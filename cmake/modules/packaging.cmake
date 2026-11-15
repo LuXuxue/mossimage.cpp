@@ -295,6 +295,13 @@ endif()
 if(MOSSINFER_SM70)
   string(APPEND _mi_sm75_suffix -sm70)
 endif()
+# A build from a branch can name its archives apart from the release of the same version (e.g. -vision); empty for
+# releases. It changes only the file names: the library and the servers report PROJECT_VERSION.
+set(MOSSINFER_PACKAGE_SUFFIX "" CACHE STRING "Text appended to the archive names (empty for releases)")
+if(MOSSINFER_PACKAGE_SUFFIX AND NOT MOSSINFER_PACKAGE_SUFFIX MATCHES "^-[A-Za-z0-9.]+$")
+  message(FATAL_ERROR "MOSSINFER_PACKAGE_SUFFIX must start with '-' and hold only letters, digits and dots")
+endif()
+string(APPEND _mi_sm75_suffix "${MOSSINFER_PACKAGE_SUFFIX}")
 set(CPACK_PACKAGE_FILE_NAME mossinfer-${PROJECT_VERSION}-${_mi_os}-cu${CUDAToolkit_VERSION_MAJOR}-${_mi_arch}${_mi_sm75_suffix})
 unset(_mi_sm75_suffix)
 set(CPACK_ARCHIVE_THREADS 0)

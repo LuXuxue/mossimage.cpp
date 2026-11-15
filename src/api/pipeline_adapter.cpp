@@ -595,6 +595,47 @@ pipeline::Request to_request(const mi_gen_params& p, fs::path* distill_time_embe
     }
   }
 
+  // Vision references (MI_CAP_VISION_REFERENCES): as reference_images, read as RGB.
+  if (p.vision_images_count > 0 && p.vision_images == nullptr) {
+    throw std::invalid_argument("vision_images: NULL array with a nonzero count.");
+  }
+  if (p._reserved7 != 0) throw std::invalid_argument("_reserved7 must be 0.");
+  if (p.vision_images_count > static_cast<std::size_t>(pipeline::kMaxVisionImages)) {
+    throw std::invalid_argument("vision_images: at most " + std::to_string(pipeline::kMaxVisionImages) + " entries (got " +
+                                std::to_string(p.vision_images_count) + ").");
+  }
+  if (p.vision_max_pixels != 0 && (p.vision_max_pixels < 1024 || p.vision_max_pixels > 4194304)) {
+    throw std::invalid_argument("vision_max_pixels must be 0 (the default, 100000) or 1024 to 4194304.");
+  }
+  if (!(p.vision_weight >= 0.0 && p.vision_weight <= 2.0)) throw std::invalid_argument("vision_weight must be 0 to 2.");
+  if (p.vision_in_negative != 0 && p.vision_in_negative != 1) throw std::invalid_argument("vision_in_negative must be 0 or 1.");
+  q.vision.max_pixels = p.vision_max_pixels != 0 ? p.vision_max_pixels : 100'000;
+  q.vision.weight = static_cast<float>(p.vision_weight);
+  if (!(0.0 <= p.vision_start && p.vision_start <= p.vision_stop && p.vision_stop <= 1.0)) {
+    throw std::invalid_argument("vision_start and vision_stop must satisfy 0 <= vision_start <= vision_stop <= 1.");
+  }
+  q.vision.start = p.vision_start;
+  q.vision.stop = p.vision_stop;
+  q.vision.in_negative = p.vision_in_negative == 1;
+  for (std::size_t i = 0; i < p.vision_images_count; ++i) {
+    const mi_reference_image& r = p.vision_images[i];
+    const std::string name = "vision_images[" + std::to_string(i) + "]";
+    if (r._reserved0 != 0 || r._reserved1 != 0) throw std::invalid_argument(name + "._reserved0 / _reserved1 must be 0.");
+    if (r.image == nullptr && !given(r.image_path)) throw std::invalid_argument(name + " needs an image or an image_path.");
+    if (r.image != nullptr && r.image->channels != 3) {
+      throw std::invalid_argument(name + ".image.channels must be 3 (RGB), not " + std::to_string(r.image->channels) + ".");
+    }
+    const ImageInput in = check_image(r.image, r.image_path, 3, false, name + ".image");
+    if (load_images || in.pixels != nullptr) {
+      q.vision.images.push_back(load_input(in, 3, false, name + ".image"));
+    } else {
+      pipeline::Image s;
+      s.width = s.height = 32;
+      s.pixels.assign(32 * 32 * 3, 0);
+      q.vision.images.push_back(std::make_shared<const pipeline::Image>(std::move(s)));
+    }
+  }
+
   if (distill_dataspace && (init.given() || q.hires.enabled())) {
     throw std::invalid_argument("distill_dir selected the bundle's dataspace sampler, which cannot start from an image "
                                 "(init_image, hires_width / hires_height); set sampler to use another sampler.");

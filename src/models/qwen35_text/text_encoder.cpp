@@ -202,6 +202,7 @@ struct Batch {
   std::int64_t tokens = 0;
   int max_len = 0;
   Tensor rope;  // bf16 [max_len, 64], positions 0..max_len-1 (each sequence restarts at 0)
+  std::vector<Tensor> seq_rope;  // per sequence: its own mRoPE table when it carries images, else empty
 
   template <typename F>
   void for_each_sequence(F&& f) const {
@@ -488,6 +489,20 @@ struct TextEncoder::Impl {
     MI_CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
+  // Image tokens over their placeholders' embeddings (vision references), in stream order after the gather.
+  void inject_vision(const Batch& b, const Tensor& x) {
+    if (hooks == nullptr || hooks->vision == nullptr) return;
+    constexpr std::size_t kRowBytes = kHidden * sizeof(std::uint16_t);
+    for (std::size_t i = 0; i < hooks->vision->size() && i + 1 < b.cu.size(); ++i) {
+      for (const auto& [start, rows] : (*hooks->vision)[i].rows) {
+        const std::int64_t at = b.cu[i] + start;
+        if (start < 0 || at + rows.dim(0) > b.cu[i + 1]) throw std::invalid_argument("qwen35_text::encode: image rows past the sequence");
+        MI_CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(x.data) + static_cast<std::size_t>(at) * kRowBytes, rows.data,
+                                      static_cast<std::size_t>(rows.dim(0)) * kRowBytes, cudaMemcpyDeviceToDevice, stream));
+      }
+    }
+  }
+
   // Qwen3_5Attention (Q:772-805): writes o_proj's output to y.
   void attention(const Layer& l, const weights::TensorMap& w, const Batch& b, const Tensor& h, const Tensor& y) {
     const std::string& p = l.prefix;
@@ -509,8 +524,10 @@ struct TextEncoder::Impl {
     Tensor v3 = v.reshaped({t, kNumKvHeads, kAttnHeadDim});
     const Tensor& q_norm = w.at(p + "self_attn.q_norm.weight");
     const Tensor& k_norm = w.at(p + "self_attn.k_norm.weight");
+    std::size_t si = 0;
     b.for_each_sequence([&](std::int64_t s, std::int64_t e) {
-      const Tensor table = b.rope.slice0(0, e - s);
+      const Tensor table = si < b.seq_rope.size() && b.seq_rope[si].data ? b.seq_rope[si] : b.rope.slice0(0, e - s);
+      ++si;
       kernels::rms_norm_qwen(q_raw.slice0(s, e), q_norm, q.slice0(s, e), stream);
       kernels::rms_norm_qwen(k3.slice0(s, e), k_norm, k3.slice0(s, e), stream);
       kernels::qwen_rope_apply(q.slice0(s, e), table, q.slice0(s, e), stream);
@@ -809,6 +826,7 @@ void TextEncoder::Impl::run_layers_streaming(const std::vector<std::vector<std::
     }
     auto t0 = Clock::now();
     gather_embeddings(sequences, x);
+    inject_vision(b, x);
     stats.embed_s = seconds_since(t0);
     MI_CUDA_CHECK(cudaEventRecord(timing[kEvEmbedded], stream));
 
@@ -971,6 +989,15 @@ TextEncoder::~TextEncoder() = default;
 // Mirrors encode(): outputs, the fixed scratch, then the largest of one layer's token-mixer and MLP scratch.
 // Keep in sync with encode(), attention(), gated_delta_net() and run_layer() (the test compares it with the
 // arena's high-water mark).
+std::size_t TextEncoder::vision_workspace_bytes(std::span<const std::int64_t> lengths) {
+  std::size_t bytes = 0;
+  for (const std::int64_t n : lengths) {
+    bytes += runtime::align_up(static_cast<std::size_t>(n) * 3 * sizeof(std::int32_t)) +
+             runtime::align_up(static_cast<std::size_t>(n) * kernels::kQwenRopeDim * sizeof(std::uint16_t));
+  }
+  return bytes;
+}
+
 std::size_t TextEncoder::workspace_bytes(const weights::ModelIndex& index, std::span<const std::int64_t> lengths) {
   return workspace_bytes(index, lengths, EncoderOptions{});
 }
@@ -1129,6 +1156,20 @@ std::vector<Tensor> TextEncoder::encode(const std::vector<std::vector<std::int32
                                   m.stream));
     b.rope = m.arena.alloc_tensor(DType::kBF16, {b.max_len, kernels::kQwenRopeDim});
     kernels::qwen_rope_table(b.rope, m.stream);
+    if (options.vision != nullptr) {
+      b.seq_rope.resize(sequences.size());
+      for (std::size_t i = 0; i < sequences.size() && i < options.vision->size(); ++i) {
+        const auto& p = (*options.vision)[i].positions;
+        if (p.empty()) continue;
+        const auto len = static_cast<std::int64_t>(sequences[i].size());
+        if (static_cast<std::int64_t>(p.size()) != 3 * len) throw std::invalid_argument("qwen35_text::encode: positions must be [3, length]");
+        Tensor pos = m.arena.alloc_tensor(DType::kI32, {3, len});
+        MI_CUDA_CHECK(cudaMemcpyAsync(pos.data, p.data(), p.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice, m.stream));
+        b.seq_rope[i] = m.arena.alloc_tensor(DType::kBF16, {len, kernels::kQwenRopeDim});
+        kernels::qwen_mrope_table(b.seq_rope[i], pos, m.stream);
+        MI_CUDA_CHECK(cudaStreamSynchronize(m.stream));  // the host positions are freed on return
+      }
+    }
 
     Tensor x = m.arena.alloc_tensor(DType::kBF16, {b.tokens, kHidden});  // residual stream
     Tensor h = m.arena.alloc_tensor(DType::kBF16, {b.tokens, kHidden});
@@ -1146,6 +1187,7 @@ std::vector<Tensor> TextEncoder::encode(const std::vector<std::vector<std::int32
       m.stats.weight_load_s += norm_load_s;
       t0 = Clock::now();
       m.gather_embeddings(sequences, x);
+      m.inject_vision(b, x);
       m.stats.embed_s = seconds_since(t0);
       m.run_layers_sync(b, weight_bufs.front(), x, h, y, options);
     }

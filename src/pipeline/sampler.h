@@ -44,8 +44,19 @@ struct Guidance {
   // CFG truncation (P6b, pipeline/accel/accel.h; lossy): the steps with step / num_steps >= cfg_truncation run the cond
   // row alone (no uncond and no SLG row) and sample with the cond prediction. 1 = off.
   double cfg_truncation = 1.0;
+  // Vision references guided against the prompt without them (pipeline.h Request::VisionReferences): with vision_plain
+  // the cond prediction is plain + w * (cond - plain), w = vision_weight for vision_start <= step / num_steps <
+  // vision_stop, else 0. One row when w is 0 (the plain prompt) or 1 (the cond prompt), both rows otherwise.
+  bool vision_plain = false;
+  double vision_weight = 1.0;
+  double vision_start = 0.0;
+  double vision_stop = 1.0;
 
   bool do_cfg() const { return cfg != 1.0; }
+  // w of the call at `step` (1 without vision_plain).
+  double vision_weight_at(int step, int num_steps) const;
+  // Some step runs both cond rows.
+  bool vision_two_rows() const { return vision_plain && vision_weight != 0.0 && vision_weight != 1.0 && vision_start < vision_stop; }
   bool skip_active(int step, int num_steps) const;
   bool slg_active(int step, int num_steps) const;
   // Guidance runs at this step: CFG on and the step before the truncation point.
@@ -61,18 +72,21 @@ struct StepInfo {
 // Called after every step; return false to stop (cancel) before the next one.
 using StepCallback = std::function<bool(const StepInfo&)>;
 
-// The DiT rows of the loop's largest step, in row order: cond, uncond under CFG, the SLG row when SLG is enabled.
-std::vector<std::int64_t> denoise_row_lengths(std::int64_t cond_tokens, std::int64_t uncond_tokens, const Guidance& guidance);
+// The DiT rows of the loop's largest step, in row order: cond, uncond under CFG, the SLG row when SLG is enabled, the
+// plain prompt's row when guidance.vision_two_rows() (plain_tokens: its length).
+std::vector<std::int64_t> denoise_row_lengths(std::int64_t cond_tokens, std::int64_t uncond_tokens, const Guidance& guidance,
+                                              std::int64_t plain_tokens = 0);
 // Stack bytes denoise() allocates itself, without the DiT forward: velocities, guidance buffers and the sampler
 // driver's state for up to kMaxDenoiseSteps steps. A caller adds MossDit::workspace_bytes for denoise_row_lengths().
 std::size_t denoise_loop_bytes(std::int64_t height, std::int64_t width, std::int64_t cond_tokens,
-                               std::int64_t uncond_tokens, const Guidance& guidance, SamplerKind sampler);
+                               std::int64_t uncond_tokens, const Guidance& guidance, SamplerKind sampler,
+                               std::int64_t plain_tokens = 0);
 // Stack bytes denoise() allocates itself (velocities, guidance buffers, the sampler driver's state for up to
 // kMaxDenoiseSteps steps) plus the DiT forward workspace for the largest row set of the run, for a latent grid of
 // height x width and the DiT's block path.
 std::size_t denoise_workspace_bytes(std::int64_t height, std::int64_t width, std::int64_t cond_tokens,
                                     std::int64_t uncond_tokens, const Guidance& guidance, SamplerKind sampler,
-                                    moss_dit::BlockPath path = moss_dit::BlockPath::kFused);
+                                    moss_dit::BlockPath path = moss_dit::BlockPath::kFused, std::int64_t plain_tokens = 0);
 
 // Runs the sampling loop in place on `latents` (CUDA fp32 [128, h, w], the initial noise scaled to the first sigma
 // on entry (flow_noise_scaling; the pure noise when it is 1), the final latents on return; for the dataspace sampler
@@ -83,10 +97,11 @@ std::size_t denoise_workspace_bytes(std::int64_t height, std::int64_t width, std
 // kMoss. Guidance windows use the step index (i / num_steps), heun's second call included in its step. Each model
 // call's prediction is guide_prediction() of the DiT rows. All work is on `stream`, scratch on the arena stack
 // (released on return). Returns the number of steps run (< schedule.num_steps() iff the callback cancelled).
+// plain_text: the refined prompt without the vision references, required iff guidance.vision_plain.
 // Throws std::invalid_argument.
 int denoise(moss_dit::MossDit& dit, runtime::DeviceArena& arena, const Tensor& cond_text, const Tensor& uncond_text,
             const Schedule& schedule, const Guidance& guidance, SamplerKind sampler, const SamplerOptions& options,
-            const Tensor& latents, cudaStream_t stream, const StepCallback& on_step = {});
+            const Tensor& latents, cudaStream_t stream, const StepCallback& on_step = {}, const Tensor& plain_text = {});
 
 // The deterministic samplers with default options; throws std::invalid_argument for a stochastic or the dataspace
 // sampler (they need a seed or parameters).

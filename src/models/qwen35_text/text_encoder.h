@@ -102,6 +102,13 @@ using LinearHook = std::function<void(const std::string& module, const Tensor& o
 // bytes), in the device weight buffer, which every encode() reloads: may modify them.
 using DecodeHook = std::function<void(const std::string& module, std::uint8_t* s_rel, std::int64_t bytes, cudaStream_t stream)>;
 
+// What a sequence with images (vision references) needs beyond its token ids: the image tokens' rows, written over
+// the embeddings of their placeholders, and the mRoPE positions of every token (Qwen3_5Model.get_rope_index).
+struct SequenceVision {
+  std::vector<std::pair<std::int64_t, Tensor>> rows;  // (first placeholder index, device bf16 [n, 4096])
+  std::vector<std::int32_t> positions;                // [3 * length]: t, then h, then w
+};
+
 struct EncodeOptions {
   LayerHook layer_hook;
   // Checked before every decoder layer is issued; once set, encode() stops the readers, waits for every queued
@@ -112,6 +119,8 @@ struct EncodeOptions {
   // Default-initialized so aggregate initializations of the members above keep compiling warning-free.
   LinearHook linear_hook = {};
   DecodeHook decode_hook = {};
+  // Per sequence (empty entries for text-only ones), or null: every sequence is text only.
+  const std::vector<SequenceVision>* vision = nullptr;
 };
 
 // encode() saw EncodeOptions::cancel set. The encoder stays usable.
@@ -151,6 +160,8 @@ class TextEncoder {
   // Same for an encoder of a quantized file (adds the activation-quantization, W4A8 decode and F32-parameter buffers).
   static std::size_t workspace_bytes(const QuantTextModel& model, std::span<const std::int64_t> lengths,
                                      const EncoderOptions& options = {});
+  // Extra arena stack bytes encode() takes when these sequences carry images (their position tables).
+  static std::size_t vision_workspace_bytes(std::span<const std::int64_t> lengths);
 
   // Host memory an encoder with `options` holds, exactly: pinned rings (reader_threads x ring_slots x slot;
   // allocated by the constructor) plus, for host-resident sources, the copy of every layer group (allocated by

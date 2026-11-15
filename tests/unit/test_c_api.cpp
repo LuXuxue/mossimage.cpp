@@ -97,7 +97,7 @@ TEST(CApi, VersionAndAbi) {
                                   MI_CAP_IMAGE_INPUT | MI_CAP_HIRES | MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA | MI_CAP_CONTROL |
                                   MI_CAP_ACCEL | MI_CAP_PRELOAD | MI_CAP_RELEASE |
                                   MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION | MI_CAP_INSPECT | MI_CAP_COMPONENTS |
-                                  MI_CAP_REFERENCE_IMAGES | MI_CAP_CHECK);
+                                  MI_CAP_REFERENCE_IMAGES | MI_CAP_CHECK | MI_CAP_VISION_REFERENCES | MI_CAP_VISION_GUIDANCE);
   EXPECT_EQ(mi_capabilities() & MI_CAP_COMFYUI_MODELS, 0u);
   EXPECT_EQ(MI_CAP_PREVIEW | MI_CAP_COMFYUI_MODELS | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS, 0x3fu);
   EXPECT_EQ(MI_CAP_IMAGE_INPUT, 0x40u);
@@ -114,6 +114,7 @@ TEST(CApi, VersionAndAbi) {
   EXPECT_EQ(MI_CAP_PROGRESS_FRACTION, 0x10000u);
   EXPECT_EQ(MI_CAP_INSPECT, 0x20000u);
   EXPECT_EQ(MI_CAP_CHECK, 0x100000u);
+  EXPECT_EQ(MI_CAP_VISION_REFERENCES, 0x200000u);
   EXPECT_STREQ(mi_status_string(MI_OK), "MI_OK");
   EXPECT_STREQ(mi_status_string(MI_CANCELLED), "MI_CANCELLED");
   EXPECT_STREQ(mi_status_string(MI_ERR_BUSY), "MI_ERR_BUSY");
@@ -393,7 +394,7 @@ TEST(CApi, OldStructSizes) {
   for (const std::size_t bad : {kGen01 - 8, kGen01 + 8, sizeof g - 8}) {
     g.struct_size = bad;
     EXPECT_EQ(mi_gen_params_validate(&g), MI_ERR_ABI_MISMATCH) << bad;
-    EXPECT_NE(last_error().find("168, 240, 320, 376 or 408"), std::string::npos) << last_error();
+    EXPECT_NE(last_error().find("168, 240, 320, 376, 408, 448 or 464"), std::string::npos) << last_error();
   }
 
   mi_engine_params e;

@@ -35,6 +35,7 @@
 #include "models/moss_dit/moss_dit.h"
 #include "models/moss_dit/nvfp4_support.h"
 #include "models/qwen35_text/text_encoder.h"
+#include "models/qwen35_vision/vision_encoder.h"
 #include "pipeline/embedding_cache.h"
 #include "pipeline/gguf_dit.h"
 #include "pipeline/hardware_profile.h"
@@ -467,6 +468,16 @@ struct Pipeline::Impl {
   std::unique_ptr<runtime::DeviceArena> arena;
   // Long-lived while the arena lives (it holds a reference to it): its pinned rings and streams are set up once.
   std::unique_ptr<qwen35_text::TextEncoder> te;
+  // Vision references: the tower of the text encoder file at vision_path (host weights; device memory per encode).
+  std::unique_ptr<qwen35_vision::VisionEncoder> vision;
+  std::filesystem::path vision_path;
+  // Whether a text encoder file carries the vision tower (its header read once per path).
+  std::map<std::filesystem::path, bool> vision_files;
+  bool vision_available(const std::filesystem::path& te_file) {
+    const auto it = vision_files.find(te_file);
+    if (it != vision_files.end()) return it->second;
+    return vision_files[te_file] = qwen35_vision::VisionEncoder::available(te_file);
+  }
   const TeSource* te_src = nullptr;
   std::map<std::string, std::unique_ptr<TeSource>> te_sources;
   std::unique_ptr<moss_dit::MossDit> dit;
@@ -1297,6 +1308,7 @@ struct Pipeline::Impl {
     std::size_t host_buffers = 0;  // the call's own host buffers
     std::int64_t reference_tokens = 0;  // reference images (planner::RequestShape)
     int reference_prefills = 0;
+    std::size_t vision_bytes = 0;  // vision references: the tower and the position tables, on the text encoder's stack
   };
   // The call's plan into r.plan (throws planner::BudgetError before any heavy work): planner::plan within the engine's
   // mode and budgets, without the VAE models an earlier call left resident when they alone make it infeasible

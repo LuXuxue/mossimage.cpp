@@ -299,7 +299,8 @@ class CpuProtocolTest(ProtocolTestBase):
                                                "system_cuda": True, "control": True, "accel": True,
                                                "preload": True, "release": True, "certificate_dirs": False,
                                                "te_host_pin": True, "progress_fraction": True, "inspect": True,
-                                               "references": True, "check": True, "components": True})
+                                               "references": True, "check": True, "components": True,
+                                               "vision_references": True, "vision_guidance": True})
         self.assertEqual(set(res["values"]), {"mode", "block_path", "tier", "attention", "dit_direct_io", "te_host_pin",
                                               "sampler", "scheduler", "noise_layout", "noise_source", "resize",
                                               "mask_encoding", "step_cache", "lora_placement", "guidance", "output",
@@ -576,6 +577,27 @@ class CpuProtocolTest(ProtocolTestBase):
             self.assertError(r, "invalid_params", i)
             self.assertIn(text, r["error"]["message"], params)
             self.assertNotIn("reference_images", r["error"]["message"], params)
+
+    def test_vision_guidance_params(self):
+        ref = os.path.join(self.tmp, "portrait.png")
+        write_png(ref, 32, 32, lambda x, y: (x * 8, y * 8, 0))
+        base = {"prompt": "a detective", "output": os.path.join(self.tmp, "x.png")}
+        vision = lambda **kw: {"vision_references": dict({"images": [ref]}, **kw)}
+        bad = [
+            (vision(start=1.5), '"vision_references.start" must be a number from 0 to 1'),
+            (vision(stop="1"), '"vision_references.stop" must be a number from 0 to 1'),
+            (vision(start=0.8, stop=0.2), '"vision_references.start" must be at most stop'),
+            (vision(start=0.1, start2=0), '"vision_references" has an unknown member "start2"'),
+            (dict(vision(weight=0.5), slg_scale=2, slg_layers=[22]), "does not work with an SLG row"),
+            (dict(vision(start=0.3), step_cache="fbcache"), "does not work with the step cache"),
+        ]
+        for i, (params, text) in enumerate(bad):
+            r = self.server.call("generate", dict(base, **params), id=i)
+            self.assertError(r, "invalid_params", i)
+            self.assertIn(text, r["error"]["message"], params)
+        # A weight and a window pass the pre-check.
+        for i, params in enumerate([vision(weight=0.5), vision(start=0.3, stop=1), vision(weight=1.5, start=0, stop=0.7)]):
+            self.assertError(self.server.call("generate", dict(base, **params), id="ok%d" % i), "no_engine", "ok%d" % i)
 
     def test_control_and_accelerator_params(self):
         adapter = os.path.join(self.tmp, "control.safetensors")

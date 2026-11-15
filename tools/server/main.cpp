@@ -411,6 +411,66 @@ class Params {
     if (v == nullptr) return std::nullopt;
     return control_image_list(*v, std::string(key));
   }
+  // `vision_references`: {"images": [path, ...] (1 to 4, in order), "max_pixels": integer (1024..4194304, optional),
+  // "weight": number (0..2, optional), "start" / "stop": numbers (0..1, start <= stop, optional), "in_negative": bool
+  // (optional)}.
+  struct VisionReferences {
+    std::vector<std::string> images;
+    std::optional<std::int64_t> max_pixels;
+    std::optional<double> weight;
+    std::optional<double> start, stop;
+    std::optional<bool> in_negative;
+  };
+  std::optional<VisionReferences> vision_references(std::string_view key) const {
+    const Value* v = find(key);
+    if (v == nullptr) return std::nullopt;
+    const std::string k0(key);
+    if (!v->is_object()) {
+      throw bad(key, "an object {\"images\", \"max_pixels\"?, \"weight\"?, \"start\"?, \"stop\"?, \"in_negative\"?}");
+    }
+    VisionReferences r;
+    bool have_images = false;
+    for (const auto& [k, m] : v->as_object()) {
+      const auto once = [&](bool seen) {
+        if (seen) throw RequestError("invalid_params", "\"" + k0 + "\" has \"" + k + "\" more than once");
+      };
+      if (k == "images") {
+        once(have_images);
+        have_images = true;
+        if (!m.is_array() || m.as_array().empty() || m.as_array().size() > 4) throw bad(k0 + ".images", "an array of 1 to 4 image paths");
+        for (const Value& e : m.as_array()) {
+          const std::string item = k0 + ".images[" + std::to_string(r.images.size()) + "]";
+          if (!e.is_string() || e.as_string().empty()) throw bad(item, "a non-empty string (an image file)");
+          if (e.as_string().find('\0') != std::string::npos) throw bad(item, "a string without NUL characters");
+          r.images.push_back(e.as_string());
+        }
+      } else if (k == "max_pixels") {
+        once(r.max_pixels.has_value());
+        if (!m.is_number() || m.as_double() != std::floor(m.as_double()) || m.as_double() < 1024 || m.as_double() > 4194304) {
+          throw bad(k0 + ".max_pixels", "an integer from 1024 to 4194304");
+        }
+        r.max_pixels = static_cast<std::int64_t>(m.as_double());
+      } else if (k == "weight") {
+        once(r.weight.has_value());
+        if (!m.is_number() || !(m.as_double() >= 0 && m.as_double() <= 2)) throw bad(k0 + ".weight", "a number from 0 to 2");
+        r.weight = m.as_double();
+      } else if (k == "start" || k == "stop") {
+        std::optional<double>& slot = k == "start" ? r.start : r.stop;
+        once(slot.has_value());
+        if (!m.is_number() || !(m.as_double() >= 0 && m.as_double() <= 1)) throw bad(k0 + "." + k, "a number from 0 to 1");
+        slot = m.as_double();
+      } else if (k == "in_negative") {
+        once(r.in_negative.has_value());
+        if (!m.is_bool()) throw bad(k0 + ".in_negative", "a boolean");
+        r.in_negative = m.as_bool();
+      } else {
+        throw RequestError("invalid_params", "\"" + k0 + "\" has an unknown member \"" + k + "\"");
+      }
+    }
+    if (!have_images) throw RequestError("invalid_params", "\"" + k0 + ".images\" is required");
+    if (r.start.value_or(0.0) > r.stop.value_or(1.0)) throw bad(k0 + ".start", "at most stop");
+    return r;
+  }
   // `references`: {"images": [path, ...] (1 or more, in order), "max_edge": integer (optional)}.
   struct References {
     std::vector<std::string> images;
@@ -724,6 +784,8 @@ class Server {
            tf(caps & MI_CAP_PROGRESS_FRACTION) + ",\"inspect\":" + tf(caps & MI_CAP_INSPECT) +
            ",\"references\":" + tf(caps & MI_CAP_REFERENCE_IMAGES) + ",\"check\":" + tf(caps & MI_CAP_CHECK) +
            ",\"components\":" + tf(caps & MI_CAP_COMPONENTS) +
+           ",\"vision_references\":" + tf(caps & MI_CAP_VISION_REFERENCES) +
+           ",\"vision_guidance\":" + tf(caps & MI_CAP_VISION_GUIDANCE) +
            "},\"values\":{" + values + "},\"probe\":{\"driver_cuda_version\":" +
            std::to_string(probe.driver_cuda_version) + ",\"runtime_cuda_version\":" + std::to_string(probe.runtime_cuda_version) +
            ",\"driver_compatible\":" + tf(probe.driver_compatible) + ",\"device_count\":" + std::to_string(probe.device_count) +
@@ -812,7 +874,7 @@ class Server {
             "include_prompts", "preview_output", "preview_every", "init_image", "mask", "mask_encoding",
             "denoise_strength", "resize", "hires", "distill", "control", "cfg_truncation", "step_cache",
             "references", "lora_placement",
-            "step_cache_threshold"});
+            "step_cache_threshold", "vision_references"});
     auto w = std::make_unique<Work>();
     const auto output = p.string("output");
     if (!output || output->empty()) throw RequestError("invalid_params", "\"output\" (PNG path) is required");
@@ -828,7 +890,7 @@ class Server {
             "flow_multiplier", "noise_layout", "noise_source", "eta", "s_noise", "dataspace", "loras", "init_image", "mask",
             "mask_encoding", "denoise_strength", "resize", "hires", "distill", "control", "cfg_truncation", "step_cache",
             "references", "lora_placement",
-            "step_cache_threshold"});
+            "step_cache_threshold", "vision_references"});
     auto w = std::make_unique<Work>();
     request_params(p, *w, true);
     return start(std::move(w), id, Kind::kPreload);
@@ -961,6 +1023,22 @@ class Server {
       g.reference_images = w->references.data();
       g.reference_images_count = w->references.size();
       if (r->max_edge) g.reference_max_edge = static_cast<std::int32_t>(*r->max_edge);
+    }
+    // Vision references: paths only, as references.
+    if (auto r = p.vision_references("vision_references")) {
+      w->vision_paths = std::move(r->images);
+      for (const std::string& path : w->vision_paths) {
+        mi_reference_image ri{};
+        ri.image_path = path.c_str();
+        w->vision.push_back(ri);
+      }
+      g.vision_images = w->vision.data();
+      g.vision_images_count = w->vision.size();
+      if (r->max_pixels) g.vision_max_pixels = *r->max_pixels;
+      if (r->weight) g.vision_weight = *r->weight;
+      if (r->start) g.vision_start = *r->start;
+      if (r->stop) g.vision_stop = *r->stop;
+      if (r->in_negative) g.vision_in_negative = *r->in_negative ? 1 : 0;
     }
     if (const auto v = p.number("cfg_truncation")) g.cfg_truncation = *v;
     if (const auto v = p.name("step_cache", mi::server::kStepCacheNames)) g.step_cache = *v;
@@ -1119,9 +1197,11 @@ class Server {
         }
       }
     }
-    if (const Value* r = gen.find("references"); r != nullptr && r->is_object()) {
-      if (const Value* im = r->find("images"); im != nullptr && im->is_array()) {
-        for (const Value& e : im->as_array()) add(&e);
+    for (const char* key : {"references", "vision_references"}) {
+      if (const Value* r = gen.find(key); r != nullptr && r->is_object()) {
+        if (const Value* im = r->find("images"); im != nullptr && im->is_array()) {
+          for (const Value& e : im->as_array()) add(&e);
+        }
       }
     }
     std::uint64_t total = 0;
@@ -1205,7 +1285,8 @@ class Server {
                        "sampler", "scheduler", "flow_multiplier", "noise_layout", "noise_source", "eta", "s_noise",
                        "dataspace", "loras", "save_metadata", "include_prompts", "preview_output", "preview_every",
                        "init_image", "mask", "mask_encoding", "denoise_strength", "resize", "hires", "distill", "control",
-                       "cfg_truncation", "step_cache", "references", "lora_placement", "step_cache_threshold"});
+                       "cfg_truncation", "step_cache", "references", "lora_placement", "step_cache_threshold",
+                       "vision_references"});
       request_params(gen_params, w, false);
     } catch (const RequestError& e) {
       request_error = e;
@@ -1636,7 +1717,7 @@ class Server {
                "slg_layers", "slg_scale", "slg_start", "slg_stop", "max_sequence_length", "sampler", "scheduler",
                "flow_multiplier", "noise_layout", "noise_source", "eta", "s_noise", "dataspace", "loras", "init_image",
                "mask", "mask_encoding", "denoise_strength", "resize", "hires", "distill", "control", "cfg_truncation",
-               "step_cache", "references", "lora_placement", "step_cache_threshold"});
+               "step_cache", "references", "lora_placement", "step_cache_threshold", "vision_references"});
       request_params(pp, plan, true);
       sp.plan_request = &plan.params;
     }
@@ -2298,6 +2379,8 @@ class Server {
     std::vector<mi_control_image> control_images;  // points into control_strings
     std::vector<std::string> reference_paths;
     std::vector<mi_reference_image> references;  // points into reference_paths
+    std::vector<std::string> vision_paths;
+    std::vector<mi_reference_image> vision;      // points into vision_paths
     Job* job = nullptr;
     Output* out = nullptr;
     mi_engine* engine = nullptr;

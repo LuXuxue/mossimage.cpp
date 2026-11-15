@@ -148,7 +148,7 @@ MI_LAYOUT(mi_progress, step_seconds, 24);
 MI_LAYOUT(mi_progress, elapsed_seconds, 32);  // the 1.0.0 layout ends here (40 bytes)
 MI_LAYOUT(mi_progress, fraction, 40);
 MI_LAYOUT(mi_progress, eta_seconds, 48);
-static_assert(sizeof(mi_gen_params) == 408);
+static_assert(sizeof(mi_gen_params) == 464);
 MI_LAYOUT(mi_gen_params, struct_size, 0);
 MI_LAYOUT(mi_gen_params, prompt, 8);
 MI_LAYOUT(mi_gen_params, negative_prompt, 16);
@@ -209,6 +209,13 @@ MI_LAYOUT(mi_gen_params, _reserved4, 364);
 MI_LAYOUT(mi_gen_params, step_cache_threshold, 368);  // the 2.0.0 layout ends here (376 bytes)
 MI_LAYOUT(mi_gen_params, reference_images, 376);
 MI_LAYOUT(mi_gen_params, reference_images_count, 384);
+MI_LAYOUT(mi_gen_params, vision_images, 408);
+MI_LAYOUT(mi_gen_params, vision_images_count, 416);
+MI_LAYOUT(mi_gen_params, vision_max_pixels, 424);
+MI_LAYOUT(mi_gen_params, vision_weight, 432);
+MI_LAYOUT(mi_gen_params, vision_in_negative, 440);
+MI_LAYOUT(mi_gen_params, vision_start, 448);
+MI_LAYOUT(mi_gen_params, vision_stop, 456);
 MI_LAYOUT(mi_gen_params, reference_max_edge, 392);
 MI_LAYOUT(mi_gen_params, _reserved5, 396);
 MI_LAYOUT(mi_gen_params, lora_placement, 400);
@@ -505,6 +512,7 @@ constexpr std::size_t kEngineParamsSizes[] = {offsetof(mi_engine_params, dit_fil
                                                offsetof(mi_engine_params, certificate_dirs), sizeof(mi_engine_params)};
 constexpr std::size_t kGenParamsSizes[] = {offsetof(mi_gen_params, scheduler), offsetof(mi_gen_params, init_image),
                                             offsetof(mi_gen_params, control_adapter), offsetof(mi_gen_params, reference_images),
+                                            offsetof(mi_gen_params, vision_images), offsetof(mi_gen_params, vision_start),
                                             sizeof(mi_gen_params)};
 // Output structs that grew: mi_timings (0.1.0: 104 bytes, 1.0.0: 128), mi_probe_info (0.2.0: 576 bytes).
 constexpr std::size_t kTimingsSizes[] = {offsetof(mi_timings, vae_encoder_load_s), offsetof(mi_timings, lora_load_s),
@@ -522,7 +530,8 @@ static_assert(kEngineParamsSizes[2] == 136 && kTimingsSizes[1] == 128 && kMemory
 static_assert(kEngineParamsSizes[0] == 80 && kGenParamsSizes[0] == 168 && kTimingsSizes[0] == 104, "the 0.1.0 layouts");
 static_assert(kProbeInfoSizes[0] == 576, "the 0.2.0 mi_probe_info");
 static_assert(kEngineParamsSizes[1] == 120 && kGenParamsSizes[1] == 240, "the first 0.2.0 layouts");
-static_assert(kGenParamsSizes[2] == 320 && kGenParamsSizes[3] == 376, "the 1.0.0 and 2.0.0 mi_gen_params");
+static_assert(kGenParamsSizes[2] == 320 && kGenParamsSizes[3] == 376 && kGenParamsSizes[4] == 408 && kGenParamsSizes[5] == 448,
+              "the 1.0.0, 2.0.0, 2.1.0 and first vision mi_gen_params");
 // The component structs (2.1): one size each so far.
 constexpr std::size_t kSessionParamsSize = sizeof(mi_session_params);
 constexpr std::size_t kTextParamsSize = sizeof(mi_text_params);
@@ -688,6 +697,8 @@ mi_gen_params gen_params_defaults(std::size_t size = sizeof(mi_gen_params)) {
   p.s_noise = 1.0;
   p.include_prompts = 1;
   p.denoise_strength = -1.0;  // unset
+  p.vision_weight = 1.0;
+  p.vision_stop = 1.0;
   p.hires_strength = 0.45;
   p.mask_encoding = MI_MASK_U8;
   p.resize = MI_RESIZE_CROP;
@@ -880,7 +891,8 @@ uint32_t mi_capabilities(void) {
   return MI_CAP_PREVIEW | MI_CAP_MODEL_FILES | MI_CAP_LORA | MI_CAP_TIERS | MI_CAP_SAMPLERS | MI_CAP_IMAGE_INPUT | MI_CAP_HIRES |
          MI_CAP_DISTILL | MI_CAP_SYSTEM_CUDA | MI_CAP_CONTROL | MI_CAP_ACCEL | MI_CAP_PRELOAD | MI_CAP_RELEASE |
          MI_CAP_TE_HOST_PIN | MI_CAP_PROGRESS_FRACTION | MI_CAP_INSPECT |
-         MI_CAP_COMPONENTS | MI_CAP_REFERENCE_IMAGES | MI_CAP_CHECK;  // MI_CAP_CERTIFICATE_DIRS: reserved since 2.0
+         MI_CAP_COMPONENTS | MI_CAP_REFERENCE_IMAGES | MI_CAP_CHECK | MI_CAP_VISION_REFERENCES |
+         MI_CAP_VISION_GUIDANCE;  // MI_CAP_CERTIFICATE_DIRS: reserved since 2.0
 }
 
 mi_status mi_probe(mi_probe_info* info) {

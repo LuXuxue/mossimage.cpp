@@ -127,6 +127,18 @@ __global__ void qwen_table_kernel(bf16* out, RowMap rows, std::int64_t n, Freqs<
   }
 }
 
+__global__ void qwen_mrope_table_kernel(bf16* out, RowMap rows, const std::int32_t* pos, std::int64_t n, Freqs<32> inv_freq) {
+  using namespace detail;
+  const int c = static_cast<int>(threadIdx.x);  // 0..63
+  const int j = c & 31;
+  const int axis = (j % 3 == 1 && j < 33) ? 1 : (j % 3 == 2 && j < 30) ? 2 : 0;
+  for (std::int64_t r = static_cast<std::int64_t>(blockIdx.x) * blockDim.y + threadIdx.y; r < n;
+       r += static_cast<std::int64_t>(gridDim.x) * blockDim.y) {
+    const float phase = mul(static_cast<float>(pos[axis * n + r]), inv_freq.v[j]);
+    out[rows.offset(r) + c] = bf(c < 32 ? cosf(phase) : sinf(phase));
+  }
+}
+
 unsigned blocks_for(std::int64_t rows) { return detail::grid_for_rows((rows + kRowsPerBlock - 1) / kRowsPerBlock); }
 
 void apply(const char* op, int rot, const Tensor& x, const Tensor& table, const Tensor& out, cudaStream_t stream) {
@@ -191,6 +203,18 @@ void qwen_rope_table(const Tensor& out, cudaStream_t stream) {
   if (n == 0) return;
   qwen_table_kernel<<<blocks_for(n), dim3(kQwenRopeDim, kRowsPerBlock), 0, stream>>>(
       out.ptr<bf16>(), detail::row_map(out), n, freqs_from_bits(kQwenRopeInvFreqBits));
+  MI_CUDA_CHECK_LAUNCH();
+}
+
+void qwen_mrope_table(const Tensor& out, const Tensor& pos, cudaStream_t stream) {
+  constexpr const char* op = "qwen_mrope_table";
+  detail::check_rows(op, "out", out, DType::kBF16, kQwenRopeDim);
+  if (out.rank != 2) detail::fail(op, "expected out [S, 64], got " + out.describe());
+  const std::int64_t n = out.dim(0);
+  if (pos.dtype != DType::kI32 || pos.numel() != 3 * n) detail::fail(op, "expected pos i32 [3, S], got " + pos.describe());
+  if (n == 0) return;
+  qwen_mrope_table_kernel<<<blocks_for(n), dim3(kQwenRopeDim, kRowsPerBlock), 0, stream>>>(
+      out.ptr<bf16>(), detail::row_map(out), pos.ptr<const std::int32_t>(), n, freqs_from_bits(kQwenRopeInvFreqBits));
   MI_CUDA_CHECK_LAUNCH();
 }
 

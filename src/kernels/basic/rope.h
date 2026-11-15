@@ -51,6 +51,12 @@ void moss_rope_apply(const Tensor& x, const Tensor& table, const Tensor& out, cu
 // of transformers' cat(freqs, freqs) cos/sin.
 void qwen_rope_table(const Tensor& out, cudaStream_t stream);
 
+// Qwen3_5TextRotaryEmbedding with mRoPE positions (images in the prompt): pos is i32 [3, S] (t, h, w per token, from
+// Qwen3_5Model.get_rope_index), out bf16 [S, 64] as qwen_rope_table. Frequency j takes its position from h when
+// j % 3 == 1 and j < 33, from w when j % 3 == 2 and j < 30 (apply_interleaved_mrope, mrope_section [11, 11, 10]), else
+// from t. With equal axes it is qwen_rope_table bit for bit.
+void qwen_mrope_table(const Tensor& out, const Tensor& pos, cudaStream_t stream);
+
 // apply_rotary_pos_emb (Q:660-695) with rotate_half over the first 64 dims, the rest passed through.
 // x and out: bf16 [..., S, heads, head_dim >= 64]; table: bf16 [S, 64] from qwen_rope_table. out may alias x.
 void qwen_rope_apply(const Tensor& x, const Tensor& table, const Tensor& out, cudaStream_t stream);
