@@ -131,11 +131,11 @@ struct QkArgs {
   float factor;  // torch MeanOps factor of the per-head norm
 };
 
-__global__ __launch_bounds__(kWave) void qk_norm_rope_kernel(const QkArgs a) {
+__global__ __launch_bounds__(kWave) void qk_norm_rope_kernel(const QkArgs a, std::int64_t start) {
   __shared__ float red[kWave];
   __shared__ float norm[kHeadDim];
   const int lane = thread_id();
-  const std::int64_t item = blockIdx.x;
+  const std::int64_t item = start + static_cast<std::int64_t>(blockIdx.x);
   const std::int64_t token = item / (2 * a.heads);
   const int head = static_cast<int>(item % (2 * a.heads));  // q heads first, then k heads (columns head * 128)
   bf16_bits* row = a.qkv + token * a.ld + static_cast<std::int64_t>(head) * kHeadDim + 4 * lane;
@@ -446,7 +446,12 @@ void qk_norm_rope(bf16_bits* qkv, std::int64_t ld, std::int64_t tokens, int head
   const std::int64_t rows = tokens * heads;
   const QkArgs a{qkv, ld, q_norm, k_norm, table, table_ld, heads,
                  static_cast<float>(rows) / static_cast<float>(rows * kHeadDim)};
-  qk_norm_rope_kernel<<<dim3(static_cast<unsigned>(tokens * 2 * heads)), dim3(kWave), 0, stream>>>(a);
+  const std::int64_t total = tokens * 2 * heads;
+  constexpr std::int64_t kChunk = 1;  // 780M iGPU grid limit
+  for (std::int64_t s = 0; s < total; s += kChunk) {
+    const std::int64_t xn = total - s < kChunk ? total - s : kChunk;
+    qk_norm_rope_kernel<<<dim3(static_cast<unsigned>(xn)), dim3(kWave), 0, stream>>>(a, s);
+  }
   check_launch("qk_norm_rope");
 }
 
@@ -501,10 +506,20 @@ void packed_gemm_plain(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std
 void packed_gemm_gated(bf16_bits* residual, std::int64_t ldr, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const bf16_bits* gate, const BlockBuffers& b, int n, int k, hipStream_t stream) {
   if (b.tokens == 0) return;
   pack_fragments(b.pack, x, ldx, b.tokens, pack_rows(b.tokens), k, stream);
+  std::fprintf(stderr, "[gated] pack done, tokens=%d n=%d k=%d\n", b.tokens, n, k);
+  std::fflush(stderr);
+  hipDeviceSynchronize();
+  std::fprintf(stderr, "[gated] pack synced\n");
+  std::fflush(stderr);
   const Blocking bl = blocking_of(b.tokens, n, k, kGemmTileM, kGemmTileN, kGemmTileN);
   const GemmArgs a{residual, ldr, nullptr, 0, nullptr, 0, gate, b.tokens, n, k, bl.bm, bl.bn, b.pack, wp};
   gemm_kernel<Epilogue::kGatedResidual><<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("gemm_gated_residual (packed)");
+  std::fprintf(stderr, "[gated] gemm launched, workgroups=%u\n", bl.workgroups);
+  std::fflush(stderr);
+  hipDeviceSynchronize();
+  std::fprintf(stderr, "[gated] gemm synced\n");
+  std::fflush(stderr);
 }
 void packed_gemm_situ(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const BlockBuffers& b, int f, int k, hipStream_t stream) {
   if (b.tokens == 0) return;
@@ -526,6 +541,8 @@ void pack_attention(const BlockBuffers& b, hipStream_t stream) {
 void run_block_op(int op, const BlockWeights& w, const BlockBuffers& b, hipStream_t stream) {
   constexpr std::int64_t ldx = kDim, ldq = 3 * kDim;
   const bool packed = w.qkv_packed != nullptr && b.pack != nullptr && b.pack_attn != nullptr;
+  std::fprintf(stderr, "[bf16-op] %d packed=%d\n", op, (int)packed);
+  std::fflush(stderr);
   const auto mod = [&](int i) { return b.mod + static_cast<std::int64_t>(i) * kDim; };
   const bf16_bits* k = b.qkv + kDim;
   const bf16_bits* v = b.qkv + 2 * kDim;

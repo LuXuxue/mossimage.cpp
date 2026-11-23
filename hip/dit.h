@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "hip_block.h"
+#include "int8_block.h"
 #include "runtime.h"
 
 namespace mi::hip {
@@ -103,11 +104,14 @@ class Dit {
   DeviceBuffer slots_[2];
   std::unique_ptr<Event> slot_free_[2], copy_done_[2];
   std::vector<hip_block::BlockWeights> blocks_;
+  std::vector<Int8BlockWeights> int8_blocks_;  // the INT8 ConvRot blocks (the high tier); parallel to blocks_
+  std::vector<bool> is_int8_;                  // block l is the INT8 path when set
   Globals g_{};
   std::vector<TextBlock> text_blocks_;
 
   DeviceBuffer x_, y_, qkv_, attn_, ffn_, rope_, tokens_, proj_, up_gate_, embeds_, pack_, pack_attn_, cu_;
   DeviceBuffer mod_, head_, t_in_, hidden_, time_;
+  DeviceBuffer i8_y_, i8_ffn_, i8_scale_, i8_ug_, i8_gemm_out_;  // the INT8 block's scratch
 
   std::vector<std::unique_ptr<Event>> events_;  // time_ops
   std::vector<int> event_what_;

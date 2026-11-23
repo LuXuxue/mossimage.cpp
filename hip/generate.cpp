@@ -9,6 +9,10 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 #include "text_encoder.h"
 #include "vae.h"
@@ -22,8 +26,15 @@ double now_s() {
 
 double gib(std::uint64_t bytes) { return static_cast<double>(bytes) / static_cast<double>(1ull << 30); }
 
-// MemAvailable of /proc/meminfo: what the host can give, the page cache it would drop included.
+// What the host can give to a pinned allocation: MemAvailable of /proc/meminfo on Linux (the page cache it would drop
+// included), the physical memory the processes can use on Windows.
 std::uint64_t host_available_bytes() {
+#if defined(_WIN32)
+  MEMORYSTATUSEX s{};
+  s.dwLength = sizeof s;
+  if (!GlobalMemoryStatusEx(&s)) return std::numeric_limits<std::uint64_t>::max();
+  return s.ullAvailPhys;
+#else
   std::ifstream in("/proc/meminfo");
   std::string key;
   std::uint64_t kib = 0;
@@ -32,6 +43,7 @@ std::uint64_t host_available_bytes() {
     in.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
   }
   return std::numeric_limits<std::uint64_t>::max();  // unknown: not refused here
+#endif
 }
 
 [[noreturn]] void fail(const std::string& what) { throw std::invalid_argument("hip generate: " + what); }

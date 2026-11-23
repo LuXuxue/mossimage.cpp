@@ -241,7 +241,10 @@ __global__ __launch_bounds__(kWave) void gemm_kernel(const GemmArgs a) {
 
 inline void check_launch(const char* op) {
   const hipError_t e = hipGetLastError();
-  if (e != hipSuccess) throw std::runtime_error(std::string("hip_block::") + op + ": " + hipGetErrorString(e));
+  if (e != hipSuccess) {
+    std::fprintf(stderr, "[check_launch] %s: error %d (%s)\n", op, (int)e, hipGetErrorString(e));
+    throw std::runtime_error(std::string("hip_block::") + op + ": " + hipGetErrorString(e));
+  }
 }
 
 inline unsigned grid_of(std::int64_t items, int per_tile) { return static_cast<unsigned>((items + per_tile - 1) / per_tile); }

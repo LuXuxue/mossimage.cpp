@@ -166,12 +166,13 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
   // The blocks: the first `resident` on the device, the rest in pinned host memory, all packed on the host.
   const auto block_names = [](int l) {
     const std::string p = "layers." + std::to_string(l) + ".";
+    // FUSED proj.qkv.weight [3d, d] (q, k, v stacked), not separate q/k/v, as this model stores it.
     return std::vector<std::string>{p + "norm1.weight", p + "norm2.weight", p + "q_norm.weight", p + "k_norm.weight",
-                                    p + "proj.q.weight", p + "proj.k.weight", p + "proj.v.weight", p + "proj.o.weight",
-                                    p + "proj.ffn_up_gate.weight", p + "proj.ffn_down.weight"};
+                                    p + "proj.qkv.weight", p + "proj.o.weight", p + "proj.ffn_up_gate.weight",
+                                    p + "proj.ffn_down.weight"};
   };
-  const std::vector<std::vector<std::int64_t>> block_shapes = {{d}, {d}, {kHead}, {kHead}, {d, d}, {d, d}, {d, d}, {d, d},
-                                                               {2 * f, d}, {d, f}};
+  const std::vector<std::vector<std::int64_t>> block_shapes = {{d}, {d}, {kHead}, {kHead}, {3 * d, d}, {d, d}, {2 * f, d},
+                                                               {d, f}};
   // The globals and the refiner stay resident, and streaming needs its two slots: a budget below that cannot hold.
   if (options.device_budget > 0 && options.device_budget < minimum_weight_bytes()) {
     fail("a device budget of " + std::to_string(options.device_budget) + " bytes is below the " +
@@ -181,7 +182,84 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
   const int resident = resident_blocks_for(options.device_budget);
   HostBuffer staging(resident > 0 ? kBlock.bytes : 0);
   std::vector<bf16> row_major;
+  is_int8_.assign(kDiTLayers, false);
+  int8_blocks_.resize(kDiTLayers);
+  // The INT8 ConvRot block layout: the bf16 norms, then each linear's int8 weight [n, k] and its per-row float scale [n].
+  const std::size_t i8_norms = 2 * d * kBf16 + 2 * kHead * kBf16;
+  const std::size_t i8_qkv_q = i8_norms;
+  const std::size_t i8_qkv_scale = i8_qkv_q + 3 * d * d;
+  const std::size_t i8_o_q = i8_qkv_scale + 3 * d * 4;
+  const std::size_t i8_o_scale = i8_o_q + d * d;
+  const std::size_t i8_up_q = i8_o_scale + d * 4;
+  const std::size_t i8_up_scale = i8_up_q + 2 * f * d;
+  const std::size_t i8_down_q = i8_up_scale + 2 * f * 4;
+  const std::size_t i8_down_scale = i8_down_q + d * f;
+  const std::size_t i8_block_bytes = i8_down_scale + d * 4;
   for (int l = 0; l < kDiTLayers; ++l) {
+    const std::string qkv_name = "layers." + std::to_string(l) + ".proj.qkv.weight";
+    const bool is_int8 = index.at(qkv_name).dtype == "I8";
+    is_int8_[l] = is_int8;
+    if (is_int8) {
+      const std::string p = "layers." + std::to_string(l) + ".";
+      const auto i8_check = [&](const std::string& name, const std::vector<std::int64_t>& shape, const std::string& dt) {
+        const st::TensorInfo& t = index.at(name);
+        if (t.dtype != dt) fail(name + " is " + t.dtype + ", expected " + dt);
+        if (t.shape != shape) fail(name + " has an unexpected shape");
+      };
+      i8_check(p + "norm1.weight", {d}, "BF16");
+      i8_check(p + "norm2.weight", {d}, "BF16");
+      i8_check(p + "q_norm.weight", {kHead}, "BF16");
+      i8_check(p + "k_norm.weight", {kHead}, "BF16");
+      i8_check(p + "proj.qkv.weight", {3 * d, d}, "I8");
+      i8_check(p + "proj.qkv.weight_scale", {3 * d, 1}, "F32");
+      i8_check(p + "proj.o.weight", {d, d}, "I8");
+      i8_check(p + "proj.o.weight_scale", {d, 1}, "F32");
+      i8_check(p + "proj.ffn_up_gate.weight", {2 * f, d}, "I8");
+      i8_check(p + "proj.ffn_up_gate.weight_scale", {2 * f, 1}, "F32");
+      i8_check(p + "proj.ffn_down.weight", {d, f}, "I8");
+      i8_check(p + "proj.ffn_down.weight_scale", {d, 1}, "F32");
+      HostBuffer streamed(i8_block_bytes);
+      char* dst = static_cast<char*>(streamed.data());
+      index.read_into(p + "norm1.weight", dst + i8_norms * 0, d * kBf16);
+      index.read_into(p + "norm2.weight", dst + 2 * d * kBf16, d * kBf16);
+      index.read_into(p + "q_norm.weight", dst + 2 * d * kBf16 + kHead * kBf16, kHead * kBf16);
+      index.read_into(p + "k_norm.weight", dst + 2 * d * kBf16 + 2 * kHead * kBf16, kHead * kBf16);
+      index.read_into(p + "proj.qkv.weight", dst + i8_qkv_q, 3 * d * d);
+      index.read_into(p + "proj.qkv.weight_scale", dst + i8_qkv_scale, 3 * d * 4);
+      index.read_into(p + "proj.o.weight", dst + i8_o_q, d * d);
+      index.read_into(p + "proj.o.weight_scale", dst + i8_o_scale, d * 4);
+      index.read_into(p + "proj.ffn_up_gate.weight", dst + i8_up_q, 2 * f * d);
+      index.read_into(p + "proj.ffn_up_gate.weight_scale", dst + i8_up_scale, 2 * f * 4);
+      index.read_into(p + "proj.ffn_down.weight", dst + i8_down_q, d * f);
+      index.read_into(p + "proj.ffn_down.weight_scale", dst + i8_down_scale, d * 4);
+      owned_.emplace_back(i8_block_bytes);
+      owned_.back().upload(streamed.data(), i8_block_bytes);
+      weight_bytes_ += i8_block_bytes;
+      const char* base = reinterpret_cast<const char*>(at(owned_.back(), 0));
+      const auto bp = [&](std::size_t o) { return reinterpret_cast<const std::uint8_t*>(base + o); };
+      const auto fp = [&](std::size_t o) { return reinterpret_cast<const float*>(base + o); };
+      Int8BlockWeights w;
+      w.norm1 = reinterpret_cast<const bf16*>(base + 0);
+      w.norm2 = reinterpret_cast<const bf16*>(base + 2 * d * kBf16);
+      w.q_norm = reinterpret_cast<const bf16*>(base + 2 * d * kBf16 + kHead * kBf16);
+      w.k_norm = reinterpret_cast<const bf16*>(base + 2 * d * kBf16 + 2 * kHead * kBf16);
+      w.qkv.q = reinterpret_cast<const std::int8_t*>(base + i8_qkv_q);
+      w.qkv.scale = fp(i8_qkv_scale);
+      w.qkv.bias = nullptr;
+      w.o.q = reinterpret_cast<const std::int8_t*>(base + i8_o_q);
+      w.o.scale = fp(i8_o_scale);
+      w.o.bias = nullptr;
+      w.up_gate.q = reinterpret_cast<const std::int8_t*>(base + i8_up_q);
+      w.up_gate.scale = fp(i8_up_scale);
+      w.up_gate.bias = nullptr;
+      w.down.q = reinterpret_cast<const std::int8_t*>(base + i8_down_q);
+      w.down.scale = fp(i8_down_scale);
+      w.down.bias = nullptr;
+      int8_blocks_[l] = w;
+      host_blocks_.emplace_back();  // keep the parallel vectors aligned
+      slot_of_.push_back(-1);  // int8 blocks are always on-device
+      continue;
+    }
     const std::vector<std::string> names = block_names(l);
     for (std::size_t i = 0; i < names.size(); ++i) check_tensor(names[i], block_shapes[i]);
     const bool on_device = l < resident;
@@ -191,9 +269,9 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
     std::memset(dst, 0, kBlock.bytes);
     const std::size_t plain[4] = {kBlock.norm1, kBlock.norm2, kBlock.q_norm, kBlock.k_norm};
     for (std::size_t i = 0; i < 4; ++i) index.read_into(names[i], dst + plain[i], index.at(names[i]).bytes);
-    // q, k and v are packed one after the other: each holds whole row groups, so that is the [9216, 3072] weight's packing.
-    const std::size_t packed_at[6] = {kBlock.qkv, kBlock.qkv + d * d * kBf16, kBlock.qkv + 2 * d * d * kBf16, kBlock.o,
-                                      kBlock.up_gate, kBlock.down};
+    // The fused qkv [3d, d] is q, k, v stacked: packing it whole gives the [9216, 3072] qkv layout; o, up_gate and down pack
+    // to their slots.
+    const std::size_t packed_at[4] = {kBlock.qkv, kBlock.o, kBlock.up_gate, kBlock.down};
     for (std::size_t i = 4; i < names.size(); ++i) {
       const std::vector<std::int64_t>& s = block_shapes[i];
       row_major.resize(static_cast<std::size_t>(s[0] * s[1]));
@@ -373,6 +451,14 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
   DeviceBuffer& rope = scratch(rope_, total * kHead * kBf16);
   DeviceBuffer& tokens = scratch(tokens_, hw * kDiTLatentChannels * kBf16);
   DeviceBuffer& proj = scratch(proj_, rows.size() * hw * kDiTLatentChannels * kBf16);
+  // The INT8 block's scratch (rotated+quantized activations and their GEMM outputs), sized when any block is INT8.
+  if (std::any_of(is_int8_.begin(), is_int8_.end(), [](bool v) { return v; })) {
+    scratch(i8_y_, total * kDim);
+    scratch(i8_ffn_, total * kFfn);
+    scratch(i8_scale_, total * sizeof(float));
+    scratch(i8_ug_, total * 2 * kFfn * kBf16);
+    scratch(i8_gemm_out_, total * kDim * kBf16);
+  }
 
   // The video tokens [hw, 128] in bf16 (the reference's .to(bf16) of the transposed latents), the same for every row.
   std::vector<bf16> host_tokens(hw * kDiTLatentChannels);
@@ -423,16 +509,30 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
 
   for (int l = 0; l < kDiTLayers; ++l) {
     const int s = slot_of_[static_cast<std::size_t>(l)];
+    std::fprintf(stderr, "[slot] l=%d s=%d sf=%p cd=%p cs=%p\n", l, s, (s >= 0 ? (void*)slot_free_[s].get() : nullptr), (s >= 0 ? (void*)copy_done_[s].get() : nullptr), (void*)copy_stream_.get());
+    std::fflush(stderr);
     if (s >= 0) {
       // The copy waits until the slot's previous block has run; this block's ops wait for the copy. The host queues
       // everything ahead, so the next streamed block's copy (the other slot) runs while this block computes.
+      std::fprintf(stderr, "[slot-wait] l=%d s=%d\n", l, s);
+      std::fflush(stderr);
       slot_free_[s]->wait(copy_stream_.get());
       const HostBuffer& src = host_blocks_[static_cast<std::size_t>(l)];
+      std::fprintf(stderr, "[copy-before] block %d s=%d src=%p dst=%p bytes=%llu\n", l, s, (const void*)src.data(), (const void*)slots_[s].data(), (unsigned long long)src.bytes());
+      std::fflush(stderr);
       copy_async(slots_[s].data(), src.data(), src.bytes(), copy_stream_.get());
+      std::fprintf(stderr, "[copy-queued] block %d s=%d\n", l, s);
+      std::fflush(stderr);
       copy_done_[s]->record(copy_stream_.get());
       copy_done_[s]->wait(st);
+      std::fprintf(stderr, "[copy-waited] block %d s=%d\n", l, s);
+      std::fflush(stderr);
       mark(hip_block::kBlockOps);
+      std::fprintf(stderr, "[copy-done] block %d s=%d bytes=%llu\n", l, s, (unsigned long long)src.bytes());
+      std::fflush(stderr);
     }
+    std::fprintf(stderr, "[block-start] %d s=%d runs=%zu\n", l, s, runs[static_cast<std::size_t>(l)].size());
+    std::fflush(stderr);
     for (const Run& run : runs[static_cast<std::size_t>(l)]) {
       hip_block::BlockBuffers b{};
       b.x = at(x, off[run.r0] * kDim * kBf16);
@@ -449,11 +549,59 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
       b.tokens = static_cast<int>(off[run.r1] - off[run.r0]);
       b.pack = pack_.as<bf16>();
       b.pack_attn = pack_attn_.as<bf16>();
-      for (int op = 0; op < hip_block::kBlockOps; ++op) {
-        hip_block::run_block_op(op, blocks_[static_cast<std::size_t>(l)], b, st);
-        mark(op);
+      std::fprintf(stderr, "[block] %d\n", l);
+      std::fflush(stderr);
+      if (is_int8_[static_cast<std::size_t>(l)]) {
+        Int8Buffers ib{};
+        ib.i8_y = i8_y_.as<std::int8_t>();
+        ib.i8_ffn = i8_ffn_.as<std::int8_t>();
+        ib.scale = i8_scale_.as<float>();
+        ib.ug = i8_ug_.as<bf16>();
+        ib.gemm_out = i8_gemm_out_.as<bf16>();
+        for (int op = 0; op < hip_block::kBlockOps; ++op) {
+          std::fprintf(stderr, "[int8] block %d op %d\n", l, op);
+          std::fflush(stderr);
+          run_int8_block_op(op, int8_blocks_[static_cast<std::size_t>(l)], b, ib, st);
+          mark(op);
+          {
+            hipError_t e = hipDeviceSynchronize();
+            if (e != hipSuccess) std::fprintf(stderr, "[int8-sync-err] block %d op %d: %s\n", l, op, hipGetErrorString(e));
+            if (l == 1 && op == 1) {
+              // DEBUG: check b.qkv content after int8 qkv gemm
+              auto bf16_to_float = [](std::uint16_t v) -> float {
+                std::uint32_t bits = static_cast<std::uint32_t>(v) << 16;
+                float f;
+                std::memcpy(&f, &bits, sizeof(f));
+                return f;
+              };
+              {
+                std::vector<std::uint16_t> host(64);
+                hipMemcpy(host.data(), b.qkv, host.size() * sizeof(std::uint16_t), hipMemcpyDeviceToHost);
+                std::fprintf(stderr, "[qkv-head] first=%f second=%f\n", bf16_to_float(host[0]), bf16_to_float(host[1]));
+                std::fflush(stderr);
+              }
+              {
+                const std::size_t total_bytes = static_cast<std::size_t>(b.tokens) * 3 * 3072 * 2;
+                std::vector<std::uint16_t> host(64);
+                hipMemcpy(host.data(), b.qkv + total_bytes / 2 - 64, host.size() * sizeof(std::uint16_t), hipMemcpyDeviceToHost);
+                std::fprintf(stderr, "[qkv-tail] last=%f second-last=%f\n", bf16_to_float(host[63]), bf16_to_float(host[62]));
+                std::fflush(stderr);
+              }
+            }
+            std::fflush(stderr);
+          }
+        }
+      } else {
+        for (int op = 0; op < hip_block::kBlockOps; ++op) {
+          hip_block::run_block_op(op, blocks_[static_cast<std::size_t>(l)], b, st);
+          mark(op);
+          std::fprintf(stderr, "[bf16-done] block %d op %d\n", l, op);
+          std::fflush(stderr);
+        }
       }
     }
+    std::fprintf(stderr, "[block-end] %d s=%d\n", l, s);
+    std::fflush(stderr);
     if (s >= 0) slot_free_[s]->record(st);
   }
 

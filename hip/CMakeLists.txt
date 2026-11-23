@@ -1,12 +1,15 @@
 # The HIP backend: MOSS-Image's kernels for AMD GPUs through ROCm, and the same sources through HIP's NVIDIA headers for
 # checking on a CUDA device. Its own project; the engine's build does not include it. Configure once per target (README.md):
 #   -DHIP_TARGET="gfx1100;gfx1200;gfx1201"  one or more AMD architectures in one binary (the release package: all three);
-#                                           rocWMMA leaf, ROCm's clang, links libamdhip64
+#                                           rocWMMA leaf, ROCm's clang, links libamdhip64 / amdhip64.lib
 #   -DHIP_TARGET=nvidia                     scalar leaf, nvcc with HIP's NVIDIA headers
+# On Linux the ROCm SDK comes from $ROCM_PATH (-DROCM_PATH=...); on Windows a TheRock SDK, e.g.
+#   -DROCM_PATH=C:/Users/.../_rocm_sdk_devel   (its lib/llvm/bin/clang-cl builds host and device code, its
+#   lib/amdhip64.lib links, and bin/amdhip64_7.dll is copied next to moss-infer-hip).
 cmake_minimum_required(VERSION 3.28)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/version.cmake)  # MOSSINFER_VERSION, from the C header
 
-set(HIP_TARGET "" CACHE STRING "Device targets: a list of gfx1100, gfx1200, gfx1201, or nvidia")
+set(HIP_TARGET "" CACHE STRING "Device targets: a list of gfx1100, gfx1103, gfx1200, gfx1201, or nvidia")
 set(ROCM_PATH "$ENV{ROCM_PATH}" CACHE PATH "ROCm root, the directory holding include/hip and lib/llvm")
 option(MI_HIP_WERROR "Treat warnings as errors" ON)
 
@@ -17,19 +20,24 @@ elseif(HIP_TARGET)
   set(MI_HIP_AMD ON)
   list(REMOVE_DUPLICATES HIP_TARGET)
   foreach(_arch IN LISTS HIP_TARGET)
-    if(NOT _arch MATCHES "^(gfx1100|gfx1200|gfx1201)$")
+    if(NOT _arch MATCHES "^(gfx1100|gfx1103|gfx1200|gfx1201)$")
       set(MI_HIP_AMD OFF)
     endif()
   endforeach()
 endif()
 if(NOT MI_HIP_AMD AND NOT HIP_TARGET STREQUAL "nvidia")
-  message(FATAL_ERROR "Set HIP_TARGET to a list of gfx1100, gfx1200, gfx1201, or to nvidia (got '${HIP_TARGET}')")
+  message(FATAL_ERROR "Set HIP_TARGET to a list of gfx1100, gfx1103, gfx1200, gfx1201, or to nvidia (got '${HIP_TARGET}')")
 endif()
 if(NOT EXISTS "${ROCM_PATH}/include/hip/hip_runtime.h")
   message(FATAL_ERROR "ROCM_PATH (cache variable or environment) must hold include/hip/hip_runtime.h (got '${ROCM_PATH}')")
 endif()
 if(MI_HIP_AMD)
-  set(CMAKE_CXX_COMPILER "${ROCM_PATH}/lib/llvm/bin/clang++")
+  # Windows: clang-cl (MSVC mode, the VS toolchain's C runtime); Linux: ROCm's clang in GNU mode.
+  if(WIN32)
+    set(CMAKE_CXX_COMPILER "${ROCM_PATH}/lib/llvm/bin/clang-cl.exe")
+  else()
+    set(CMAKE_CXX_COMPILER "${ROCM_PATH}/lib/llvm/bin/clang++")
+  endif()
 endif()
 
 project(mossinfer_hip VERSION ${MOSSINFER_VERSION} LANGUAGES CXX)
@@ -51,9 +59,12 @@ list(APPEND MI_HIP_WARN -ffp-contract=off)
 
 # Kernel sources. block_kernels.hip is the DiT block (tools/hip_block checks it against the engine); dit_kernels.hip the
 # DiT's other ops; te_kernels.hip the text encoder's; vae_kernels.hip the VAE decoder's.
-set(MI_HIP_KERNELS block_kernels.hip dit_kernels.hip te_kernels.hip vae_kernels.hip)
-set(MI_HIP_KERNEL_HEADERS device_math.h dit_kernels.h gemm_tile.h hip_block.h mma_leaf.h te_kernels.h vae_kernels.h)
-set(MI_HIP_HOST runtime.cpp safetensors.cpp dit.cpp text_encoder.cpp vae.cpp generate.cpp)
+set(MI_HIP_KERNELS block_kernels.hip dit_kernels.hip te_kernels.hip vae_kernels.hip int8_gemm.hip rotate_quantize.hip
+                    int8_block.hip)
+set(MI_HIP_KERNEL_HEADERS device_math.h dit_kernels.h gemm_tile.h hip_block.h mma_leaf.h te_kernels.h vae_kernels.h
+                           int8_leaf.h int8_block.h)
+set(MI_HIP_HOST runtime.cpp safetensors.cpp dit.cpp text_encoder.cpp vae.cpp generate.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../src/weights/quant/quant_codec.cpp)
 
 if(HIP_TARGET STREQUAL "nvidia")
   set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures of the NVIDIA build")
@@ -77,6 +88,11 @@ else()
   # One fat binary: a code object per architecture. MI_HIP_TARGET names them, comma-separated (runtime.cpp).
   set(MI_HIP_PATHS --rocm-path=${ROCM_PATH} --hip-path=${ROCM_PATH})
   set(MI_HIP_FLAGS ${MI_HIP_PATHS})
+  # TheRock places the ocml device library (bitcode) outside the default search path:
+  # <rocm>/lib/llvm/amdgcn/bitcode. A full ROCm SDK (Linux) keeps the default /opt/rocm/lib/amdgcn/bitcode.
+  if(WIN32)
+    list(APPEND MI_HIP_FLAGS --rocm-device-lib-path=${ROCM_PATH}/lib/llvm/amdgcn/bitcode)
+  endif()
   foreach(_arch IN LISTS HIP_TARGET)
     list(APPEND MI_HIP_FLAGS --offload-arch=${_arch})
   endforeach()
@@ -88,9 +104,9 @@ else()
   set_property(SOURCE ${MI_HIP_HOST} PROPERTY COMPILE_OPTIONS ${MI_HIP_WARN})
 
   add_library(mossinfer_hip STATIC ${MI_HIP_KERNELS} ${MI_HIP_HOST})
-  target_compile_definitions(mossinfer_hip PUBLIC __HIP_PLATFORM_AMD__=1 PRIVATE HIP_BLOCK_LEAF_ROCWMMA
+  target_compile_definitions(mossinfer_hip PUBLIC __HIP_PLATFORM_AMD__=1 PRIVATE HIP_BLOCK_LEAF_ROCWMMA ROCWMMA_I8_LEAF
                                                   MI_HIP_TARGET="${MI_HIP_TARGET_NAMES}")
-  target_include_directories(mossinfer_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_include_directories(mossinfer_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../src)
   target_include_directories(mossinfer_hip SYSTEM PUBLIC ${ROCM_PATH}/include)
   # libamdhip64 from ROCM_PATH; the executables find it there in the build tree (BUILD_RPATH), and the installed
   # moss-infer-hip in /opt/rocm/lib (INSTALL_RPATH, below).
@@ -99,7 +115,10 @@ else()
   set(CMAKE_BUILD_RPATH ${ROCM_PATH}/lib)
 
   # Each kernel source's device build on its own, per architecture: the assembly and linked code object
-  # check_device.sh reads (<source>.<arch>.s, .co). Same flags as the library's compile.
+  # check_device.sh reads (<source>.<arch>.s, .co). Same flags as the library's compile. check_device.sh is a
+  # bash script, so the check runs on Unix hosts only; the Windows build compiles the same device code through
+  # the library's own compile.
+  if(NOT WIN32)
   set(MI_HIP_DEVICE_ARGS -x hip -std=c++17 -O3 ${MI_HIP_PATHS} --cuda-device-only -D__HIP_PLATFORM_AMD__=1
       -DHIP_BLOCK_LEAF_ROCWMMA -I${CMAKE_CURRENT_SOURCE_DIR} -isystem ${ROCM_PATH}/include ${MI_HIP_WARN})
   set(_deps "")
@@ -128,6 +147,7 @@ else()
     endforeach()
   endforeach()
   add_custom_target(mossinfer_hip_device_check ALL DEPENDS ${_checks})
+  endif()
 endif()
 
 # moss-infer-hip, the standalone program: the backend plus the engine's host sources it shares with moss-infer (the
@@ -150,11 +170,19 @@ target_link_libraries(moss-infer-hip PRIVATE mossinfer_hip mossinfer_hip_host)
 # runtime ships: ROCm 7 provides libamdhip64.so.7, found in /opt/rocm/lib (the installed program's RUNPATH) or on the
 # loader path.
 if(MI_HIP_AMD)
-  set_target_properties(moss-infer-hip PROPERTIES INSTALL_RPATH /opt/rocm/lib)
+  if(NOT WIN32)
+    set_target_properties(moss-infer-hip PROPERTIES INSTALL_RPATH /opt/rocm/lib)
+  endif()
   # The program itself then needs no libstdc++ of the build's age; ROCm's libamdhip64 still loads the system's.
   option(MOSSINFER_STATIC_LIBSTDCXX "Link libstdc++ and libgcc statically into moss-infer-hip (release packages)" OFF)
-  if(MOSSINFER_STATIC_LIBSTDCXX)
+  if(MOSSINFER_STATIC_LIBSTDCXX AND NOT WIN32)
     target_link_options(moss-infer-hip PRIVATE -static-libstdc++ -static-libgcc)
+  endif()
+  # Windows: amdhip64_7.dll (versioned name) from the SDK's bin next to the program.
+  if(WIN32)
+    file(GLOB _mi_hip_dlls "${ROCM_PATH}/bin/amdhip64*.dll")
+    add_custom_command(TARGET moss-infer-hip POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_mi_hip_dlls} $<TARGET_FILE_DIR:moss-infer-hip>)
   endif()
   install(TARGETS moss-infer-hip RUNTIME DESTINATION bin)
   install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../LICENSE ${CMAKE_CURRENT_SOURCE_DIR}/../NOTICE
@@ -169,7 +197,12 @@ if(MI_HIP_AMD)
   # The release name for the release's three architectures; a build of fewer names them, so it cannot pass for it.
   set(_mi_hip_archs ${HIP_TARGET})
   list(SORT _mi_hip_archs)
-  set(CPACK_PACKAGE_FILE_NAME "mossinfer-${MOSSINFER_VERSION}-linux-hip-${_mi_arch}")
+  if(WIN32)
+    set(_mi_os windows)
+  else()
+    set(_mi_os linux)
+  endif()
+  set(CPACK_PACKAGE_FILE_NAME "mossinfer-${MOSSINFER_VERSION}-${_mi_os}-hip-${_mi_arch}")
   if(NOT _mi_hip_archs STREQUAL "gfx1100;gfx1200;gfx1201")
     list(JOIN _mi_hip_archs "-" _mi_hip_suffix)
     string(APPEND CPACK_PACKAGE_FILE_NAME "-${_mi_hip_suffix}")

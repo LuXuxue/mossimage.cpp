@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <mutex>
@@ -18,6 +19,7 @@
 #include "hip_block.h"
 #include "safetensors.h"
 #include "te_kernels.h"
+#include "weights/quant/quant_codec.h"
 
 namespace mi::hip {
 namespace {
@@ -42,9 +44,17 @@ std::uint64_t align256(std::uint64_t v) { return (v + 255) & ~std::uint64_t{255}
 
 using TensorRef = std::pair<const st::File*, const st::TensorInfo*>;
 
+// A weight's source: a file tensor (BF16) or a dequantized I8 weight held as host BF16.
+struct WeightSource {
+  const st::File* file = nullptr;      // set for file tensors
+  const st::TensorInfo* info = nullptr;  // set for file tensors
+  const bf16* host_bf16 = nullptr;     // set for dequantized I8 weights
+  std::uint64_t bytes = 0;
+};
+
 // One read of a tensor into the layer's staging layout.
 struct Piece {
-  TensorRef tensor;
+  WeightSource src;
   std::uint64_t offset;  // in the layer layout
 };
 
@@ -124,8 +134,9 @@ struct TextEncoder::Impl {
   bool current;  // the device made current before any member below allocates on it (the streams first)
   TextEncoderOptions options;
   std::map<std::string, std::unique_ptr<st::File>> files;
-  std::map<std::string, TensorRef> tensors;
-  TensorRef embed{}, final_norm{};
+  std::map<std::string, WeightSource> tensors;
+  WeightSource embed{}, final_norm{};
+  HostBuffer dequant;  // dequantized I8 weights, as host BF16 (one contiguous block)
   std::int64_t vocab = 0;
   std::vector<LayerPlan> layers;
   std::uint64_t layer_bytes = 0, packed_bytes = 0;
@@ -139,18 +150,44 @@ struct TextEncoder::Impl {
       : device(d), current((d.make_current(), true)), options(o) {
     if (options.reader_threads < 1) throw std::invalid_argument("hip text encoder: reader_threads must be positive");
     for (const auto& [name, shard] : st::read_index(dir / "model.safetensors.index.json")) {
-      if (name.rfind("language_model.", 0) != 0) continue;
+      // Accept both "language_model.*" and "model.language_model.*" tensor naming; the file lookup keeps the original name.
+      std::string key = name;
+      if (key.rfind("model.", 0) == 0) key = key.substr(6);
+      if (key.rfind("language_model.", 0) != 0) continue;
       auto& file = files[shard];
       if (!file) file = std::make_unique<st::File>(dir / shard);
-      tensors[name] = {file.get(), &file->at(name)};
+      tensors[key] = {file.get(), &file->at(name), nullptr, file->at(name).bytes};
+    }
+    // Dequantize the I8 ConvRot weights to host BF16 (the high tier's text encoder ships int8 weights).
+    std::uint64_t i8_bytes = 0;
+    for (const auto& [key, src] : tensors) {
+      if (src.info && src.info->dtype == "I8") i8_bytes += src.info->bytes;
+    }
+    dequant = HostBuffer(2 * i8_bytes);  // BF16: two bytes per dequantized element
+    bf16* dq = dequant.as<bf16>();
+    std::size_t dq_off = 0;
+    for (auto& [key, src] : tensors) {
+      if (!(src.info && src.info->dtype == "I8")) continue;
+      const std::int64_t N = src.info->shape[0], K = src.info->shape[1];
+      std::vector<std::int8_t> q(static_cast<std::size_t>(N) * K);
+      src.file->read(*src.info, q.data());
+      const auto sit = tensors.find(key + "_scale");
+      if (sit == tensors.end() || !sit->second.file) fail("no weight_scale for " + key);
+      std::vector<float> scale(static_cast<std::size_t>(N));
+      sit->second.file->read(*sit->second.info, scale.data());
+      std::vector<float> f32(static_cast<std::size_t>(N) * K);
+      mi::quant::dequantize_rows(q.data(), scale.data(), N, K, 256, f32.data());
+      const std::size_t count = static_cast<std::size_t>(N) * K;
+      for (std::size_t i = 0; i < count; ++i) dq[dq_off + i] = mi::quant::float_to_bf16(f32[i]);
+      src = {nullptr, nullptr, dq + dq_off, 2 * count};
+      dq_off += count;
     }
     const auto it = tensors.find("language_model.embed_tokens.weight");
-    if (it == tensors.end() || it->second.second->dtype != "BF16" || it->second.second->shape.size() != 2 ||
-        it->second.second->shape[1] != kTeHidden || it->second.second->shape[0] < 1) {
-      fail("language_model.embed_tokens.weight must be BF16 [vocab, 4096]");
+    if (it == tensors.end() || it->second.bytes == 0 || it->second.bytes % (2 * kTeHidden) != 0) {
+      fail("language_model.embed_tokens.weight must be [vocab, 4096]");
     }
     embed = it->second;
-    vocab = embed.second->shape[0];
+    vocab = static_cast<std::int64_t>(embed.bytes / (2 * kTeHidden));
     final_norm = lookup("language_model.norm.weight", {kTeHidden});
     for (int i = 0; i < kTeLayers; ++i) layers.push_back(plan_layer(i));
     for (const LayerPlan& l : layers) {
@@ -166,19 +203,24 @@ struct TextEncoder::Impl {
       raw[1] = DeviceBuffer(layer_bytes);
     }
     std::vector<bf16> c(2 * kTeHidden, 0x3f80);  // [final norm | ones]
-    final_norm.first->read(*final_norm.second, c.data());
+    if (final_norm.file) {
+      final_norm.file->read(*final_norm.info, c.data());
+    } else {
+      std::memcpy(c.data(), final_norm.host_bf16, final_norm.bytes);
+    }
     consts = DeviceBuffer(c.size() * 2);
     consts.upload(c.data(), c.size() * 2);
     device.synchronize();  // a pageable upload's DMA may be in flight on return
   }
 
-  const TensorRef& lookup(const std::string& name, const std::vector<std::int64_t>& shape) const {
+  const WeightSource& lookup(const std::string& name, const std::vector<std::int64_t>& shape) const {
     const auto it = tensors.find(name);
     if (it == tensors.end()) fail("no tensor " + name);
-    if (it->second.second->dtype != "BF16" || it->second.second->shape != shape) {
-      fail("tensor " + name + " must be BF16 of the Qwen3.5 text encoder's shape");
-    }
-    return it->second;
+    const WeightSource& s = it->second;
+    std::uint64_t expected = 2;  // BF16: two bytes per element
+    for (const std::int64_t d : shape) expected *= static_cast<std::uint64_t>(d);
+    if (s.bytes != expected) fail("tensor " + name + " has the wrong size");
+    return s;
   }
 
   LayerPlan plan_layer(int i) const {
@@ -186,11 +228,11 @@ struct TextEncoder::Impl {
     l.full_attention = i % 4 == 3;
     const std::string p = "language_model.layers." + std::to_string(i) + ".";
     const auto add = [&](const std::string& name, const std::vector<std::int64_t>& shape) {
-      const TensorRef& t = lookup(p + name, shape);
+      const WeightSource& t = lookup(p + name, shape);
       l.bytes = align256(l.bytes);
       const std::uint64_t at = l.bytes;
       l.pieces.push_back({t, at});
-      l.bytes += t.second->bytes;
+      l.bytes += t.bytes;
       return at;
     };
     // A group's tensors back to back: their sizes are multiples of 256 bytes, so the alignment adds no gap.
@@ -248,8 +290,8 @@ struct TextEncoder::Impl {
     };
     std::vector<Chunk> chunks;
     for (const Piece& p : l.pieces) {
-      for (std::uint64_t rel = 0; rel < p.tensor.second->bytes; rel += kReadChunk) {
-        chunks.push_back({&p, rel, std::min(kReadChunk, p.tensor.second->bytes - rel)});
+      for (std::uint64_t rel = 0; rel < p.src.bytes; rel += kReadChunk) {
+        chunks.push_back({&p, rel, std::min(kReadChunk, p.src.bytes - rel)});
       }
     }
     std::atomic<std::size_t> next{0};
@@ -258,7 +300,12 @@ struct TextEncoder::Impl {
       try {
         for (std::size_t i = next++; i < chunks.size(); i = next++) {
           const Chunk& c = chunks[i];
-          c.piece->tensor.first->read(*c.piece->tensor.second, dst + c.piece->offset + c.rel, c.rel, c.bytes);
+          const WeightSource& s = c.piece->src;
+          if (s.file) {
+            s.file->read(*s.info, dst + c.piece->offset + c.rel, c.rel, c.bytes);
+          } else {
+            std::memcpy(dst + c.piece->offset + c.rel, s.host_bf16 + c.rel / 2, c.bytes);
+          }
         }
       } catch (...) {
         errors[t] = std::current_exception();
@@ -572,8 +619,13 @@ std::vector<std::vector<bf16>> TextEncoder::Impl::encode(const std::vector<std::
       std::size_t r = 0;
       for (const auto& sq : seqs) {
         for (const std::int32_t id : sq) {
-          embed.first->read(*embed.second, rows.data() + r++ * kTeHidden, static_cast<std::uint64_t>(id) * kTeHidden * 2,
-                            kTeHidden * 2);
+          if (embed.file) {
+            embed.file->read(*embed.info, rows.data() + r++ * kTeHidden, static_cast<std::uint64_t>(id) * kTeHidden * 2,
+                             kTeHidden * 2);
+          } else {
+            std::memcpy(rows.data() + r++ * kTeHidden, embed.host_bf16 + static_cast<std::size_t>(id) * kTeHidden,
+                        kTeHidden * 2);
+          }
         }
       }
       act.upload(rows.data(), rows.size() * 2, sc.x);

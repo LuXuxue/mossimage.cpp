@@ -180,8 +180,9 @@ Args parse(const std::vector<std::string>& argv) {
     else if (f == "--device") a.device = int32(f, v);
     else if (f == "--vram-budget") a.vram_budget = vram_bytes(f, number(f, v));
     else if (f == "--tier") {
-      // The backend runs the bf16 files exactly as the reference tier does; the lossy tiers need the CUDA kernels.
-      if (v != "reference") usage("moss-infer-hip runs --tier reference only");
+      // reference: bf16 weights; high: the INT8 ConvRot DiT (int8 x int8 -> int32 -> bf16), auto-detected per block from the
+      // model's safetensors dtypes. The other tiers are CUDA-only.
+      if (v != "reference" && v != "high") usage("moss-infer-hip runs --tier reference or high");
     }
     else usage("unknown or unsupported flag " + f);
   }
