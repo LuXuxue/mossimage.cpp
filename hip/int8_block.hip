@@ -35,23 +35,7 @@ constexpr std::int64_t kFfn = 8192;
 constexpr int kHeads = 24;
 constexpr std::int64_t kHead = 128;
 
-// x[m, n] += bf16(out[m, n] * gate[n]) in place (the gated residual after an int8 GEMM).
-__global__ void gate_residual_kernel(bf16* x, const bf16* out, const bf16* gate, std::int64_t m, int n) {
-  const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= m * n) return;
-  const int c = static_cast<int>(i % n);
-  x[i] = bf(add(f(x[i]), mul(f(out[i]), f(gate[c]))));
-}
-
 }  // namespace
-
-void int8_gate_residual(bf16* residual, std::int64_t ldr, const bf16* out, const bf16* gate, std::int64_t m, int n,
-                        hipStream_t stream) {
-  const std::int64_t total = m * n;
-  const int kThreads = 256;
-  gate_residual_kernel<<<dim3((total + kThreads - 1) / kThreads), dim3(kThreads), 0, stream>>>(residual, out, gate, m, n);
-  check_launch("int8_gate_residual");
-}
 
 void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b, const Int8Buffers& ib, hipStream_t stream,
                        const bf16* lora_delta, std::int64_t ldl) {
@@ -70,8 +54,7 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b,
       qk_norm_rope(b.qkv, kQkv, tokens, kHeads, w.q_norm, w.k_norm, b.rope, kHead, stream);
       break;
     case 3:  // attention: int8 QK + int8 PV, comfy-kitchen's gfx1103 SageAttention path
-      int8_attn_quantize(b.qkv, kQkv, ib.attn, static_cast<int>(tokens),
-                         static_cast<std::size_t>(ib.attn.padded) * kHeads * kHeadDim, stream);
+      int8_attn_quantize(b.qkv, kQkv, ib.attn, static_cast<int>(tokens), stream);
       int8_attn_run(ib.attn, b.attn, kDim, b.max_seqlen,
                     static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHead))), stream);
       break;

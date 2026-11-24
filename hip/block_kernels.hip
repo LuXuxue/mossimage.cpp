@@ -62,7 +62,7 @@ struct PackArgs {
 };
 __global__ __launch_bounds__(kWave) void pack_kernel(const PackArgs a) {
   const int t = thread_id(), r = t / 2, c0 = (t & 1) * 8;
-  const std::int64_t ks = blockIdx.x, group = blockIdx.y, row = group * kFrag + r;  // along the row groups: 0.9 ms at K 8192, across them 23 ms
+  const std::int64_t ks = blockIdx.x, group = blockIdx.y, row = group * kFrag + r;  // K steps along x, row groups along y
   copy_lane_of_fragment(a.to + (group * a.kg + ks) * (kFrag * kFrag) + r * kFrag + c0, a.from + row * a.ld + ks * kFrag + c0, row >= a.rows);
 }
 

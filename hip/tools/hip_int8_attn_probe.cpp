@@ -65,13 +65,13 @@ int main(int argc, char** argv) {
   dq.upload(qkv.data(), qkv.size() * 2);
   ds.upload(cu, sizeof(cu), reinterpret_cast<std::uint8_t*>(const_cast<std::int32_t*>(b.cu)) -
                                 reinterpret_cast<std::uint8_t*>(ds.data()));
-  int8_attn_quantize(dq.as<bf16>(), 3 * dim, b, T, padded * h, st);
+  int8_attn_quantize(dq.as<bf16>(), 3 * dim, b, T, st);
   int8_attn_run(b, dout.as<bf16>(), dim, T, static_cast<float>(1.0 / std::sqrt(double(D))), st);
   if (std::getenv("MI_I8ATTN_BENCH")) {
     hipDeviceSynchronize();
     const int iters = 20;
     const auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < iters; ++i) int8_attn_quantize(dq.as<bf16>(), 3 * dim, b, T, padded * h, st);
+    for (int i = 0; i < iters; ++i) int8_attn_quantize(dq.as<bf16>(), 3 * dim, b, T, st);
     hipDeviceSynchronize();
     const double qms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     const auto t1 = std::chrono::steady_clock::now();

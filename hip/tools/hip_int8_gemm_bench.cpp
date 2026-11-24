@@ -1,8 +1,7 @@
-// Time the high tier's four INT8 GEMM shapes. Set MI_HIP_GEMM_VARIANT to choose the tile.
+// Time the high tier's four INT8 GEMM shapes with the build's tile configuration.
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <vector>
 
 #include "int8_gemm.h"

@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "runtime.h"
 #include "text_encoder.h"
@@ -12,7 +13,8 @@ int main(int argc, char** argv) {
   Device device(-1);
   TextEncoderOptions opt;
   opt.time_ops = true;
-  opt.tiled_gemm = std::getenv("MI_HIP_TE_PACKED_GEMM") == nullptr;
+  const char* pg = std::getenv("MI_HIP_TE_PACKED_GEMM");
+  opt.tiled_gemm = pg == nullptr || std::strcmp(pg, "0") == 0;
   auto t0 = std::chrono::steady_clock::now();
   TextEncoder enc(device, argv[1], opt);
   double ctor = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

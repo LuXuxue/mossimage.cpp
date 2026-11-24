@@ -4,8 +4,8 @@
 #                                           rocWMMA leaf, ROCm's clang, links libamdhip64 / amdhip64.lib
 #   -DHIP_TARGET=nvidia                     scalar leaf, nvcc with HIP's NVIDIA headers
 # On Linux the ROCm SDK comes from $ROCM_PATH (-DROCM_PATH=...); on Windows a TheRock SDK, e.g.
-#   -DROCM_PATH=C:/Users/.../_rocm_sdk_devel   (its lib/llvm/bin/clang-cl builds host and device code, its
-#   lib/amdhip64.lib links, and bin/amdhip64_7.dll is copied next to moss-infer-hip).
+#   -DROCM_PATH=<SDK devel root>   (its lib/llvm/bin/clang-cl builds host and device code, its
+#   lib/amdhip64.lib links, and its bin/amdhip64*.dll files are copied next to moss-infer-hip).
 cmake_minimum_required(VERSION 3.28)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/version.cmake)  # MOSSINFER_VERSION, from the C header
 
@@ -104,9 +104,7 @@ else()
   set_property(SOURCE ${MI_HIP_HOST} PROPERTY COMPILE_OPTIONS ${MI_HIP_WARN})
 
   add_library(mossinfer_hip STATIC ${MI_HIP_KERNELS} ${MI_HIP_HOST})
-  set(MI_I8ATTN_ROT "4" CACHE STRING "Rotation used by the int8 attention quantizers (4 or 128)")
   target_compile_definitions(mossinfer_hip PUBLIC __HIP_PLATFORM_AMD__=1 PRIVATE HIP_BLOCK_LEAF_ROCWMMA ROCWMMA_I8_LEAF
-                                                  MI_I8ATTN_ROT=${MI_I8ATTN_ROT}
                                                   MI_HIP_TARGET="${MI_HIP_TARGET_NAMES}")
   target_include_directories(mossinfer_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../src)
   target_include_directories(mossinfer_hip SYSTEM PUBLIC ${ROCM_PATH}/include)
@@ -180,8 +178,8 @@ if(MI_HIP_AMD)
   if(MOSSINFER_STATIC_LIBSTDCXX AND NOT WIN32)
     target_link_options(moss-infer-hip PRIVATE -static-libstdc++ -static-libgcc)
   endif()
-  # Windows: the HIP runtime DLLs from the SDK's bin next to the program. amdhip64_7.dll imports
-  # rocm_kpack.dll and amd_comgr.dll, so the versioned runtime alone is not enough to load.
+  # Windows: the HIP runtime DLLs from the SDK's bin next to the program. The versioned
+  # amdhip64*.dll imports rocm_kpack.dll and amd_comgr.dll, so it alone is not enough to load.
   if(WIN32)
     file(GLOB _mi_hip_dlls "${ROCM_PATH}/bin/amdhip64*.dll")
     list(APPEND _mi_hip_dlls "${ROCM_PATH}/bin/rocm_kpack.dll" "${ROCM_PATH}/bin/amd_comgr.dll")
@@ -274,7 +272,7 @@ add_executable(hip_bf16_gemm_bench tools/hip_bf16_gemm_bench.cpp)
 target_compile_options(hip_bf16_gemm_bench PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_bf16_gemm_bench PRIVATE mossinfer_hip)
 
-# The tiled bf16 GEMM used by the LoRA side branch.
+# The tiled bf16 GEMM used by the LoRA side branch and the text encoder's projections.
 add_executable(hip_bf16_gemm_check tools/hip_bf16_gemm_check.cpp)
 target_compile_options(hip_bf16_gemm_check PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_bf16_gemm_check PRIVATE mossinfer_hip)

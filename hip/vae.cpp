@@ -197,9 +197,8 @@ Layout layout(int c, std::uint32_t h, std::uint32_t w) {
 
 double gib(std::uint64_t b) { return static_cast<double>(b) / (1024.0 * 1024.0 * 1024.0); }
 
-// Attention operands are packed as 2 TF32 bf16 pieces by default (3 instead of 6 GEMM products, ~0.5 s faster at
-// 1536x1024; the decoded image differs from the fp32-accurate path by at most 1 byte on <0.5% of pixels).
-// MI_HIP_VAE_ATTN_PIECES=3 restores the fp32-accurate 3-piece path.
+// Attention operands are packed as 2 TF32 bf16 pieces by default (3 instead of 6 GEMM products), with a small
+// decoded-image difference from the fp32-accurate path. MI_HIP_VAE_ATTN_PIECES=3 restores the exact 3-piece path.
 int attn_pieces() {
   if (const char* s = std::getenv("MI_HIP_VAE_ATTN_PIECES")) {
     const int v = std::atoi(s);

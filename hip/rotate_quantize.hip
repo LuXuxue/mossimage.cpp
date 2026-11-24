@@ -8,8 +8,7 @@
 //
 // The row absmax is a max over every rotated element (exact in any order); the scale is max(min(amax, bf16max) / 127,
 // 1e-30); the quantized bytes go back through the same transpose, so each lane stores its 16 contiguous bytes of a group
-// with one 16-byte store. The fused variant first applies the engine's rms_norm_moss + SiTU modulate (norm weight, scale,
-// shift) to the row in bf16, then rotates and quantizes.
+// with one 16-byte store.
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -103,18 +102,6 @@ struct RotateArgs {
   float* scale;
 };
 
-struct FusedArgs {
-  const bf16* x;
-  std::int64_t ldx;
-  const bf16* weight;
-  const bf16* scale;
-  const bf16* shift;
-  std::int64_t k;
-  std::int8_t* q;
-  std::int64_t ldq;
-  float* scale_out;
-};
-
 template <int kPairsPerWarp>
 __global__ void rotate_quantize_kernel(RotateArgs a, int row0) {
   extern __shared__ float tiles[];  // warps x 2 x kHalfFloats
@@ -181,98 +168,6 @@ __global__ void rotate_quantize_kernel(RotateArgs a, int row0) {
   }
 }
 
-template <int kPairsPerWarp>
-__global__ void rms_modulate_rotate_quantize_kernel(FusedArgs a, int row0) {
-  extern __shared__ float tiles[];  // warps x 2 x kHalfFloats
-  __shared__ float warp_sumsq[kMaxWarps];
-  __shared__ float inv_rms;
-  const int lane = static_cast<int>(threadIdx.x) & 31;
-  const int warp = static_cast<int>(threadIdx.x) >> 5;
-  const int warps = static_cast<int>(blockDim.x) >> 5;
-  const int half = lane >> 4, h = lane & 15;
-  const int row = row0 + static_cast<int>(blockIdx.y);
-  const int groups = static_cast<int>(a.k) / kConvRotGroup;
-
-  float x[kPairsPerWarp][16];
-  float* tile = tiles + (warp * 2 + half) * kHalfFloats;
-  const bf16* bx = a.x + static_cast<std::int64_t>(row) * a.ldx;
-  float sumsq = 0.0f;
-  HIP_BLOCK_UNROLL
-  for (int i = 0; i < kPairsPerWarp; ++i) {
-    const int g = 2 * (warp + i * warps) + half;
-    if (g >= groups) continue;
-    const bf16* src = bx + static_cast<std::int64_t>(g) * kConvRotGroup + 16 * h;
-    HIP_BLOCK_UNROLL
-    for (int j = 0; j < 16; ++j) {
-      x[i][j] = f(src[j]);
-      sumsq = add(sumsq, mul(x[i][j], x[i][j]));
-    }
-  }
-  for (int off = 16; off > 0; off >>= 1) sumsq = add(sumsq, __shfl_xor_sync(0xffffffffull, sumsq, off));
-  if (lane == 0) warp_sumsq[warp] = sumsq;
-  __syncthreads();
-  sumsq = warp_sumsq[0];
-  for (int w = 1; w < warps; ++w) sumsq = add(sumsq, warp_sumsq[w]);
-  const float r = rsqrt(add(mul(sumsq, 1.0f / static_cast<float>(a.k)), 1e-6f));
-  if (threadIdx.x == 0) inv_rms = r;
-  __syncthreads();
-  const float rr = inv_rms;
-
-  // rms_norm_moss + SiTU modulate in bf16: y = rbf(rbf(x * r) * weight); out = bf(rbf(y * (1 + scale)) + shift).
-  HIP_BLOCK_UNROLL
-  for (int i = 0; i < kPairsPerWarp; ++i) {
-    const int g = 2 * (warp + i * warps) + half;
-    if (g >= groups) continue;
-    const std::int64_t off = static_cast<std::int64_t>(g) * kConvRotGroup + 16 * h;
-    HIP_BLOCK_UNROLL
-    for (int j = 0; j < 16; ++j) {
-      const float y = rbf(mul(rbf(mul(x[i][j], rr)), f(a.weight[off + j])));
-      const float one_plus = rbf(add(1.0f, f(a.scale[off + j])));
-      x[i][j] = f(bf(add(rbf(mul(y, one_plus)), f(a.shift[off + j]))));
-    }
-  }
-
-  float amax = 0.0f;
-  HIP_BLOCK_UNROLL
-  for (int i = 0; i < kPairsPerWarp; ++i) {
-    if (2 * (warp + i * warps) >= groups) continue;
-    hadamard256(x[i], tile, h);
-    const int g = 2 * (warp + i * warps) + half;
-    if (g >= groups) continue;
-    HIP_BLOCK_UNROLL
-    for (int j = 0; j < 16; ++j) {
-      x[i][j] = rbf(x[i][j]);
-      amax = fmaxf(amax, fabsf(x[i][j]));
-    }
-  }
-  for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffull, amax, off));
-  if (lane == 0) warp_sumsq[warp] = amax;
-  __syncthreads();
-  amax = warp_sumsq[0];
-  for (int w = 1; w < warps; ++w) amax = fmaxf(amax, warp_sumsq[w]);
-
-  const float s = fmaxf(mul(fminf(amax, kBf16Max), kInv127), kMinScale);
-  if (threadIdx.x == 0) a.scale_out[row] = s;
-  const float s_bf = rbf(s);
-  std::int8_t* qr = a.q + static_cast<std::int64_t>(row) * a.ldq;
-  HIP_BLOCK_UNROLL
-  for (int i = 0; i < kPairsPerWarp; ++i) {
-    if (2 * (warp + i * warps) >= groups) continue;
-    const int g = 2 * (warp + i * warps) + half;
-    HIP_BLOCK_UNROLL
-    for (int j = 0; j < 16; ++j) {
-      const float qv = nearbyintf(rbf(div(x[i][j], s_bf)));
-      tile[j * kStride + h] = fminf(127.0f, fmaxf(-128.0f, qv));
-    }
-    __syncwarp();
-    std::int8_t bytes[16];
-    HIP_BLOCK_UNROLL
-    for (int j = 0; j < 16; ++j) bytes[j] = static_cast<std::int8_t>(tile[h * kStride + j]);
-    __syncwarp();
-    if (g < groups) *reinterpret_cast<uint4*>(qr + static_cast<std::int64_t>(g) * kConvRotGroup + 16 * h) = *reinterpret_cast<uint4*>(bytes);
-  }
-}
-
 void check_launch(const char* what) {
   const auto e = hipGetLastError();
   if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
@@ -302,30 +197,6 @@ void rotate_quantize(const bf16* x, std::int64_t ldx, std::int64_t rows, std::in
     }
   }
   check_launch("rotate_quantize");
-}
-
-// rms_norm_moss + SiTU modulate, then rotate and quantize a [rows, k] bf16 row to [rows, k] int8 with one per-row scale.
-void rms_norm_modulate_rotate_quantize(const bf16* x, std::int64_t ldx, const bf16* weight, const bf16* scale,
-                                       const bf16* shift, std::int64_t rows, std::int64_t k, std::int8_t* q,
-                                       std::int64_t ldq, float* scale_out, hipStream_t stream) {
-  const int groups = static_cast<int>(k) / kConvRotGroup;
-  const BlockShape bs = BlockShape::of(groups);
-  const int threads = 32 * bs.warps;
-  const size_t smem = static_cast<size_t>(bs.warps) * 2 * kHalfFloats * sizeof(float);
-  const FusedArgs fa{x, ldx, weight, scale, shift, k, q, ldq, scale_out};
-  constexpr std::int64_t kChunkRows = 8192;
-  for (std::int64_t row0 = 0; row0 < rows; row0 += kChunkRows) {
-    const int chunk = static_cast<int>(std::min<std::int64_t>(kChunkRows, rows - row0));
-    const dim3 grid(1, static_cast<unsigned>(chunk), 1);
-    switch (bs.pairs) {
-      case 1: rms_modulate_rotate_quantize_kernel<1><<<grid, dim3(threads), smem, stream>>>(fa, static_cast<int>(row0)); break;
-      case 2: rms_modulate_rotate_quantize_kernel<2><<<grid, dim3(threads), smem, stream>>>(fa, static_cast<int>(row0)); break;
-      case 3: rms_modulate_rotate_quantize_kernel<3><<<grid, dim3(threads), smem, stream>>>(fa, static_cast<int>(row0)); break;
-      case 4: rms_modulate_rotate_quantize_kernel<4><<<grid, dim3(threads), smem, stream>>>(fa, static_cast<int>(row0)); break;
-      default: throw std::runtime_error("rms_norm_modulate_rotate_quantize: unsupported pairs");
-    }
-  }
-  check_launch("rms_norm_modulate_rotate_quantize");
 }
 
 }  // namespace mi::hip

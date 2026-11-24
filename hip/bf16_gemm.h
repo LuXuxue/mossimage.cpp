@@ -1,6 +1,6 @@
-// Tiled bf16 GEMM for the LoRA side branch: C[m,n] = A[m,k] @ B[n,k]^T, fp32
-// accumulation with a single bf16 rounding at the store. The op order and rounding
-// match hip_block::gemm, but a 128x128 LDS-staged tile replaces its 32x48 one.
+// Tiled bf16 GEMM for the LoRA side branch and, by default, the text encoder's projections:
+// C[m,n] = A[m,k] @ B[n,k]^T, fp32 accumulation with a single bf16 rounding at the store.
+// The op order and rounding match hip_block::gemm, but a 128x128 LDS-staged tile replaces its 32x48 one.
 #pragma once
 
 #include <cstdint>

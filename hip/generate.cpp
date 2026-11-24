@@ -179,8 +179,10 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     double t0 = now_s();
     report("text encoder load", 0, 1);
     TextEncoderOptions te_options;
-    te_options.exact_dequant = std::getenv("MI_HIP_TE_EXACT_DEQUANT") != nullptr;
-    te_options.tiled_gemm = std::getenv("MI_HIP_TE_PACKED_GEMM") == nullptr;
+    const char* ed = std::getenv("MI_HIP_TE_EXACT_DEQUANT");
+    te_options.exact_dequant = ed != nullptr && std::strcmp(ed, "0") != 0;
+    const char* pg = std::getenv("MI_HIP_TE_PACKED_GEMM");
+    te_options.tiled_gemm = pg == nullptr || std::strcmp(pg, "0") == 0;
     const char* dd = std::getenv("MI_HIP_TE_DEVICE_DEQUANT");
     te_options.device_dequant = dd == nullptr || std::strcmp(dd, "0") != 0;
     TextEncoder encoder(device, component(r.te_file, "text_encoder"), te_options);

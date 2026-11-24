@@ -43,7 +43,6 @@ class Lora {
   const LoraBlock& block(int l) const { return blocks_[static_cast<std::size_t>(l)]; }
   int max_rank() const { return max_rank_; }
   int max_n() const { return max_n_; }
-  const std::string& path() const { return path_; }
   int adapters() const { return adapters_; }
 
   struct Loaded {

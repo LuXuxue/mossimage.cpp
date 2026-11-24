@@ -9,7 +9,8 @@
 //   k_scale: [padded / 16, heads] float, one scale per 16 adjacent keys;
 //   v_scale: [heads * 128] float, one scale per channel (applied to the output).
 // `padded` rounds each sequence's start/end out to a 64-key tile and inserts a 64-key gap
-// between sequences, so every key tile is in bounds and the V tile's padding is zero.
+// between sequences, so every key tile is in bounds. The V padding is left uninitialized: out-of-range
+// keys get zero probability, so those bytes never contribute to PV.
 #pragma once
 
 #include <cstddef>
@@ -57,10 +58,10 @@ inline std::size_t int8_attn_bytes(int tokens, int batch) {
 // so no host-side metadata upload is needed between layers.
 constexpr int seq_base(int cu_b, int b) { return ((cu_b + 63) / 64) * 64 + 64 * b; }
 
-// Quantize q/k/v out of the [tokens, 3 * kDim] qkv tensor into the buffers above. `v_bytes` is
-// the byte size of b.v. b.cu, b.base, b.len, b.pos and b.padded must already be set.
+// Quantize q/k/v out of the [tokens, 3 * kDim] qkv tensor into the buffers above.
+// b.cu, b.base, b.len, b.pos and b.padded must already be set.
 void int8_attn_quantize(const i8attn_bf16* qkv, std::int64_t ld, const Int8AttnBuffers& b, int tokens,
-                        std::size_t v_bytes, hipStream_t stream);
+                        hipStream_t stream);
 
 // Run attention, writing bf16 [tokens, ldo] with head columns 128 apart.
 void int8_attn_run(const Int8AttnBuffers& b, i8attn_bf16* out, std::int64_t ldo, int max_seqlen,

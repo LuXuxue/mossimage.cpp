@@ -95,9 +95,9 @@ __device__ __forceinline__ uint32_t sad8(const uint32_t p[8]) {
   return __builtin_amdgcn_sad_u8(lo, 0, __builtin_amdgcn_sad_u8(hi, 0, 0u));
 }
 
-// The block Hadamard rotation used by the q8 kernels: H4 in-register, then a 32-lane butterfly.
-// A diagonal sign flip ahead of it keeps the literals bit-identical to the reference; Q and K
-// get the same rotation, so dot products are unchanged and only quantization outliers move.
+// The block Hadamard rotation used by the q8 kernels: an in-register H4 on each group of four channels.
+// Q and K get the same rotation, so dot products are unchanged and only quantization outliers move.
+// The reference's full H128 was measured slower and further from the CUDA high tier's outputs, so it is not built.
 __device__ __forceinline__ void convrot4(float* v) {
   const float x0 = v[0], x1 = v[1], x2 = v[2], x3 = v[3];
   const float a0 = x0 + x1, a1 = x0 - x1, a2 = x2 + x3, a3 = x2 - x3;
@@ -105,43 +105,6 @@ __device__ __forceinline__ void convrot4(float* v) {
   v[1] = (a1 + a3) * 0.5f;
   v[2] = (a0 - a2) * 0.5f;
   v[3] = (a1 - a3) * 0.5f;
-}
-
-__device__ __forceinline__ void convrot128_impl(float* v, int lane) {
-  constexpr uint32_t kSigns[4] = {0x1035997bu, 0x8087f5eeu, 0xee2e4e1au, 0x71132418u};
-  const uint32_t signs = kSigns[lane >> 3];
-  const int shift = (lane & 7) * 4;
-#pragma unroll
-  for (int c = 0; c < 4; ++c) {
-    const uint32_t flip = ((signs >> (shift + c)) & 1u) ^ 1u;
-    v[c] = bits_to_float(hip_block::detail::float_to_bits(v[c]) ^ (flip << 31));
-  }
-  convrot4(v);
-#pragma unroll
-  for (int bit = 1; bit < 32; bit <<= 1) {
-#pragma unroll
-    for (int c = 0; c < 4; ++c) {
-      const float other = __shfl_xor_sync(0xffffffffull, v[c], bit, 32);
-      v[c] = (lane & bit) != 0 ? other - v[c] : v[c] + other;
-    }
-  }
-#pragma unroll
-  for (int c = 0; c < 4; ++c) v[c] *= 0.1767766952966369f;
-}
-
-// Configurable rotation: 128 is the reference's long-sequence choice; 4 is the local H4 and
-// avoids the 32-lane butterfly when quantization throughput matters more than outlier spreading.
-#ifndef MI_I8ATTN_ROT
-#define MI_I8ATTN_ROT 4
-#endif
-__device__ __forceinline__ void convrot_row(float* v, int lane) {
-#if MI_I8ATTN_ROT == 128
-  convrot128_impl(v, lane);
-#elif MI_I8ATTN_ROT == 4
-  convrot4(v);
-#else
-#error unsupported MI_I8ATTN_ROT
-#endif
 }
 
 __device__ __forceinline__ void load4(const bf16* p, float* v) {
@@ -190,7 +153,7 @@ __global__ __launch_bounds__(kThreads) void quant_q_kernel(const bf16* qkv, std:
   if (valid) load4(qkv + static_cast<std::int64_t>(token) * ld + static_cast<std::int64_t>(head) * kHeadDim +
                         lane * 4,
                    v);
-  convrot_row(v, lane);
+  convrot4(v);
   float mx = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffull, mx, off, 32));
@@ -225,7 +188,7 @@ __global__ __launch_bounds__(kThreads) void quant_k_kernel(const bf16* qkv, std:
       load4(qkv + static_cast<std::int64_t>(first + key0 + p) * ld +
                  static_cast<std::int64_t>(kDim + head * kHeadDim) + lane * 4,
             v);
-      convrot_row(v, lane);
+      convrot4(v);
 #pragma unroll
       for (int i = 0; i < 4; ++i) mx = fmaxf(mx, fabsf(v[i]));
     }
@@ -242,7 +205,7 @@ __global__ __launch_bounds__(kThreads) void quant_k_kernel(const bf16* qkv, std:
       load4(qkv + static_cast<std::int64_t>(first + key0 + p) * ld +
                  static_cast<std::int64_t>(kDim + head * kHeadDim) + lane * 4,
             v);
-      convrot_row(v, lane);
+      convrot4(v);
       const uint32_t packed = quant4(v, inv_scale);
       *reinterpret_cast<uint32_t*>(ko + (static_cast<std::size_t>(seq_base(first, seq) + key0 + p) * heads + head) *
                                             kHeadDim +
@@ -499,7 +462,7 @@ void fail(const char* what, hipError_t e) {
 }  // namespace
 
 void int8_attn_quantize(const bf16* qkv, std::int64_t ld, const Int8AttnBuffers& b, int tokens,
-                        std::size_t v_bytes, hipStream_t stream) {
+                        hipStream_t stream) {
   const dim3 qgrid(static_cast<unsigned>((tokens + kWaves - 1) / kWaves),
                    static_cast<unsigned>(kHeads), 1);
   quant_q_kernel<<<qgrid, kThreads, 0, stream>>>(qkv, ld, b.cu, b.q, b.q_scale, tokens, kHeads, b.batch);
@@ -512,9 +475,7 @@ void int8_attn_quantize(const bf16* qkv, std::int64_t ld, const Int8AttnBuffers&
   const int chunks = (tokens + 255) / 256;
   const dim3 vgrid(static_cast<unsigned>(chunks), static_cast<unsigned>(kHeads * kHeadDim / 256), 1);
   // No memset of the V padding: keys past the sequence end get zero probability in the attention
-  // kernel, so their (uninitialized) V bytes never contribute to PV. hipMemsetAsync on this runtime
-  // costs ~40 ms for the 19 MB tensor, more than every quantization kernel combined.
-  (void)v_bytes;
+  // kernel, so their uninitialized V bytes never contribute to PV.
   v_amax_partial<<<vgrid, 256, 0, stream>>>(qkv, ld, b.part, tokens);
   v_finalize<<<dim3(static_cast<unsigned>(kHeads * kHeadDim / 256)), 256, 0, stream>>>(b.part, b.v_scale, chunks);
   v_quant_kernel<<<vgrid, 256, 0, stream>>>(qkv, ld, b.cu, b.v_scale, b.v, tokens, b.padded, b.batch);

@@ -1,4 +1,4 @@
-// The LoRA side branch's bf16 GEMM, using the same LDS-staged, software-pipelined
+// The LoRA side branch's and text encoder's bf16 GEMM, using the same LDS-staged, software-pipelined
 // 128x128 tile as the INT8 block GEMM. gfx11's bf16 WMMA consumes 32 bytes of a row
 // per 16-element K-step (each lane holds the whole step), so the stage is 64 bytes
 // of K and the LDS row pad is 32 bytes to keep those fragment loads aligned.

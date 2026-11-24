@@ -334,11 +334,11 @@ std::uint64_t Dit::activation_bytes(std::uint64_t tokens, std::uint64_t rows, st
                          (tokens + hip_block::kAttentionStepN * rows) * kQkv +
                          hw * kDiTLatentChannels * (1 + rows) + 10 * kDim + kDiTFreqDim) *
                         kBf16;
-  // The INT8 path adds quantized activations and a bf16 GEMM output; the LoRA side branch adds its low-rank t and the
-  // full-size delta fused into the base GEMM. Include them in the planner's accounting so a large image cannot be
-  // planned as if those buffers were free (they were previously omitted, ~0.5 GiB at 1536x1024).
+  // The INT8 path adds quantized activations and the up_gate bf16 output; the LoRA side branch adds its low-rank t and
+  // the full-size delta fused into the base GEMM. Include them in the planner's accounting so a large image cannot be
+  // planned as if those buffers were free.
   if (int8) {
-    bytes += tokens * (3 * kDim + 5 * kFfn + 1) + tokens * sizeof(float);
+    bytes += tokens * (kDim + 5 * kFfn + 1) + tokens * sizeof(float);
     // The int8 attention's q/k/v, scales and varlen metadata.
     const std::uint64_t padded = (tokens + 63u) / 64u * 64u + 64u * rows;
     const std::uint64_t h = static_cast<std::uint64_t>(hip_block::kHeads) * hip_block::kHeadDim;
@@ -490,7 +490,6 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
     scratch(i8_ffn_, total * kFfn);
     scratch(i8_scale_, total * sizeof(float));
     scratch(i8_ug_, total * 2 * kFfn * kBf16);
-    scratch(i8_gemm_out_, total * kDim * kBf16);
     const std::size_t padded = int8_attn_padded(static_cast<int>(total), static_cast<int>(rows.size()));
     const std::size_t h = static_cast<std::size_t>(hip_block::kHeads) * hip_block::kHeadDim;
     scratch(i8_q_, padded * h);
@@ -590,7 +589,6 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
         ib.i8_ffn = i8_ffn_.as<std::int8_t>();
         ib.scale = i8_scale_.as<float>();
         ib.ug = i8_ug_.as<bf16>();
-        ib.gemm_out = i8_gemm_out_.as<bf16>();
         ib.attn.q = i8_q_.as<std::int8_t>();
         ib.attn.k = i8_k_.as<std::int8_t>();
         ib.attn.v = i8_v_.as<std::int8_t>();

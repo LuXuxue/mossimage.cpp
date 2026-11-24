@@ -2,8 +2,8 @@
 //
 // Each row of g=256 int8 values is scaled and multiplied by H_256 = kron^4(H4) as four radix-4 butterfly stages,
 // reproducing dequant_fast.h's host transform operation for operation and rounded once to bf16 at the end. The int8
-// weights stay on the device (no 2x host bf16 image and no 18 GiB host-to-device copy of dequantized weights); only the
-// scales are uploaded once at construction.
+// weights stay on the device (no second, bf16 host image and its copy); only the scales are uploaded once at
+// construction.
 #pragma once
 
 #include <cstddef>

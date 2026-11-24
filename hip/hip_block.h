@@ -30,7 +30,7 @@ inline constexpr int kHeadDim = 128;
 inline constexpr int kFfnDim = 8192;
 
 // Key tokens per step of the online softmax. Part of the numerics: each step's weights are rounded to bf16 relative to
-// the running maximum over the steps so far. 32 is FlashAttention's hdim128 128x32 tile, which the engine runs on sm_89.
+// the running maximum over the steps so far. The step size follows the engine's FlashAttention-style tile (128 here).
 inline constexpr int kAttentionStepN = 128;
 
 // Packed operands: 16 x 16 fragments contiguous, for rows grouped in 16s and columns in 16s: element (r, c) at
@@ -48,7 +48,8 @@ const char* leaf_name();
 // out[rows, d] = bf16(bf16(bf16(rms_norm(x)) * w) * (1 + scale)) + shift); w, scale, shift: [d], d a multiple of 4.
 // The fp32 mean of squares is summed in the order of torch's reduce kernel for >= 16 rows (kernels/basic/norm.cu: 32
 // threads x 4 values, then a halving tree). That order is kept below 16 rows, where the engine's block width grows, so
-// outputs there are not bit-exact against the engine: about 5 in 10^6 differ at 7 to 15 rows of 3072 (hip_block_verify).
+// outputs there are not bit-exact against the engine: a few values in 10^6 differ at short row counts (see the kernel
+// checks under tools/).
 void rms_norm_modulate(const bf16_bits* x, std::int64_t ldx, const bf16_bits* weight, const bf16_bits* scale,
                        const bf16_bits* shift, bf16_bits* out, std::int64_t ldo, std::int64_t rows, int d,
                        hipStream_t stream);

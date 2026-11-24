@@ -33,13 +33,12 @@ struct Int8BlockWeights {
 };
 
 // The INT8 block's scratch, sized for one run of `tokens` tokens. i8_y/i8_ffn hold a row's rotated+quantized int8, scale
-// its per-row scale, ug the up_gate GEMM's bf16 output, gemm_out the o/down GEMM's bf16 output (before the residual).
+// its per-row scale, ug the up_gate GEMM's bf16 output. The o/down GEMMs write their fused gate+residual result in place.
 struct Int8Buffers {
   std::int8_t* i8_y;      // [tokens, kDim] int8
   std::int8_t* i8_ffn;    // [tokens, kFfnDim] int8
   float* scale;           // [tokens]
   bf16* ug;               // [tokens, 2 kFfnDim] bf16
-  bf16* gemm_out;         // [tokens, kDim] bf16
   Int8AttnBuffers attn;   // quantized q/k/v and scales for the int8 attention op
 };
 
@@ -47,10 +46,5 @@ struct Int8Buffers {
 // buffers (hip_block::BlockBuffers). Same op order as hip_block::run_block_op.
 void run_int8_block_op(int op, const Int8BlockWeights& w, const hip_block::BlockBuffers& b, const Int8Buffers& ib,
                        hipStream_t stream, const bf16* lora_delta = nullptr, std::int64_t ldl = 0);
-
-// x[m, n] += bf16(out[m, n] * gate[n]) in place (the gated residual after an int8 GEMM).
-void int8_gate_residual(bf16* residual, std::int64_t ldr, const bf16* out, const bf16* gate, std::int64_t m, int n,
-                        hipStream_t stream);
-
 
 }  // namespace mi::hip

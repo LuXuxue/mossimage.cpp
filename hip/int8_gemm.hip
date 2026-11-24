@@ -188,10 +188,10 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void int8_gemm_tiled(
         float v = static_cast<float>(acc[i][j][e]) * xs * a.w_scale[c];
         if (a.bias != nullptr) v += a.bias[c];
         if (a.lora_delta != nullptr) v += f(a.lora_delta[static_cast<std::int64_t>(r) * a.ldl + c]);
-        const bf16_bits g = bf(v);  // the GEMM's own bf16 rounding, as in the two-kernel sequence
+        const bf16_bits g = bf(v);  // the GEMM's own bf16 rounding, before the optional gate+residual epilogue
         const std::size_t at = static_cast<std::size_t>(r) * a.ldy + c;
         if (a.gate != nullptr) {
-          // The separate kernels do bf(x + bf(gemm_out)*gate). Read the residual before storing to it.
+          // bf(x + bf(gemm_out)*gate): read the residual before storing to it (it may alias y).
           const float prod = f(g) * f(a.gate[c]);
           const float res = a.residual != nullptr ? f(a.residual[static_cast<std::int64_t>(r) * a.ldr + c]) : 0.0f;
           a.y[at] = bf(add(res, prod));
@@ -225,7 +225,7 @@ void int8_gemm(hip_block::bf16_bits* y, std::int64_t ldy, const std::int8_t* x, 
     const int xn = std::min(kChunk, gx - x0);
     dim3 grid(gy, xn, 1);  // x = N blocks, y = M blocks (matches the kernel's grouped ordering)
     // Deep K: the 128-thread 4x4 fragment grid has the highest matrix density and the LDS reads are amortised. Shallow
-    // K: the 512-thread 2x2 grid yields more blocks to interleave across the six WGPs of the 780M.
+    // K: the 512-thread 2x2 grid yields more blocks to interleave across the GPU's WGPs.
     if (deep) {
       hip_block::int8_gemm_tiled<128, 128, 128, 2, 2, 4, 4><<<grid, 128, 0, stream>>>(a, xn);
     } else {
