@@ -244,6 +244,21 @@ add_executable(hip_int8_gemm_bench tools/hip_int8_gemm_bench.cpp)
 target_compile_options(hip_int8_gemm_bench PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_int8_gemm_bench PRIVATE mossinfer_hip)
 
+# LoRA side-branch shapes.
+add_executable(hip_lora_info tools/hip_lora_info.cpp)
+target_compile_options(hip_lora_info PRIVATE ${MI_HIP_WARN})
+target_link_libraries(hip_lora_info PRIVATE mossinfer_hip)
+
+# Activation-quantization throughput.
+add_executable(hip_rotate_quantize_bench tools/hip_rotate_quantize_bench.cpp)
+target_compile_options(hip_rotate_quantize_bench PRIVATE ${MI_HIP_WARN})
+target_link_libraries(hip_rotate_quantize_bench PRIVATE mossinfer_hip)
+
+# LoRA GEMM shape throughput.
+add_executable(hip_bf16_gemm_bench tools/hip_bf16_gemm_bench.cpp)
+target_compile_options(hip_bf16_gemm_bench PRIVATE ${MI_HIP_WARN})
+target_link_libraries(hip_bf16_gemm_bench PRIVATE mossinfer_hip)
+
 # The tiled bf16 GEMM used by the LoRA side branch.
 add_executable(hip_bf16_gemm_check tools/hip_bf16_gemm_check.cpp)
 target_compile_options(hip_bf16_gemm_check PRIVATE ${MI_HIP_WARN})

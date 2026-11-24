@@ -15,6 +15,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "device_math.h"
@@ -346,7 +347,8 @@ __global__ __launch_bounds__(kThreads) void int8_attn_kernel(const AttnArgs a) {
   const int interior = a.scale_log2 >= 0.0f ? seqlen / kCtaK : 0;
   const v8i bias_acc = {kIntBias, kIntBias, kIntBias, kIntBias, kIntBias, kIntBias, kIntBias, kIntBias};
 
-  for (int iter = 0; iter < num_iters; ++iter) {
+  auto run_iter = [&](auto boundary_tag, int iter) {
+    constexpr bool kBoundary = decltype(boundary_tag)::value;
     const int kb0 = iter * kCtaK;
     __syncthreads();
     // K tile [key][d], zero past the sequence end.
@@ -389,10 +391,9 @@ __global__ __launch_bounds__(kThreads) void int8_attn_kernel(const AttnArgs a) {
 #pragma unroll
     for (int fk = 0; fk < 4; ++fk) tile_scale_k[fk] = a.scale_log2 * qscale * kscale[fk];
 
-    const bool boundary = iter >= interior;
-    float prob[4][8];
+    float prob[kBoundary ? 4 : 1][8];
     float tile_m = kMaskedScore;
-    if (boundary) {
+    if constexpr (kBoundary) {
 #pragma unroll
       for (int fk = 0; fk < 4; ++fk) {
 #pragma unroll
@@ -438,7 +439,7 @@ __global__ __launch_bounds__(kThreads) void int8_attn_kernel(const AttnArgs a) {
       uint32_t packed[8];
 #pragma unroll
       for (int e = 0; e < 8; ++e) {
-        const float p = boundary ? __builtin_amdgcn_exp2f(prob[fk][e] - tile_m)
+        const float p = kBoundary ? __builtin_amdgcn_exp2f(prob[fk][e] - tile_m)
                                  : __builtin_amdgcn_exp2f(fmaf(static_cast<float>(s_acc[fk][e]),
                                                                tile_scale_k[fk], -tile_m));
         packed[e] = prob_to_u8(p);
@@ -470,7 +471,11 @@ __global__ __launch_bounds__(kThreads) void int8_attn_kernel(const AttnArgs a) {
       }
       o_bias = 0.0f;
     }
-  }
+  };
+
+  int iter = 0;
+  for (; iter < interior; ++iter) run_iter(std::false_type{}, iter);
+  for (; iter < num_iters; ++iter) run_iter(std::true_type{}, iter);
 
   d_run += swap_half_wave(d_run);
   if (q_local < seqlen) {

@@ -116,6 +116,17 @@ other than euler) are accepted but print a clear `no effect on this backend` /
   full H128 improves outlier spreading but measured slower here and moved the
   output further from the CUDA high tier (256px latent correlation 0.83 against
   0.89 for H4).
+- Tile tuning was measured, not guessed. The 192-thread 4x2 / 2x4 INT8 GEMM
+  layouts and the 256-row bf16 tile both looked faster in a first pass, but the
+  former were being launched with too few warps (192 instead of 256) and the
+  latter had a mismatched grid; with correct launch bounds every alternative is
+  equal to or slower than the shipped config. Dropping Q caching and splitting
+  the interior/boundary attention paths into compile-time variants also changed
+  nothing. At 1536x1024 the four INT8 GEMMs sustain ~5.2 TMAC/s, attention
+  ~4.5 TMAC/s and the LoRA bf16 GEMMs ~2.6-3.5 TMAC/s — close to this iGPU's
+  WMMA throughput, so the remaining ~1.1 s of LoRA overhead is not a tuning
+  miss. `hip_int8_gemm_bench`, `hip_bf16_gemm_bench` and
+  `hip_rotate_quantize_bench` reproduce those numbers.
 - The DiT block's attention output head stride is the head dimension (128), not
   the full residual width; using the latter silently overwrites adjacent token
   rows and produces grey noise.

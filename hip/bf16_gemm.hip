@@ -162,13 +162,14 @@ void bf16_gemm_tiled(bf16* c, std::int64_t ldc, const bf16* a, std::int64_t lda,
                      const bf16* b, std::int64_t ldb, int m, int n, int k, hipStream_t stream) {
   if (m == 0 || n == 0 || k == 0) return;
   const Bf16GemmArgs args{a, b, c, lda, ldb, ldc, m, n, k};
-  constexpr int kTileM = 128, kTileN = 128, kChunk = 4096;
-  const int gx = (m + kTileM - 1) / kTileM;
-  const int gy = (n + kTileN - 1) / kTileN;
+  const bool deep = k >= 2048;
+  constexpr int kChunk = 4096;
+  const int gx = (m + 127) / 128;
+  const int gy = (n + 127) / 128;
   for (int x0 = 0; x0 < gx; x0 += kChunk) {
     const int xn = x0 + kChunk < gx ? kChunk : gx - x0;
     dim3 grid(gy, xn, 1);
-    if (k >= 2048) {
+    if (deep) {
       gemm_tiled<128, 128, 128, 2, 2, 4, 4><<<grid, 128, 0, stream>>>(args);
     } else {
       gemm_tiled<128, 128, 64, 4, 4, 2, 2><<<grid, 512, 0, stream>>>(args);
