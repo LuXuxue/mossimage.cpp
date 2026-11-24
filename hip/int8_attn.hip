@@ -443,7 +443,9 @@ __global__ __launch_bounds__(kThreads) void int8_attn_kernel(const AttnArgs a) {
   d_run += swap_half_wave(d_run);
   if (q_local < seqlen) {
     const float inv_d = 1.0f / d_run;
-    bf16* orow = a.o + static_cast<std::int64_t>(q0 + q_local) * a.ldo + head * kHeadDim;
+    // Q/K/V live in the padded, per-sequence columns, but the output is the compact [tokens, kDim] attn buffer.
+    // Writing at q0 would run past it once batch > 1 (the padded gaps) and corrupt the following buffers.
+    bf16* orow = a.o + (static_cast<std::int64_t>(a.cu[seq]) + q_local) * a.ldo + head * kHeadDim;
 #pragma unroll
     for (int dt = 0; dt < 8; ++dt) {
 #pragma unroll
