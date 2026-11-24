@@ -21,6 +21,7 @@
 
 namespace hip_block {
 
+using detail::add;
 using detail::bf;
 using detail::f;
 
@@ -38,6 +39,9 @@ struct Int8GemmArgs {
   int m, n, k;
   const bf16_bits* lora_delta;  // optional [m, n] bf16 low-rank term, added before the bf16 rounding
   std::int64_t ldl;
+  const bf16_bits* gate;        // optional [n] fp32 gate: y = residual + bf16(y)*gate, after the first bf16 rounding
+  const bf16_bits* residual;    // optional [m, ldr], may alias y
+  std::int64_t ldr;
 };
 
 // Stage a ROWS x BKB byte tile from global into registers, then write it to LDS. One 16-byte chunk per lane per pass;
@@ -184,7 +188,16 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void int8_gemm_tiled(
         float v = static_cast<float>(acc[i][j][e]) * xs * a.w_scale[c];
         if (a.bias != nullptr) v += a.bias[c];
         if (a.lora_delta != nullptr) v += f(a.lora_delta[static_cast<std::int64_t>(r) * a.ldl + c]);
-        a.y[static_cast<std::int64_t>(r) * a.ldy + c] = bf(v);
+        const bf16_bits g = bf(v);  // the GEMM's own bf16 rounding, as in the two-kernel sequence
+        const std::size_t at = static_cast<std::size_t>(r) * a.ldy + c;
+        if (a.gate != nullptr) {
+          // The separate kernels do bf(x + bf(gemm_out)*gate). Read the residual before storing to it.
+          const float prod = f(g) * f(a.gate[c]);
+          const float res = a.residual != nullptr ? f(a.residual[static_cast<std::int64_t>(r) * a.ldr + c]) : 0.0f;
+          a.y[at] = bf(add(res, prod));
+        } else {
+          a.y[at] = g;
+        }
       }
     }
   }
@@ -197,9 +210,11 @@ namespace mi::hip {
 // Launch the INT8 ConvRot GEMM: y [m, n] = bf16((x @ w^T) * xs * ws + bias). x [m, k] int8, w [n, k] int8.
 void int8_gemm(hip_block::bf16_bits* y, std::int64_t ldy, const std::int8_t* x, std::int64_t ldx,
                        const float* x_scale, const std::int8_t* w, const float* w_scale, const float* bias, int m, int n,
-                       int k, hipStream_t stream, const hip_block::bf16_bits* lora_delta, std::int64_t ldl) {
+                       int k, hipStream_t stream, const hip_block::bf16_bits* lora_delta, std::int64_t ldl,
+                       const hip_block::bf16_bits* gate, const hip_block::bf16_bits* residual, std::int64_t ldr) {
   if (m == 0 || n == 0 || k == 0) return;
-  hip_block::Int8GemmArgs a{x, ldx, x_scale, w, w_scale, bias, y, ldy, m, n, k, lora_delta, ldl};
+  hip_block::Int8GemmArgs a{x, ldx, x_scale, w, w_scale, bias, y, ldy, m, n, k, lora_delta, ldl,
+                            gate, residual, ldr};
   // Chunk the grid's y dimension so a multi-megapixel image's token count cannot exceed the device's grid limit.
   constexpr int kChunk = 4096;
   const bool deep = k >= 4096;

@@ -77,9 +77,9 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b,
       break;
     case 4:  // x += int8_gemm(rotate_quantize(attn)) * gate_msa
       rotate_quantize(b.attn, kDim, tokens, kDim, ib.i8_y, kDim, ib.scale, stream);
-      int8_gemm(ib.gemm_out, kDim, ib.i8_y, kDim, ib.scale, w.o.q, w.o.scale, nullptr,
-                static_cast<int>(tokens), static_cast<int>(kDim), static_cast<int>(kDim), stream, lora_delta, ldl);
-      int8_gate_residual(b.x, kDim, ib.gemm_out, mod(2), tokens, kDim, stream);
+      int8_gemm(b.x, kDim, ib.i8_y, kDim, ib.scale, w.o.q, w.o.scale, nullptr,
+                static_cast<int>(tokens), static_cast<int>(kDim), static_cast<int>(kDim), stream, lora_delta, ldl,
+                mod(2), b.x, kDim);  // gate+residual fused: no gemm_out round trip
       break;
     case 5:  // norm2 + modulate -> y (bf16)
       rms_norm_modulate(b.x, kDim, w.norm2, mod(4), mod(3), b.y, kDim, tokens, kDim, stream);
@@ -92,9 +92,9 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b,
       break;
     default:  // x += int8_gemm(rotate_quantize(ffn)) * gate_mlp
       rotate_quantize(b.ffn, kFfn, tokens, kFfn, ib.i8_ffn, kFfn, ib.scale, stream);
-      int8_gemm(ib.gemm_out, kDim, ib.i8_ffn, kFfn, ib.scale, w.down.q, w.down.scale, nullptr,
-                static_cast<int>(tokens), static_cast<int>(kDim), static_cast<int>(kFfn), stream, lora_delta, ldl);
-      int8_gate_residual(b.x, kDim, ib.gemm_out, mod(5), tokens, kDim, stream);
+      int8_gemm(b.x, kDim, ib.i8_ffn, kFfn, ib.scale, w.down.q, w.down.scale, nullptr,
+                static_cast<int>(tokens), static_cast<int>(kDim), static_cast<int>(kFfn), stream, lora_delta, ldl,
+                mod(5), b.x, kDim);  // gate+residual fused: no gemm_out round trip
       break;
   }
 }
