@@ -65,6 +65,11 @@ outside the repository.
   per-layer weight packing and taking encode() to ~1.2 s; `MI_HIP_TE_PACKED_GEMM=1`
   selects the original packed rocWMMA path. "text encoder load" and "text encoder"
   are reported separately.
+  The int8 ConvRot layer weights default to staying int8 on the device: `te_dequant.hip`
+  runs the same radix-4 transform there as the host path and writes bf16 directly into
+  the per-layer buffer, avoiding the 2x host bf16 image and its copy. This is
+  bit-identical to the host dequantization; `MI_HIP_TE_DEVICE_DEQUANT=0` restores it
+  (~1 GiB less device memory, slightly faster `encode()`).
 - The VAE decoder's mid attention packs Q/K/V/P into 2 TF32 bf16 pieces by
   default (3 GEMM products instead of 6), saving ~0.5 s at 1536x1024 with a
   decoded-image difference of at most 1 byte on <0.5% of pixels. Set

@@ -20,6 +20,7 @@
 #include "half.h"
 #include "hip_block.h"
 #include "safetensors.h"
+#include "te_dequant.h"
 #include "te_kernels.h"
 #include "weights/quant/quant_codec.h"
 
@@ -46,12 +47,16 @@ std::uint64_t align256(std::uint64_t v) { return (v + 255) & ~std::uint64_t{255}
 
 using TensorRef = std::pair<const st::File*, const st::TensorInfo*>;
 
-// A weight's source: a file tensor (BF16) or a dequantized I8 weight held as host BF16.
+// A weight's source: a file tensor (BF16), a dequantized I8 weight held as host BF16, or a raw int8 weight whose
+// dequantization will run on the device (host_bf16 then points at int8 bytes and `bytes` is the int8 byte count).
 struct WeightSource {
   const st::File* file = nullptr;      // set for file tensors
   const st::TensorInfo* info = nullptr;  // set for file tensors
-  const bf16* host_bf16 = nullptr;     // set for dequantized I8 weights
+  const bf16* host_bf16 = nullptr;     // set for dequantized I8 weights or device-dequant int8 weights
   std::uint64_t bytes = 0;
+  bool is_i8 = false;                  // raw int8, to be dequantized on the device
+  std::uint64_t scale_off = 0;         // into the device scale array
+  std::uint64_t footprint() const { return is_i8 ? 2 * bytes : bytes; }
 };
 
 // One read of a tensor into the layer's staging layout.
@@ -69,9 +74,19 @@ struct Gemm {
 
 // Where a layer's tensors sit. The small tensors (norms, conv, gates' parameters) come first, at the same offsets in the
 // raw and the packed layout; the projection groups follow.
+struct I8Piece {
+  std::uint64_t offset, scale_off;  // into the raw layer buffer / the device scale array
+  int n, k;
+};
+struct CopyRange {
+  std::uint64_t offset, bytes;  // a bf16 piece copied verbatim from the int8 staging buffer
+};
+
 struct LayerPlan {
   bool full_attention = false;
   std::vector<Piece> pieces;
+  std::vector<I8Piece> i8_pieces;    // device-dequantized raw int8 weights in this layer
+  std::vector<CopyRange> d2d_ranges; // bf16 pieces copied from the int8 staging buffer on the device
   std::uint64_t bytes = 0, small_bytes = 0, packed_bytes = 0;
   std::uint64_t in_norm = 0, post_norm = 0;
   std::uint64_t conv = 0, a_log = 0, dt_bias = 0, gdn_norm = 0;  // GatedDeltaNet
@@ -138,7 +153,11 @@ struct TextEncoder::Impl {
   std::map<std::string, std::unique_ptr<st::File>> files;
   std::map<std::string, WeightSource> tensors;
   WeightSource embed{}, final_norm{};
-  HostBuffer dequant;  // dequantized I8 weights, as host BF16 (one contiguous block)
+  HostBuffer dequant;    // dequantized I8 weights that stay on the host (embedding, final norm), as BF16
+  HostBuffer i8_host;    // raw int8 weights for device-side dequantization
+  HostBuffer scales_host;
+  DeviceBuffer scales_dev;
+  DeviceBuffer i8dev;  // H2D staging for the int8 layer weights; one buffer, ordered by dequant_free
   std::int64_t vocab = 0;
   std::vector<LayerPlan> layers;
   std::uint64_t layer_bytes = 0, packed_bytes = 0;
@@ -163,51 +182,75 @@ struct TextEncoder::Impl {
       if (!file) file = std::make_unique<st::File>(shard);
       tensors[key] = {file.get(), &file->at(name), nullptr, file->at(name).bytes};
     }
-    // Dequantize the I8 ConvRot weights to host BF16 (the high tier's text encoder ships int8 weights).
-    // Tensors are independent, so read and convert them in parallel; the dequantizer itself is single-threaded here.
-    std::vector<std::string> i8_keys;
-    std::uint64_t i8_bytes = 0;
+    // The high tier's text encoder ships int8 ConvRot weights. By default the layer weights stay int8 on the device and
+    // te_dequant.hip runs the radix-4 transform there; the embedding and final norm stay on the host path because they
+    // are read outside a layer. Tensors are independent, so the file reads run in parallel.
+    const bool devdq = options.device_dequant && !options.exact_dequant;
+    std::vector<std::string> host_keys, dev_keys;
+    std::uint64_t host_i8_bytes = 0, dev_i8_bytes = 0, scale_elems = 0;
     for (const auto& [key, src] : tensors) {
-      if (src.info && src.info->dtype == "I8") {
-        i8_keys.push_back(key);
-        i8_bytes += src.info->bytes;
+      if (!src.info || src.info->dtype != "I8") continue;
+      const bool host_only = key == "language_model.embed_tokens.weight" || key == "language_model.norm.weight";
+      if (devdq && !host_only) {
+        dev_keys.push_back(key);
+        dev_i8_bytes += src.info->bytes;
+        scale_elems += static_cast<std::uint64_t>(src.info->shape[0]);
+      } else {
+        host_keys.push_back(key);
+        host_i8_bytes += src.info->bytes;
       }
     }
-    dequant = HostBuffer(2 * i8_bytes);  // BF16: two bytes per dequantized element
+    dequant = HostBuffer(static_cast<std::size_t>(2 * host_i8_bytes));
+    i8_host = HostBuffer(static_cast<std::size_t>(dev_i8_bytes));
+    scales_host = HostBuffer(static_cast<std::size_t>(4 * scale_elems));
     bf16* dq = dequant.as<bf16>();
-    std::vector<std::size_t> offsets(i8_keys.size());
-    std::size_t dq_off = 0;
-    for (std::size_t i = 0; i < i8_keys.size(); ++i) {
-      offsets[i] = dq_off;
-      dq_off += static_cast<std::size_t>(tensors[i8_keys[i]].info->bytes);
+    char* i8p = static_cast<char*>(i8_host.data());
+    float* sch = scales_host.as<float>();
+    std::vector<std::size_t> host_off(host_keys.size()), dev_off(dev_keys.size()), scale_off(dev_keys.size());
+    std::size_t dq_off = 0, db_off = 0, sc_off = 0;
+    for (std::size_t i = 0; i < host_keys.size(); ++i) {
+      host_off[i] = dq_off;
+      dq_off += static_cast<std::size_t>(tensors[host_keys[i]].info->bytes);
+    }
+    for (std::size_t i = 0; i < dev_keys.size(); ++i) {
+      dev_off[i] = db_off;
+      db_off += static_cast<std::size_t>(tensors[dev_keys[i]].info->bytes);
+      scale_off[i] = sc_off;
+      sc_off += static_cast<std::size_t>(tensors[dev_keys[i]].info->shape[0]);
     }
     const int threads = std::min<int>(8, static_cast<int>(std::thread::hardware_concurrency()));
     std::atomic<std::size_t> next{0};
     std::vector<std::exception_ptr> errors(static_cast<std::size_t>(threads));
     const auto work = [&](int t) {
       try {
-        for (std::size_t i = next++; i < i8_keys.size(); i = next++) {
-          const std::string& key = i8_keys[i];
+        for (std::size_t i = next++; i < host_keys.size() + dev_keys.size(); i = next++) {
+          const bool dev = i >= host_keys.size();
+          const std::size_t j = dev ? i - host_keys.size() : i;
+          const std::string& key = dev ? dev_keys[j] : host_keys[j];
           const WeightSource& src = tensors[key];
           const std::int64_t N = src.info->shape[0], K = src.info->shape[1];
-          std::vector<std::int8_t> q(static_cast<std::size_t>(N) * K);
-          src.file->read(*src.info, q.data());
           const auto sit = tensors.find(key + "_scale");
           if (sit == tensors.end() || !sit->second.file) fail("no weight_scale for " + key);
           std::vector<float> scale(static_cast<std::size_t>(N));
           sit->second.file->read(*sit->second.info, scale.data());
-          if (options.exact_dequant) {
-            std::vector<float> f32(static_cast<std::size_t>(N) * K);
-            mi::quant::dequantize_rows(q.data(), scale.data(), N, K, 256, f32.data());
-            for (std::size_t j = 0; j < f32.size(); ++j) dq[offsets[i] + j] = mi::quant::float_to_bf16(f32[j]);
+          if (dev) {
+            src.file->read(*src.info, i8p + dev_off[j]);  // straight into the persistent int8 host image
+            std::memcpy(sch + scale_off[j], scale.data(), static_cast<std::size_t>(N) * sizeof(float));
           } else {
-            mi::hip::dequantize_rows_fast_bf16(q.data(), scale.data(), N, K, 256, dq + offsets[i], 1);
+            std::vector<std::int8_t> q(static_cast<std::size_t>(N) * K);
+            src.file->read(*src.info, q.data());
+            if (options.exact_dequant) {
+              std::vector<float> f32(static_cast<std::size_t>(N) * K);
+              mi::quant::dequantize_rows(q.data(), scale.data(), N, K, 256, f32.data());
+              for (std::size_t k = 0; k < f32.size(); ++k) dq[host_off[j] + k] = mi::quant::float_to_bf16(f32[k]);
+            } else {
+              mi::hip::dequantize_rows_fast_bf16(q.data(), scale.data(), N, K, 256, dq + host_off[j], 1);
+            }
           }
-          const std::size_t count = static_cast<std::size_t>(N) * K;
         }
       } catch (...) {
         errors[static_cast<std::size_t>(t)] = std::current_exception();
-        next = i8_keys.size();
+        next = host_keys.size() + dev_keys.size();
       }
     };
     {
@@ -218,10 +261,19 @@ struct TextEncoder::Impl {
     for (const auto& e : errors) {
       if (e) std::rethrow_exception(e);
     }
-    for (std::size_t i = 0; i < i8_keys.size(); ++i) {
-      const std::string& key = i8_keys[i];
+    for (std::size_t i = 0; i < host_keys.size(); ++i) {
+      const std::string& key = host_keys[i];
       const std::size_t count = static_cast<std::size_t>(tensors[key].info->bytes);
-      tensors[key] = {nullptr, nullptr, dq + offsets[i], 2 * count};
+      tensors[key] = {nullptr, nullptr, dq + host_off[i], 2 * count};
+    }
+    for (std::size_t i = 0; i < dev_keys.size(); ++i) {
+      const std::string& key = dev_keys[i];
+      const std::size_t count = static_cast<std::size_t>(tensors[key].info->bytes);
+      tensors[key] = {nullptr, nullptr, reinterpret_cast<const bf16*>(i8p + dev_off[i]), count, true, scale_off[i]};
+    }
+    if (devdq && scale_elems != 0) {
+      scales_dev = DeviceBuffer(static_cast<std::size_t>(4 * scale_elems));
+      scales_dev.upload(sch, static_cast<std::size_t>(4 * scale_elems));
     }
     const auto it = tensors.find("language_model.embed_tokens.weight");
     if (it == tensors.end() || it->second.bytes == 0 || it->second.bytes % (2 * kTeHidden) != 0) {
@@ -243,6 +295,7 @@ struct TextEncoder::Impl {
     } else {
       raw[1] = DeviceBuffer(layer_bytes);
     }
+    if (devdq) i8dev = DeviceBuffer(layer_bytes);
     std::vector<bf16> c(2 * kTeHidden, 0x3f80);  // [final norm | ones]
     if (final_norm.file) {
       final_norm.file->read(*final_norm.info, c.data());
@@ -258,7 +311,7 @@ struct TextEncoder::Impl {
     const auto it = tensors.find(name);
     if (it == tensors.end()) fail("no tensor " + name);
     const WeightSource& s = it->second;
-    std::uint64_t expected = 2;  // BF16: two bytes per element
+    std::uint64_t expected = s.is_i8 ? 1 : 2;  // int8: one byte per element; BF16: two
     for (const std::int64_t d : shape) expected *= static_cast<std::uint64_t>(d);
     if (s.bytes != expected) fail("tensor " + name + " has the wrong size");
     return s;
@@ -273,7 +326,13 @@ struct TextEncoder::Impl {
       l.bytes = align256(l.bytes);
       const std::uint64_t at = l.bytes;
       l.pieces.push_back({t, at});
-      l.bytes += t.bytes;
+      l.bytes += t.footprint();
+      if (t.is_i8) {
+        if (shape.size() != 2) fail("device-dequant int8 weight must be 2D: " + name);
+        l.i8_pieces.push_back({at, t.scale_off, static_cast<int>(shape[0]), static_cast<int>(shape[1])});
+      } else {
+        l.d2d_ranges.push_back({at, t.footprint()});
+      }
       return at;
     };
     // A group's tensors back to back: their sizes are multiples of 256 bytes, so the alignment adds no gap.
@@ -344,6 +403,8 @@ struct TextEncoder::Impl {
           const WeightSource& s = c.piece->src;
           if (s.file) {
             s.file->read(*s.info, dst + c.piece->offset + c.rel, c.rel, c.bytes);
+          } else if (s.is_i8) {
+            std::memcpy(dst + c.piece->offset + c.rel, reinterpret_cast<const char*>(s.host_bf16) + c.rel, c.bytes);
           } else {
             std::memcpy(dst + c.piece->offset + c.rel, s.host_bf16 + c.rel / 2, c.bytes);
           }
@@ -402,14 +463,16 @@ std::vector<std::vector<bf16>> TextEncoder::Impl::encode(const std::vector<std::
   const auto T = static_cast<std::uint32_t>(cu.back());
   const int nseq = static_cast<int>(seqs.size());
   const bool packed_path = options.packed && !options.tiled_gemm;
+  const bool devdq = options.device_dequant && !options.exact_dequant;
   const int nraw = packed_path ? 1 : 2;
   stats = TextEncoderStats{};
   stats.tokens = T;
 
   const Scratch sc(T, packed_path);
   DeviceBuffer act(sc.end), cu_dev(cu.size() * 4), rope(static_cast<std::size_t>(max_len) * te::kRopeDim * 2);
-  stats.device_bytes = static_cast<std::uint64_t>(nraw) * layer_bytes + (packed_path ? packed_bytes : 0) + sc.end +
-                       cu_dev.bytes() + rope.bytes() + consts.bytes();
+  stats.device_bytes = static_cast<std::uint64_t>(nraw + (devdq ? 1 : 0)) * layer_bytes +
+                       (packed_path ? packed_bytes : 0) + sc.end + cu_dev.bytes() + rope.bytes() + consts.bytes() +
+                       scales_dev.bytes();
   stats.pinned_bytes = 2 * layer_bytes;
   cu_dev.upload(cu.data(), cu.size() * 4);
   auto* base = act.as<std::byte>();
@@ -593,7 +656,7 @@ std::vector<std::vector<bf16>> TextEncoder::Impl::encode(const std::vector<std::
 
   // Everything that can throw before the try below is made before the reader starts: a throw while it runs outside the
   // try would destroy a joinable thread.
-  Event copy_done[2], raw_free[2];
+  Event copy_done[2], raw_free[2], dequant_free;
   std::vector<std::unique_ptr<Event>> layer_start, layer_end;
   for (int k = 0; k <= kTeLayers; ++k) {
     layer_start.push_back(std::make_unique<Event>(true));
@@ -647,12 +710,18 @@ std::vector<std::vector<bf16>> TextEncoder::Impl::encode(const std::vector<std::
     handoff.cv.notify_all();
   };
 
-  // Layer k's staging -> raw[k % nraw] copy on the copy stream, once that buffer's last reader is done.
+  // Layer k's staging -> device copy on the copy stream, once that buffer's last reader is done. On the device-dequant
+  // path the int8 bytes land in the shared i8dev first and the compute stream expands them into raw[b].
   const auto issue_copy = [&](int k) {
     wait_staged(k);
     const int b = k % nraw;
-    if (k >= nraw) raw_free[b].wait(cs);
-    copy_async(raw[b].data(), staging[k % 2].data(), layers[static_cast<std::size_t>(k)].bytes, cs);
+    if (devdq) {
+      if (k >= 1) dequant_free.wait(cs);  // the previous layer's dequant has consumed the shared staging buffer
+      copy_async(i8dev.data(), staging[k % 2].data(), layers[static_cast<std::uint64_t>(k)].bytes, cs);
+    } else {
+      if (k >= nraw) raw_free[b].wait(cs);
+      copy_async(raw[b].data(), staging[k % 2].data(), layers[static_cast<std::uint64_t>(k)].bytes, cs);
+    }
     copy_done[b].record(cs);
   };
 
@@ -684,6 +753,22 @@ std::vector<std::vector<bf16>> TextEncoder::Impl::encode(const std::vector<std::
       const LayerPlan& l = layers[static_cast<std::size_t>(k)];
       const int b = k % nraw;
       copy_done[b].wait(s);
+      if (devdq) {
+        // Copy only the bf16 pieces verbatim; the int8 pieces are expanded directly into their raw positions.
+        char* rd = static_cast<char*>(raw[b].data());
+        const char* id = static_cast<const char*>(i8dev.data());
+        for (const CopyRange& r : l.d2d_ranges) {
+          copy_async(rd + r.offset, id + r.offset, static_cast<std::size_t>(r.bytes), s);
+        }
+        const bf16* ib = i8dev.as<bf16>();
+        bf16* rb = raw[b].as<bf16>();
+        const float* scd = scales_dev.as<float>();
+        for (const I8Piece& p : l.i8_pieces) {
+          te_dequant::dequant_i8(reinterpret_cast<const std::int8_t*>(ib + p.offset / 2), scd + p.scale_off,
+                                 rb + p.offset / 2, p.n, p.k, s);
+        }
+        dequant_free.record(s);
+      }
       layer_start[static_cast<std::size_t>(k)]->record(s);
       const bf16* w = raw[b].as<bf16>();
       if (packed_path) {

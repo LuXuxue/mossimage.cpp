@@ -59,7 +59,7 @@ list(APPEND MI_HIP_WARN -ffp-contract=off)
 
 # Kernel sources. block_kernels.hip is the DiT block (tools/hip_block checks it against the engine); dit_kernels.hip the
 # DiT's other ops; te_kernels.hip the text encoder's; vae_kernels.hip the VAE decoder's.
-set(MI_HIP_KERNELS block_kernels.hip dit_kernels.hip te_kernels.hip vae_kernels.hip int8_gemm.hip rotate_quantize.hip
+set(MI_HIP_KERNELS block_kernels.hip dit_kernels.hip te_kernels.hip te_dequant.hip vae_kernels.hip int8_gemm.hip rotate_quantize.hip
                     int8_block.hip int8_attn.hip bf16_gemm.hip lora.hip)
 set(MI_HIP_KERNEL_HEADERS device_math.h dit_kernels.h gemm_tile.h hip_block.h mma_leaf.h te_kernels.h vae_kernels.h
                            int8_leaf.h int8_block.h int8_gemm.h int8_attn.h bf16_gemm.h lora.h)

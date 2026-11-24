@@ -51,6 +51,9 @@ struct TextEncoderOptions {
   // Route the projection GEMMs through the LDS-staged tiled bf16 kernel on row-major weights,
   // dropping the per-layer weight/activation packing (2-3x faster GEMMs, slightly different rounding).
   bool tiled_gemm = true;
+  // Keep the int8 ConvRot weights on the device and run the Hadamard dequantization there, instead of expanding them
+  // to a 2x host bf16 image and copying that to the device. The embedding and final norm stay on the host path.
+  bool device_dequant = true;
 };
 
 // Times of the last encode().
