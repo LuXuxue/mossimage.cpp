@@ -22,6 +22,16 @@
 namespace hip_block {
 namespace {
 
+// RDNA3's exp2 is a single hardware instruction; the device library's exp2f lowers to a longer sequence. The ROCm
+// ComfyUI kernels gate this builtin on gfx1103, where the two were verified equivalent within their tolerance.
+__device__ __forceinline__ float hw_exp2(float x) {
+#if defined(__gfx1103__)
+  return __builtin_amdgcn_exp2f(x);
+#else
+  return exp2f(x);
+#endif
+}
+
 constexpr int kSituTileM = 48, kSituTileF = 16;  // F hidden columns and their F gate columns
 static_assert(kPackRowsMultiple % kGemmTileM == 0 && kPackRowsMultiple % kSituTileM == 0);
 constexpr int kAttnTileM = 16;                   // rows per wave; <= kWave (one lane per row in the softmax)
@@ -307,7 +317,7 @@ __global__ __launch_bounds__(kWave) void attention_kernel(const AttnArgs a) {
       row_max[t] = cur;
       float sum = 0.0f;
       if (!first) {
-        const float rescale = exp2f(mul(prev - cur, a.scale_log2));
+        const float rescale = hw_exp2(mul(prev - cur, a.scale_log2));
         row_scale[t] = rescale;
         sum = mul(row_sum[t], rescale);
       }
@@ -319,7 +329,7 @@ __global__ __launch_bounds__(kWave) void attention_kernel(const AttnArgs a) {
     for (int i = t; i < kAttnTileM * kAttnStepN; i += kWave) {
       const int r = i / kAttnStepN, c = i % kAttnStepN;
       if (r < rows && c < cols) {
-        const float w = exp2f(fmaf(s_mem[i], a.scale_log2, -row_max_scaled[r]));
+        const float w = hw_exp2(fmaf(s_mem[i], a.scale_log2, -row_max_scaled[r]));
         w_mem[i] = w;
         p_mem[i] = bf(w);
       } else {

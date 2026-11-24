@@ -60,16 +60,6 @@ bool check(const mi::hip::Device& device, const Case& c, bool delta) {
       if (got[static_cast<std::size_t>(r) * c.n + col] != rbf(v)) ++bad;
     }
   }
-  if (bad != 0 && c.m == 37 && !delta) {
-    for (int i = 0; i < 8; ++i) {
-      const int r = i / c.n, col = i % c.n;
-      std::int32_t acc = 0;
-      for (int t = 0; t < c.k; ++t) acc += static_cast<std::int32_t>(xh[r * c.k + t]) * wh[col * c.k + t];
-      const float want = rbf(static_cast<float>(acc) * xsh[r] * wsh[col]);
-      std::printf("    [%d,%d] got=%04x want=%04x (%g vs %g)\n", r, col, got[i], want,
-                  mi::hip::bf16_to_float(got[i]), mi::hip::bf16_to_float(want));
-    }
-  }
   std::printf("  %4dx%4dx%4d delta=%d: %s (%zu mismatched of %d)\n", c.m, c.n, c.k, static_cast<int>(delta),
               bad == 0 ? "ok" : "FAILED", bad, c.m * c.n);
   return bad == 0;
@@ -83,7 +73,8 @@ int main(int argc, char** argv) {
   if (argc == 4) {
     cases.push_back({std::atoi(argv[1]), std::atoi(argv[2]), std::atoi(argv[3])});
   } else {
-    cases = {{37, 80, 64}, {65, 96, 64}, {1, 32, 32}, {129, 160, 32}, {64, 32, 32}, {17, 17, 32}};
+    cases = {{37, 80, 64}, {65, 96, 64}, {1, 32, 32}, {129, 160, 32}, {64, 32, 32}, {17, 17, 32},
+             {65, 96, 4096}, {37, 80, 8192}, {256, 512, 3072}};
   }
   bool ok = true;
   for (const Case& c : cases) {

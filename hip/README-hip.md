@@ -70,9 +70,13 @@ other than euler) are accepted but print a clear `no effect on this backend` /
 
 ## Implementation notes
 
-- `int8_leaf.h` uses the gfx11-native 16x16x16 int8 WMMA. The 16x16x32 shape
-  used by the first draft maps to the gfx9 MFMA intrinsic and is a no-op on
-  gfx11 (it silently produced zeros).
+- `int8_leaf.h` uses the gfx11-native 16x16x16 int8 WMMA through raw
+  `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32` intrinsics (the same path the
+  ROCm-optimised ComfyUI kernels take), not rocWMMA. Its fragment layout is
+  public: each lane holds a whole 16-byte K-step of row `lane % 16`, and
+  accumulator element `e` is row `2*e + lane/16`, column `lane % 16`. The
+  16x16x32 shape used by the first draft maps to the gfx9 MFMA intrinsic and is
+  a no-op on gfx11 (it silently produced zeros).
 - The INT8 block's bf16 norms live at byte offsets
   `norm1=0`, `norm2=d*2`, `q_norm=2*d*2`, `k_norm=(2*d+128)*2`, before the qkv
   weight at `i8_norms`.
@@ -83,17 +87,23 @@ other than euler) are accepted but print a clear `no effect on this backend` /
   the activation buffer at large token counts and faults asynchronously (the
   error surfacing much later as `hipMemcpy to the host: unspecified launch
   failure`). The kernel now also checks launch errors at its call site.
-- One INT8 GEMM workgroup computes a 128x32 output tile so eight M fragments
-  reuse the same weight fragments. `hip_int8_gemm_check` checks it bit-for-bit
-  (with a fused LoRA delta) against a host replay on several tail shapes.
-- The attention key step is 64 (was 32), halving the number of softmax passes
-  and barriers per head. `hip_attn_probe` checks both packed and unpacked paths
+- The INT8 GEMM uses the tiled, software-pipelined 128x128 design from the
+  ROCm-optimised ComfyUI backend: A and B tiles are staged through LDS once per
+  128-byte K block, the next block's global loads are prefetched into registers
+  while the current block's fragments are multiplied, and the next K-step's
+  fragments are loaded before the current step's MMAs. Shallow K uses a
+  512-thread 2x2 fragment grid, deep K a 128-thread 4x4 grid.
+  `hip_int8_gemm_check` checks all of it bit-for-bit (with a fused LoRA delta)
+  against a host replay on tail shapes, deep K and real layer shapes.
+- The attention key step is 128 (was 32) and softmax uses gfx1103's single-instruction
+  `__builtin_amdgcn_exp2f`. `hip_attn_probe` checks both packed and unpacked paths
   against a CPU reference.
-- At 1536x1024 with the 4-step LoRA, a step takes about 54 s on the 780M (down
-  from 150 s before the attention and GEMM tiling changes). This is still well
-  above ComfyUI's ~9.4 s/it: reaching it needs the software-pipelined 128x128
-  multi-wave LDS GEMM from the ROCm-optimised ComfyUI kernels, which is not
-  ported here.
+- At 1536x1024 with the 4-step LoRA, a step takes about 21 s on the 780M (down
+  from 150 s before the attention and GEMM changes, and 54 s after the first GEMM
+  tiling). The GEMMs fell from ~56 s to ~9.5 s; attention is now the bottleneck
+  at ~11 s. Still above ComfyUI's ~9.4 s/it: closing the remaining gap needs the
+  int8/FP8 flash attention from the ROCm-optimised ComfyUI kernels (the CUDA high
+  tier also uses int8 attention, not exact bf16), which is not ported here.
 - The DiT block's attention output head stride is the head dimension (128), not
   the full residual width; using the latter silently overwrites adjacent token
   rows and produces grey noise.

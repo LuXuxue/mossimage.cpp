@@ -1,11 +1,11 @@
-// The INT8 leaf of the high tier's ConvRot GEMM: a 16x16x32 int8 multiply with an int32 accumulator, per wave.
+// The INT8 leaf of the high tier's ConvRot GEMM: a 16x16x16 int8 WMMA with an int32 accumulator, per wave.
 //
-//   ROCWMMA_I8_LEAF (AMD gfx11xx)  rocWMMA fragments, v_wmma_i8_16x16x32_i8
+//   gfx11 (RDNA3)  __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32, raw intrinsics
 //
-// The int8 counterpart of mma_leaf.h's bf16 leaf (16x16x16). The K step is 32, the int8 WMMA's native depth, so the
-// INT8 GEMM walk advances K by 32, not 16. rocWMMA's fragment lane layouts are private and differ between RDNA3 and
-// RDNA4, so nothing outside this file touches a fragment's elements: an accumulator's values reach the kernel only
-// through store_acc, into memory.
+// No rocWMMA: its fragment and accumulator layouts are opaque, and its load_matrix_sync/store_matrix_sync helpers
+// force a particular LDS layout that prevents the multi-warp, software-pipelined tiled kernel. The raw gfx11 layout is
+// public and simple: a 16-byte K-step fragment is held whole by every lane (row = lane % 16), and accumulator element e
+// is row 2*e + lane/16, column lane%16. This matches the ROCm-optimised ComfyUI kernels on gfx1103.
 //
 // Every call is collective: all 32 threads of the wave make it, with the same (thread-independent) arguments and under
 // the same control flow. p may point to global or __shared__ memory. The kernels depend on lockstep: they reuse a
@@ -14,28 +14,26 @@
 //   load_a       A(m, k) = p[m * ld + k]
 //   load_b       B(k, n) = p[n * ld + k]   (a [N, K] row-major weight, one column per row of memory)
 //   mma          c += a * b
-//   store_acc    p[m * ld + n] = c(m, n)
-//   load_acc     c(m, n) = p[m * ld + n]
+//   store_acc    p[m * ld + n] = c(m, n)   (row-major 16x16 tile into a shared int buffer)
 #pragma once
 
 #if defined(ROCWMMA_I8_LEAF)
-
-#include <rocwmma/rocwmma.hpp>
 
 #include <cstdint>
 
 namespace hip_block::i8leaf {
 
-inline constexpr const char* kName = "rocWMMA v_wmma_i32_16x16x16_iu8";
-// RDNA3 (gfx11) has no 16x16x32 int8 WMMA: that shape's rocWMMA path is the gfx9 MFMA intrinsic and is a no-op here.
-// The native gfx11 int8 instruction is v_wmma_i32_16x16x16_iu8.
+using v4i = int __attribute__((ext_vector_type(4)));
+using v8i = int __attribute__((ext_vector_type(8)));
+
+inline constexpr const char* kName = "gfx11 native v_wmma_i32_16x16x16_iu8";
 inline constexpr int kK = 16;
 
-using FragA = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, rocwmma::int8_t, rocwmma::row_major>;
-using FragB = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, rocwmma::int8_t, rocwmma::col_major>;
-using FragAcc = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, int>;
+using FragA = v4i;
+using FragB = v4i;
+using FragAcc = v8i;
 
-// The 16x16 output tile: lane t owns row t / 2 and columns (t & 1) * 8 .. + 8, as the bf16 leaf's dequant.
+// Epilogue addressing used by the single-wave GEMM kernel: a lane owns row lane/2 and two 8-column groups.
 __device__ __forceinline__ int row_of_thread() { return static_cast<int>(threadIdx.x) / 2; }
 __device__ __forceinline__ int col_of_thread() { return (static_cast<int>(threadIdx.x) & 1) * 8; }
 
@@ -43,19 +41,27 @@ __device__ __forceinline__ int col_of_thread() { return (static_cast<int>(thread
 // adds.
 __device__ __forceinline__ void barrier() { __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront"); }
 
-__device__ __forceinline__ void clear(FragAcc& c) { rocwmma::fill_fragment(c, 0); }
+__device__ __forceinline__ void clear(FragAcc& c) { c = {0, 0, 0, 0, 0, 0, 0, 0}; }
+
+// One lane reads a whole 16-byte K-step of row lane%16. With a 16-byte-aligned LDS stride this is one ds_read_b128.
 __device__ __forceinline__ void load_a(FragA& a, const std::int8_t* p, int ld) {
-  rocwmma::load_matrix_sync(a, p, static_cast<std::uint32_t>(ld));
+  a = *reinterpret_cast<const v4i*>(p + (static_cast<int>(threadIdx.x) & 15) * ld);
 }
 __device__ __forceinline__ void load_b(FragB& b, const std::int8_t* p, int ld) {
-  rocwmma::load_matrix_sync(b, p, static_cast<std::uint32_t>(ld));
+  b = *reinterpret_cast<const v4i*>(p + (static_cast<int>(threadIdx.x) & 15) * ld);
 }
-__device__ __forceinline__ void mma(FragAcc& c, const FragA& a, const FragB& b) { rocwmma::mma_sync(c, a, b, c); }
+
+__device__ __forceinline__ void mma(FragAcc& c, const FragA& a, const FragB& b) {
+  c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
+}
+
+// gfx11 accumulator element e: row 2*e + lane/16, column lane%16. Write a full 16x16 row-major int tile.
 __device__ __forceinline__ void store_acc(int* p, const FragAcc& c, int ld) {
-  rocwmma::store_matrix_sync(p, c, static_cast<std::uint32_t>(ld), rocwmma::mem_row_major);
-}
-__device__ __forceinline__ void load_acc(FragAcc& c, const int* p, int ld) {
-  rocwmma::load_matrix_sync(c, p, static_cast<std::uint32_t>(ld), rocwmma::mem_row_major);
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    p[(2 * e + (lane >> 4)) * ld + (lane & 15)] = c[e];
+  }
 }
 
 }  // namespace hip_block::i8leaf

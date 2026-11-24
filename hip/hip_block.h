@@ -31,7 +31,7 @@ inline constexpr int kFfnDim = 8192;
 
 // Key tokens per step of the online softmax. Part of the numerics: each step's weights are rounded to bf16 relative to
 // the running maximum over the steps so far. 32 is FlashAttention's hdim128 128x32 tile, which the engine runs on sm_89.
-inline constexpr int kAttentionStepN = 64;
+inline constexpr int kAttentionStepN = 128;
 
 // Packed operands: 16 x 16 fragments contiguous, for rows grouped in 16s and columns in 16s: element (r, c) at
 //   to[(r / 16 * (cols / 16) + c / 16) * 256 + r % 16 * 16 + c % 16]

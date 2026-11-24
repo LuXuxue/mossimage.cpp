@@ -1,5 +1,10 @@
 // The INT8 ConvRot GEMM for the high tier: y [m, n] = bf16((x @ w^T) * xs * ws + bias), x [m, k] and w [n, k] int8,
-// one per-row scale each. A single 16x16 wave tile; the WMMA int8->int32 leaves are int8_leaf.h.
+// one per-row scale each. The int8 WMMA int32 leaves are in int8_leaf.h (raw gfx11 intrinsics).
+//
+// The kernel is the tiled, software-pipelined design used by the ROCm-optimised ComfyUI backend: an LDS-staged 128x128
+// tile computed by several warps, with the next K tile's global reads prefetched into registers while the current tile's
+// fragments are multiplied, and a two-deep register pipeline over the 16-byte WMMA K-steps. This removes the repeated
+// global loads of the earlier one-wave 128x32 tile and is what closes most of the gap to ComfyUI's GEMM throughput.
 #if defined(ROCWMMA_I8_LEAF)
 
 #include <hip/hip_runtime.h>
@@ -18,7 +23,6 @@ namespace hip_block {
 
 using detail::bf;
 using detail::f;
-using detail::rbf;
 
 constexpr int kWave = 32;
 
@@ -36,82 +40,150 @@ struct Int8GemmArgs {
   std::int64_t ldl;
 };
 
-// One workgroup computes a 64x32 output tile: four A fragments and two B fragments produce eight int32 accumulators.
-// The weight and activation fragments are therefore reused four times / twice respectively instead of being reloaded
-// for every 16x16 output tile.
-constexpr int kTileM = 128;
-constexpr int kTileN = 32;
-constexpr int kMf = kTileM / 16, kNf = kTileN / 16;
+// Stage a ROWS x BKB byte tile from global into registers, then write it to LDS. One 16-byte chunk per lane per pass;
+// out-of-range rows and the K tail are zero-filled so the WMMA reads never leave the tile.
+template <int ROWS, int BKB, int THREADS>
+struct TileStager {
+  static constexpr int kPerRow = BKB / 16;
+  static constexpr int kChunks = ROWS * kPerRow;
+  static constexpr int kPerThread = kChunks / THREADS;
+  static constexpr int kStride = BKB + 16;  // 16-byte pad keeps every LDS row aligned for one ds_read_b128
+  static_assert(kChunks % THREADS == 0, "THREADS must divide the tile's 16-byte chunks");
 
-__global__ __launch_bounds__(kWave) void int8_gemm_kernel(const Int8GemmArgs a, int x0 = 0) {
-  const int m0 = (static_cast<int>(blockIdx.x) + x0) * kTileM;
-  const int n0 = static_cast<int>(blockIdx.y) * kTileN;
-  const int row = i8leaf::row_of_thread();
-  const int col = i8leaf::col_of_thread();
+  uint4 regs[kPerThread];
 
-  i8leaf::FragAcc acc[kMf][kNf];
+  __device__ __forceinline__ void load(const std::int8_t* src, int row0, int rows_total, int kbyte0,
+                                       int kbytes) {
+    const int tid = static_cast<int>(threadIdx.x);
 #pragma unroll
-  for (int mf = 0; mf < kMf; ++mf) {
-#pragma unroll
-    for (int nf = 0; nf < kNf; ++nf) i8leaf::clear(acc[mf][nf]);
+    for (int i = 0; i < kPerThread; ++i) {
+      const int c = tid * kPerThread + i;
+      const int row = row0 + c / kPerRow;
+      const int kbyte = kbyte0 + (c % kPerRow) * 16;
+      regs[i] = (row < rows_total && kbyte < kbytes)
+                    ? *reinterpret_cast<const uint4*>(src + static_cast<std::int64_t>(row) * kbytes + kbyte)
+                    : make_uint4(0, 0, 0, 0);
+    }
   }
 
-  // A partial M tile is staged through shared memory with zero rows: load_a fetches 16 whole rows, so a direct load
-  // would read past the end of x and fault asynchronously at large token counts.
-  alignas(16) __shared__ std::int8_t s_a[kTileM * 16];
-  const bool partial_m = m0 + kTileM > a.m;
-  for (int k0 = 0; k0 < a.k; k0 += i8leaf::kK) {
-    i8leaf::FragA fa[kMf];
-    i8leaf::FragB fb[kNf];
-    if (partial_m) {
-      for (int i = threadIdx.x; i < kTileM * 16; i += kWave) {
-        const int rr = i / 16, cc = i % 16;
-        const int r = m0 + rr;
-        s_a[i] = r < a.m ? a.x[static_cast<std::int64_t>(r) * a.ldx + k0 + cc] : 0;
+  __device__ __forceinline__ void store(std::int8_t* lds) const {
+    const int tid = static_cast<int>(threadIdx.x);
+#pragma unroll
+    for (int i = 0; i < kPerThread; ++i) {
+      const int c = tid * kPerThread + i;
+      *reinterpret_cast<uint4*>(lds + (c / kPerRow) * kStride + (c % kPerRow) * 16) = regs[i];
+    }
+  }
+};
+
+// C[m, n] = epilogue(A[m, k] @ B[n, k]^T), B in its natural [N, K] row-major form. WARPS_M*WARPS_N waves of 32 threads
+// tile a BM x BN output tile; each wave owns TM*TN 16x16 WMMA tiles. K walks in BKB-byte stages, each holding kSteps
+// 16-byte WMMA K-steps. The next stage's global loads and the next K-step's fragments are issued ahead of the MMAs.
+template <int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN>
+__global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void int8_gemm_tiled(
+    const Int8GemmArgs a, int x_blocks) {
+  constexpr int kThreads = WARPS_M * WARPS_N * kWave;
+  constexpr int kStride = BKB + 16;
+  constexpr int kSteps = BKB / 16;
+  static_assert(BM == WARPS_M * TM * 16 && BN == WARPS_N * TN * 16, "warp grid must tile the block");
+  static_assert(TileStager<BM, BKB, kThreads>::kStride == kStride, "staging stride must match read stride");
+
+  __shared__ __align__(16) std::int8_t As[BM * kStride];
+  __shared__ __align__(16) std::int8_t Bs[BN * kStride];
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int wm = warp / WARPS_N, wn = warp % WARPS_N;
+  const int frag_r = lane & 15;  // gfx11: every lane holds the whole K-step of row frag_r
+
+  // Grouped block order for L2 locality: consecutive blocks advance along M within a group of kGroupM block-rows,
+  // so concurrently resident blocks share the same B columns. Grid x indexes N, y indexes M, as in the reference.
+  constexpr int kGroupM = 4;
+  const int blocks_n = gridDim.x;
+  const int blocks_m = gridDim.y;
+  const int bid = blockIdx.y * blocks_n + blockIdx.x;
+  const int per_group = kGroupM * blocks_n;
+  const int group = bid / per_group;
+  const int idx = bid - group * per_group;
+  const int group_rows = std::min(kGroupM, blocks_m - group * kGroupM);
+  const int mb = group * kGroupM + idx % group_rows;
+  const int nb = idx / group_rows;
+  const int m0 = mb * BM, n0 = nb * BN;
+
+  i8leaf::FragAcc acc[TM][TN];
+#pragma unroll
+  for (int i = 0; i < TM; ++i) {
+#pragma unroll
+    for (int j = 0; j < TN; ++j) i8leaf::clear(acc[i][j]);
+  }
+
+  TileStager<BM, BKB, kThreads> sa, sb;
+  sa.load(a.x, m0, a.m, 0, a.k);
+  sb.load(a.w, n0, a.n, 0, a.k);
+  sa.store(As);
+  sb.store(Bs);
+  __syncthreads();
+
+  for (int k0 = 0; k0 < a.k; k0 += BKB) {
+    const int knext = k0 + BKB;
+    const bool has_next = knext < a.k;
+    if (has_next) {
+      sa.load(a.x, m0, a.m, knext, a.k);
+      sb.load(a.w, n0, a.n, knext, a.k);
+    }
+
+    i8leaf::FragA af[2][TM];
+    i8leaf::FragB bf[2][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+      af[0][i] = *reinterpret_cast<const i8leaf::v4i*>(As + (wm * (TM * 16) + i * 16 + frag_r) * kStride);
+#pragma unroll
+    for (int j = 0; j < TN; ++j)
+      bf[0][j] = *reinterpret_cast<const i8leaf::v4i*>(Bs + (wn * (TN * 16) + j * 16 + frag_r) * kStride);
+
+#pragma unroll
+    for (int kk = 0; kk < kSteps; ++kk) {
+      const int cur = kk & 1, nxt = cur ^ 1;
+      if (kk + 1 < kSteps) {
+        const int kb = (kk + 1) * 16;
+#pragma unroll
+        for (int i = 0; i < TM; ++i)
+          af[nxt][i] = *reinterpret_cast<const i8leaf::v4i*>(As + (wm * (TM * 16) + i * 16 + frag_r) * kStride + kb);
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+          bf[nxt][j] = *reinterpret_cast<const i8leaf::v4i*>(Bs + (wn * (TN * 16) + j * 16 + frag_r) * kStride + kb);
       }
-      __syncthreads();
 #pragma unroll
-      for (int mf = 0; mf < kMf; ++mf) i8leaf::load_a(fa[mf], s_a + mf * 16 * 16, 16);
-      __syncthreads();
-    } else {
+      for (int i = 0; i < TM; ++i) {
 #pragma unroll
-      for (int mf = 0; mf < kMf; ++mf)
-        i8leaf::load_a(fa[mf], a.x + static_cast<std::int64_t>(m0 + mf * 16) * a.ldx + k0, a.ldx);
+        for (int j = 0; j < TN; ++j) i8leaf::mma(acc[i][j], af[cur][i], bf[cur][j]);
+      }
     }
-#pragma unroll
-    for (int nf = 0; nf < kNf; ++nf)
-      i8leaf::load_b(fb[nf], a.w + static_cast<std::int64_t>(n0 + nf * 16) * a.k + k0, a.k);
-#pragma unroll
-    for (int mf = 0; mf < kMf; ++mf) {
-#pragma unroll
-      for (int nf = 0; nf < kNf; ++nf) i8leaf::mma(acc[mf][nf], fa[mf], fb[nf]);
+
+    if (has_next) {
+      __syncthreads();  // all warps finished reading the current LDS tile
+      sa.store(As);
+      sb.store(Bs);
+      __syncthreads();
     }
   }
 
-  alignas(16) __shared__ int s_acc[kTileM * kTileN];
+  // Each accumulator element e is output row 2*e + lane/16, column lane%16 on gfx11.
 #pragma unroll
-  for (int mf = 0; mf < kMf; ++mf) {
+  for (int i = 0; i < TM; ++i) {
 #pragma unroll
-    for (int nf = 0; nf < kNf; ++nf) {
-      i8leaf::store_acc(s_acc + mf * 16 * kTileN + nf * 16, acc[mf][nf], kTileN);
-    }
-  }
-  i8leaf::barrier();
-
+    for (int e = 0; e < 8; ++e) {
+      const int r = m0 + wm * (TM * 16) + i * 16 + 2 * e + (lane >> 4);
+      if (r >= a.m) continue;
+      const float xs = a.x_scale[r];
 #pragma unroll
-  for (int mf = 0; mf < kMf; ++mf) {
-    const int r = m0 + mf * 16 + row;
-    if (r >= a.m) continue;
-    const float xs = a.x_scale[r];
-#pragma unroll
-    for (int nf = 0; nf < kNf; ++nf) {
-      for (int i = 0; i < 8; ++i) {
-        const int c = n0 + nf * 16 + col + i;
-        if (c >= n0 + kTileN || c >= a.n) break;
-        const float ws = a.w_scale[c];
-        float v = static_cast<float>(s_acc[(mf * 16 + row) * kTileN + (c - n0)]) * xs * ws;
+      for (int j = 0; j < TN; ++j) {
+        const int c = n0 + wn * (TN * 16) + j * 16 + (lane & 15);
+        if (c >= a.n) continue;
+        float v = static_cast<float>(acc[i][j][e]) * xs * a.w_scale[c];
         if (a.bias != nullptr) v += a.bias[c];
-        if (a.lora_delta != nullptr) v += f(a.lora_delta[r * a.ldl + c]);
+        if (a.lora_delta != nullptr) v += f(a.lora_delta[static_cast<std::int64_t>(r) * a.ldl + c]);
         a.y[static_cast<std::int64_t>(r) * a.ldy + c] = bf(v);
       }
     }
@@ -124,16 +196,24 @@ namespace mi::hip {
 
 // Launch the INT8 ConvRot GEMM: y [m, n] = bf16((x @ w^T) * xs * ws + bias). x [m, k] int8, w [n, k] int8.
 void int8_gemm(hip_block::bf16_bits* y, std::int64_t ldy, const std::int8_t* x, std::int64_t ldx,
-                      const float* x_scale, const std::int8_t* w, const float* w_scale, const float* bias, int m, int n,
-                      int k, hipStream_t stream, const hip_block::bf16_bits* lora_delta, std::int64_t ldl) {
+                       const float* x_scale, const std::int8_t* w, const float* w_scale, const float* bias, int m, int n,
+                       int k, hipStream_t stream, const hip_block::bf16_bits* lora_delta, std::int64_t ldl) {
+  if (m == 0 || n == 0 || k == 0) return;
   hip_block::Int8GemmArgs a{x, ldx, x_scale, w, w_scale, bias, y, ldy, m, n, k, lora_delta, ldl};
-  const int gx = (m + hip_block::kTileM - 1) / hip_block::kTileM;
-  const int gy = (n + hip_block::kTileN - 1) / hip_block::kTileN;
-  // Chunk the grid's x dimension: a 4.2 MP image's token count would otherwise exceed the device's grid limit.
-  constexpr int kChunkX = 4096;
-  for (int x0 = 0; x0 < gx; x0 += kChunkX) {
-    const int xn = std::min(kChunkX, gx - x0);
-    hip_block::int8_gemm_kernel<<<dim3(xn, gy, 1), hip_block::kWave, 0, stream>>>(a, x0);
+  // Chunk the grid's x dimension so a multi-megapixel image's token count cannot exceed the device's grid limit.
+  constexpr int kTileM = 128, kTileN = 128, kChunk = 4096;
+  const int gx = (m + kTileM - 1) / kTileM;
+  const int gy = (n + kTileN - 1) / kTileN;
+  for (int x0 = 0; x0 < gx; x0 += kChunk) {
+    const int xn = std::min(kChunk, gx - x0);
+    dim3 grid(gy, xn, 1);  // x = N blocks, y = M blocks (matches the kernel's grouped ordering)
+    // Deep K: the 128-thread 4x4 fragment grid has the highest matrix density and the LDS reads are amortised. Shallow
+    // K: the 512-thread 2x2 grid yields more blocks to interleave across the six WGPs of the 780M.
+    if (k >= 4096) {
+      hip_block::int8_gemm_tiled<128, 128, 128, 2, 2, 4, 4><<<grid, 128, 0, stream>>>(a, xn);
+    } else {
+      hip_block::int8_gemm_tiled<128, 128, 64, 4, 4, 2, 2><<<grid, 512, 0, stream>>>(a, xn);
+    }
   }
   const hipError_t e = hipGetLastError();
   if (e != hipSuccess) throw std::runtime_error(std::string("hip_block::int8_gemm: ") + hipGetErrorString(e));
