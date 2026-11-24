@@ -562,7 +562,8 @@ int run(const Args& a) {
     g.progress = [&](const char* stage, int done, int total) {
       const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
       if (std::string_view(stage) == "denoise" && done > 0) {
-        std::fprintf(stderr, "denoise %d/%d %.2f s\n", done, total, now - last);
+        // Like the CUDA CLI: redraw one line in place instead of one line per step.
+        std::fprintf(stderr, "\rstep %d/%d  %.2f s/step %s", done, total, now - last, done == total ? "\n" : "");
       } else if (done == 0) {
         std::fprintf(stderr, "%s\n", stage);
       }
