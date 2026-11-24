@@ -15,6 +15,7 @@
 
 #include "text_encoder.h"
 
+#include "dequant_fast.h"
 #include "half.h"
 #include "hip_block.h"
 #include "safetensors.h"
@@ -162,28 +163,64 @@ struct TextEncoder::Impl {
       tensors[key] = {file.get(), &file->at(name), nullptr, file->at(name).bytes};
     }
     // Dequantize the I8 ConvRot weights to host BF16 (the high tier's text encoder ships int8 weights).
+    // Tensors are independent, so read and convert them in parallel; the dequantizer itself is single-threaded here.
+    std::vector<std::string> i8_keys;
     std::uint64_t i8_bytes = 0;
     for (const auto& [key, src] : tensors) {
-      if (src.info && src.info->dtype == "I8") i8_bytes += src.info->bytes;
+      if (src.info && src.info->dtype == "I8") {
+        i8_keys.push_back(key);
+        i8_bytes += src.info->bytes;
+      }
     }
     dequant = HostBuffer(2 * i8_bytes);  // BF16: two bytes per dequantized element
     bf16* dq = dequant.as<bf16>();
+    std::vector<std::size_t> offsets(i8_keys.size());
     std::size_t dq_off = 0;
-    for (auto& [key, src] : tensors) {
-      if (!(src.info && src.info->dtype == "I8")) continue;
-      const std::int64_t N = src.info->shape[0], K = src.info->shape[1];
-      std::vector<std::int8_t> q(static_cast<std::size_t>(N) * K);
-      src.file->read(*src.info, q.data());
-      const auto sit = tensors.find(key + "_scale");
-      if (sit == tensors.end() || !sit->second.file) fail("no weight_scale for " + key);
-      std::vector<float> scale(static_cast<std::size_t>(N));
-      sit->second.file->read(*sit->second.info, scale.data());
-      std::vector<float> f32(static_cast<std::size_t>(N) * K);
-      mi::quant::dequantize_rows(q.data(), scale.data(), N, K, 256, f32.data());
-      const std::size_t count = static_cast<std::size_t>(N) * K;
-      for (std::size_t i = 0; i < count; ++i) dq[dq_off + i] = mi::quant::float_to_bf16(f32[i]);
-      src = {nullptr, nullptr, dq + dq_off, 2 * count};
-      dq_off += count;
+    for (std::size_t i = 0; i < i8_keys.size(); ++i) {
+      offsets[i] = dq_off;
+      dq_off += static_cast<std::size_t>(tensors[i8_keys[i]].info->bytes);
+    }
+    const int threads = std::min<int>(8, static_cast<int>(std::thread::hardware_concurrency()));
+    std::atomic<std::size_t> next{0};
+    std::vector<std::exception_ptr> errors(static_cast<std::size_t>(threads));
+    const auto work = [&](int t) {
+      try {
+        for (std::size_t i = next++; i < i8_keys.size(); i = next++) {
+          const std::string& key = i8_keys[i];
+          const WeightSource& src = tensors[key];
+          const std::int64_t N = src.info->shape[0], K = src.info->shape[1];
+          std::vector<std::int8_t> q(static_cast<std::size_t>(N) * K);
+          src.file->read(*src.info, q.data());
+          const auto sit = tensors.find(key + "_scale");
+          if (sit == tensors.end() || !sit->second.file) fail("no weight_scale for " + key);
+          std::vector<float> scale(static_cast<std::size_t>(N));
+          sit->second.file->read(*sit->second.info, scale.data());
+          if (options.exact_dequant) {
+            std::vector<float> f32(static_cast<std::size_t>(N) * K);
+            mi::quant::dequantize_rows(q.data(), scale.data(), N, K, 256, f32.data());
+            for (std::size_t j = 0; j < f32.size(); ++j) dq[offsets[i] + j] = mi::quant::float_to_bf16(f32[j]);
+          } else {
+            mi::hip::dequantize_rows_fast_bf16(q.data(), scale.data(), N, K, 256, dq + offsets[i], 1);
+          }
+          const std::size_t count = static_cast<std::size_t>(N) * K;
+        }
+      } catch (...) {
+        errors[static_cast<std::size_t>(t)] = std::current_exception();
+        next = i8_keys.size();
+      }
+    };
+    {
+      std::vector<std::jthread> helpers;
+      for (int t = 1; t < threads; ++t) helpers.emplace_back(work, t);
+      work(0);
+    }
+    for (const auto& e : errors) {
+      if (e) std::rethrow_exception(e);
+    }
+    for (std::size_t i = 0; i < i8_keys.size(); ++i) {
+      const std::string& key = i8_keys[i];
+      const std::size_t count = static_cast<std::size_t>(tensors[key].info->bytes);
+      tensors[key] = {nullptr, nullptr, dq + offsets[i], 2 * count};
     }
     const auto it = tensors.find("language_model.embed_tokens.weight");
     if (it == tensors.end() || it->second.bytes == 0 || it->second.bytes % (2 * kTeHidden) != 0) {

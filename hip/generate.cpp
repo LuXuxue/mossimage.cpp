@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <optional>
@@ -174,13 +175,21 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
   std::vector<std::vector<std::uint16_t>> embeds;
   {
     double t0 = now_s();
+    report("text encoder load", 0, 1);
+    TextEncoderOptions te_options;
+    te_options.exact_dequant = std::getenv("MI_HIP_TE_EXACT_DEQUANT") != nullptr;
+    TextEncoder encoder(device, component(r.te_file, "text_encoder"), te_options);
+    const double load_s = now_s() - t0;
+    out.text_encoder_s = load_s;
+    report("text encoder load", 1, 1);
+    t0 = now_s();
     report("text encoder", 0, 1);
-    TextEncoder encoder(device, component(r.te_file, "text_encoder"));
     std::vector<std::vector<std::int32_t>> sequences{r.cond_ids};
     if (cfg) sequences.push_back(r.uncond_ids);
     embeds = encoder.encode(sequences);
     out.text_encoder_s = now_s() - t0;
     report("text encoder", 1, 1);
+    out.text_encoder_load_s = load_s;
   }
 
   // DiT: resident, the text refiner once per prompt, then the steps.

@@ -47,7 +47,7 @@ struct GenerateResult {
   std::uint32_t width = 0, height = 0;
   std::vector<std::uint8_t> rgb;  // [height, width, 3]; empty without the decode
   std::vector<float> latents;     // the final latents, f32 [128, height / 16, width / 16]
-  double text_encoder_s = 0, dit_load_s = 0, denoise_s = 0, vae_s = 0;
+  double text_encoder_s = 0, text_encoder_load_s = 0, dit_load_s = 0, denoise_s = 0, vae_s = 0;
   int dit_resident_blocks = 0;  // of 42; the rest streamed from host memory every step
   std::uint64_t dit_free_bytes = 0;  // device memory free once the DiT's weights loaded, for its activations
 };

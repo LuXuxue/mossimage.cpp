@@ -45,6 +45,9 @@ struct TextEncoderOptions {
   bool packed = true;
   // Device time of every op into TextEncoderStats::op_ms (events around each op).
   bool time_ops = false;
+  // Bit-exact reference Hadamard dequantization (O(g^2), ~30 s for a 9B encoder) versus the
+  // fast radix-4 transform (~6 s) that differs from it at ~0.1% of bf16 values.
+  bool exact_dequant = false;
 };
 
 // Times of the last encode().

@@ -620,7 +620,8 @@ int run(const Args& a) {
            json_escape(a.tier) + ",\n";
     doc += "  \"lora_scale\": " + num(a.lora_scale) + ", \"lora_placement\": " +
            json_escape(a.lora_placement.empty() ? "side_branch" : a.lora_placement) + ",\n";
-    doc += "  \"timings_s\": {\"text_encoder\": " + num(r.text_encoder_s) + ", \"dit_load\": " + num(r.dit_load_s) +
+    doc += "  \"timings_s\": {\"text_encoder_load\": " + num(r.text_encoder_load_s) +
+           ", \"text_encoder\": " + num(r.text_encoder_s) + ", \"dit_load\": " + num(r.dit_load_s) +
            ", \"denoise\": " + num(r.denoise_s) + ", \"vae\": " + num(r.vae_s) + "},\n";
     doc += "  \"dit_resident_blocks\": " + std::to_string(r.dit_resident_blocks) + "\n}\n";
     std::ofstream out(a.json_report, std::ios::binary);
@@ -628,9 +629,10 @@ int run(const Args& a) {
     out << doc;
   }
   if (!a.quiet) {
-    std::fprintf(stderr, "done: seed %llu; text encoder %.1f s, DiT load %.1f s (%d of 42 blocks on the device, %.2f GiB free "
-                         "beside them), denoise %.1f s (%.2f s/step), VAE %.1f s\n",
-                 static_cast<unsigned long long>(seed), r.text_encoder_s, r.dit_load_s, r.dit_resident_blocks,
+    std::fprintf(stderr, "done: seed %llu; text encoder load %.1f s, encode %.1f s, DiT load %.1f s (%d of 42 blocks on the "
+                         "device, %.2f GiB free beside them), denoise %.1f s (%.2f s/step), VAE %.1f s\n",
+                 static_cast<unsigned long long>(seed), r.text_encoder_load_s, r.text_encoder_s, r.dit_load_s,
+                 r.dit_resident_blocks,
                  static_cast<double>(r.dit_free_bytes) / static_cast<double>(1ull << 30), r.denoise_s,
                  r.denoise_s / static_cast<double>(g.timesteps.size()), r.vae_s);
   }

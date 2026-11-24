@@ -244,6 +244,16 @@ add_executable(hip_int8_gemm_bench tools/hip_int8_gemm_bench.cpp)
 target_compile_options(hip_int8_gemm_bench PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_int8_gemm_bench PRIVATE mossinfer_hip)
 
+# Fast ConvRot dequantization correctness and speed.
+add_executable(hip_dequant_fast_check tools/hip_dequant_fast_check.cpp)
+target_compile_options(hip_dequant_fast_check PRIVATE ${MI_HIP_WARN})
+target_link_libraries(hip_dequant_fast_check PRIVATE mossinfer_hip)
+
+# Text encoder construction / encode timing breakdown.
+add_executable(hip_te_profile tools/hip_te_profile.cpp)
+target_compile_options(hip_te_profile PRIVATE ${MI_HIP_WARN})
+target_link_libraries(hip_te_profile PRIVATE mossinfer_hip)
+
 # LoRA side-branch shapes.
 add_executable(hip_lora_info tools/hip_lora_info.cpp)
 target_compile_options(hip_lora_info PRIVATE ${MI_HIP_WARN})

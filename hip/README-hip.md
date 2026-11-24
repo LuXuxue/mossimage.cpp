@@ -54,6 +54,14 @@ outside the repository.
   lane. Q/K/V quantizers derive all varlen offsets from `cu_seqlens` on device.
   The V padding is not zeroed: out-of-range keys get zero probability, and a
   large `hipMemsetAsync` was far more expensive than all quantization kernels.
+- The text encoder's int8 ConvRot weights are dequantized to host bf16 once at
+  construction. The reference dense Hadamard multiply is O(g^2) and dominates
+  startup; `dequant_fast.h` applies the same H4-based transform as radix-4
+  butterfly stages (O(g log g)), writes bf16 directly and processes tensors on
+  several threads. This cuts construction from ~165 s to ~6 s and `encode()` is
+  ~1.5 s. The fast transform differs from the reference at ~0.1% of bf16 weight
+  values; set `MI_HIP_TE_EXACT_DEQUANT=1` for bit-exact (but much slower) weights.
+  The reported "text encoder load" and "text encoder" timings are separate.
 - The DiT attention output head stride is the head dimension (128), not the
   full residual width; using the latter corrupts adjacent token rows.
 - The LoRA delta must be added before the base GEMM's bf16 rounding, not to the
@@ -68,5 +76,6 @@ outside the repository.
 - `hip_int8_gemm_check`, `hip_bf16_gemm_check`, `hip_int8_attn_probe`,
   `hip_attn_probe` — compare kernels against host references
 - `hip_int8_gemm_bench`, `hip_bf16_gemm_bench`, `hip_rotate_quantize_bench`,
-  `hip_lora_info` — report kernel throughput and LoRA branch shapes
+  `hip_lora_info`, `hip_te_profile`, `hip_dequant_fast_check` — report kernel
+  throughput, LoRA branch shapes and text-encoder timing/accuracy
 - `MI_HIP_OP_TIME=1` prints a per-op DiT timing breakdown
