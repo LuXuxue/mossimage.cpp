@@ -60,10 +60,10 @@ list(APPEND MI_HIP_WARN -ffp-contract=off)
 # Kernel sources. block_kernels.hip is the DiT block (tools/hip_block checks it against the engine); dit_kernels.hip the
 # DiT's other ops; te_kernels.hip the text encoder's; vae_kernels.hip the VAE decoder's.
 set(MI_HIP_KERNELS block_kernels.hip dit_kernels.hip te_kernels.hip vae_kernels.hip int8_gemm.hip rotate_quantize.hip
-                    int8_block.hip)
+                    int8_block.hip lora.hip)
 set(MI_HIP_KERNEL_HEADERS device_math.h dit_kernels.h gemm_tile.h hip_block.h mma_leaf.h te_kernels.h vae_kernels.h
-                           int8_leaf.h int8_block.h)
-set(MI_HIP_HOST runtime.cpp safetensors.cpp dit.cpp text_encoder.cpp vae.cpp generate.cpp
+                           int8_leaf.h int8_block.h lora.h)
+set(MI_HIP_HOST runtime.cpp safetensors.cpp dit.cpp text_encoder.cpp vae.cpp generate.cpp lora.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../src/weights/quant/quant_codec.cpp)
 
 if(HIP_TARGET STREQUAL "nvidia")
@@ -178,9 +178,11 @@ if(MI_HIP_AMD)
   if(MOSSINFER_STATIC_LIBSTDCXX AND NOT WIN32)
     target_link_options(moss-infer-hip PRIVATE -static-libstdc++ -static-libgcc)
   endif()
-  # Windows: amdhip64_7.dll (versioned name) from the SDK's bin next to the program.
+  # Windows: the HIP runtime DLLs from the SDK's bin next to the program. amdhip64_7.dll imports
+  # rocm_kpack.dll and amd_comgr.dll, so the versioned runtime alone is not enough to load.
   if(WIN32)
     file(GLOB _mi_hip_dlls "${ROCM_PATH}/bin/amdhip64*.dll")
+    list(APPEND _mi_hip_dlls "${ROCM_PATH}/bin/rocm_kpack.dll" "${ROCM_PATH}/bin/amd_comgr.dll")
     add_custom_command(TARGET moss-infer-hip POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_mi_hip_dlls} $<TARGET_FILE_DIR:moss-infer-hip>)
   endif()
@@ -247,7 +249,12 @@ target_compile_options(hip_te_check PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_te_check PRIVATE mossinfer_hip mi_hip_engine_json)
 
 # The VAE decoder's kernels against host replays, then golden latents against the reference pipeline's PNGs (zlib).
-find_package(ZLIB REQUIRED)
-add_executable(hip_vae_check tools/hip_vae_check.cpp)
-target_compile_options(hip_vae_check PRIVATE ${MI_HIP_WARN})
-target_link_libraries(hip_vae_check PRIVATE mossinfer_hip ZLIB::ZLIB)
+# TheRock SDKs do not ship zlib on Windows, so skip that one check there instead of refusing to configure the tools.
+find_package(ZLIB QUIET)
+if(ZLIB_FOUND)
+  add_executable(hip_vae_check tools/hip_vae_check.cpp)
+  target_compile_options(hip_vae_check PRIVATE ${MI_HIP_WARN})
+  target_link_libraries(hip_vae_check PRIVATE mossinfer_hip ZLIB::ZLIB)
+else()
+  message(STATUS "zlib not found: skipping hip_vae_check")
+endif()

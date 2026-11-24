@@ -220,10 +220,10 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
       i8_check(p + "proj.ffn_down.weight_scale", {d, 1}, "F32");
       HostBuffer streamed(i8_block_bytes);
       char* dst = static_cast<char*>(streamed.data());
-      index.read_into(p + "norm1.weight", dst + i8_norms * 0, d * kBf16);
-      index.read_into(p + "norm2.weight", dst + 2 * d * kBf16, d * kBf16);
-      index.read_into(p + "q_norm.weight", dst + 2 * d * kBf16 + kHead * kBf16, kHead * kBf16);
-      index.read_into(p + "k_norm.weight", dst + 2 * d * kBf16 + 2 * kHead * kBf16, kHead * kBf16);
+      index.read_into(p + "norm1.weight", dst + 0, d * kBf16);
+      index.read_into(p + "norm2.weight", dst + d * kBf16, d * kBf16);
+      index.read_into(p + "q_norm.weight", dst + 2 * d * kBf16, kHead * kBf16);
+      index.read_into(p + "k_norm.weight", dst + 2 * d * kBf16 + kHead * kBf16, kHead * kBf16);
       index.read_into(p + "proj.qkv.weight", dst + i8_qkv_q, 3 * d * d);
       index.read_into(p + "proj.qkv.weight_scale", dst + i8_qkv_scale, 3 * d * 4);
       index.read_into(p + "proj.o.weight", dst + i8_o_q, d * d);
@@ -240,9 +240,9 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
       const auto fp = [&](std::size_t o) { return reinterpret_cast<const float*>(base + o); };
       Int8BlockWeights w;
       w.norm1 = reinterpret_cast<const bf16*>(base + 0);
-      w.norm2 = reinterpret_cast<const bf16*>(base + 2 * d * kBf16);
-      w.q_norm = reinterpret_cast<const bf16*>(base + 2 * d * kBf16 + kHead * kBf16);
-      w.k_norm = reinterpret_cast<const bf16*>(base + 2 * d * kBf16 + 2 * kHead * kBf16);
+      w.norm2 = reinterpret_cast<const bf16*>(base + d * kBf16);
+      w.q_norm = reinterpret_cast<const bf16*>(base + 2 * d * kBf16);
+      w.k_norm = reinterpret_cast<const bf16*>(base + 2 * d * kBf16 + kHead * kBf16);
       w.qkv.q = reinterpret_cast<const std::int8_t*>(base + i8_qkv_q);
       w.qkv.scale = fp(i8_qkv_scale);
       w.qkv.bias = nullptr;
@@ -256,6 +256,8 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
       w.down.scale = fp(i8_down_scale);
       w.down.bias = nullptr;
       int8_blocks_[l] = w;
+      // Keep blocks_ aligned with the layer index: a model with mixed INT8/bf16 blocks indexes this vector by l.
+      blocks_.push_back(hip_block::BlockWeights{});
       host_blocks_.emplace_back();  // keep the parallel vectors aligned
       slot_of_.push_back(-1);  // int8 blocks are always on-device
       continue;
@@ -343,6 +345,18 @@ void Dit::mark(int what) {
   event_what_.resize(events_.size());
   event_what_[events_used_] = what;
   events_[events_used_++]->record(stream_.get());
+}
+
+void Dit::apply_lora(const LoraBranch& branch, const bf16* x, int k, bf16* out, int n, int m, hipStream_t stream) {
+  if (!branch.active || branch.k != k || branch.n != n || m == 0) return;
+  // t = bf16(x · Aᵀ); delta = bf16(t · Bᵀ); out += delta before the site's epilogue. B's columns already carry the
+  // adapter's coefficient (folded in on load), so no separate scaling kernel is needed.
+  const int r = branch.rank;
+  bf16* t = lora_t32_.as<bf16>();
+  bf16* delta = lora_delta_.as<bf16>();
+  hip_block::gemm(t, r, x, k, branch.a, k, m, r, k, stream);
+  hip_block::gemm(delta, n, t, r, branch.b, r, m, n, r, stream);
+  lora_add(out, delta, static_cast<std::uint64_t>(m) * n, stream);
 }
 
 DeviceBuffer Dit::encode_text(const std::vector<std::uint16_t>& embeds, std::uint32_t length) {
@@ -459,6 +473,10 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
     scratch(i8_ug_, total * 2 * kFfn * kBf16);
     scratch(i8_gemm_out_, total * kDim * kBf16);
   }
+  if (options_.lora != nullptr && options_.lora->loaded()) {
+    scratch(lora_t32_, total * options_.lora->max_rank() * kBf16);
+    scratch(lora_delta_, total * options_.lora->max_n() * kBf16);
+  }
 
   // The video tokens [hw, 128] in bf16 (the reference's .to(bf16) of the transposed latents), the same for every row.
   std::vector<bf16> host_tokens(hw * kDiTLatentChannels);
@@ -509,30 +527,19 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
 
   for (int l = 0; l < kDiTLayers; ++l) {
     const int s = slot_of_[static_cast<std::size_t>(l)];
-    std::fprintf(stderr, "[slot] l=%d s=%d sf=%p cd=%p cs=%p\n", l, s, (s >= 0 ? (void*)slot_free_[s].get() : nullptr), (s >= 0 ? (void*)copy_done_[s].get() : nullptr), (void*)copy_stream_.get());
-    std::fflush(stderr);
     if (s >= 0) {
       // The copy waits until the slot's previous block has run; this block's ops wait for the copy. The host queues
       // everything ahead, so the next streamed block's copy (the other slot) runs while this block computes.
-      std::fprintf(stderr, "[slot-wait] l=%d s=%d\n", l, s);
-      std::fflush(stderr);
       slot_free_[s]->wait(copy_stream_.get());
       const HostBuffer& src = host_blocks_[static_cast<std::size_t>(l)];
-      std::fprintf(stderr, "[copy-before] block %d s=%d src=%p dst=%p bytes=%llu\n", l, s, (const void*)src.data(), (const void*)slots_[s].data(), (unsigned long long)src.bytes());
-      std::fflush(stderr);
       copy_async(slots_[s].data(), src.data(), src.bytes(), copy_stream_.get());
-      std::fprintf(stderr, "[copy-queued] block %d s=%d\n", l, s);
-      std::fflush(stderr);
       copy_done_[s]->record(copy_stream_.get());
       copy_done_[s]->wait(st);
-      std::fprintf(stderr, "[copy-waited] block %d s=%d\n", l, s);
-      std::fflush(stderr);
       mark(hip_block::kBlockOps);
-      std::fprintf(stderr, "[copy-done] block %d s=%d bytes=%llu\n", l, s, (unsigned long long)src.bytes());
-      std::fflush(stderr);
     }
-    std::fprintf(stderr, "[block-start] %d s=%d runs=%zu\n", l, s, runs[static_cast<std::size_t>(l)].size());
-    std::fflush(stderr);
+    const LoraBlock* lb = options_.lora != nullptr && options_.lora->loaded()
+                              ? &options_.lora->block(l)
+                              : nullptr;
     for (const Run& run : runs[static_cast<std::size_t>(l)]) {
       hip_block::BlockBuffers b{};
       b.x = at(x, off[run.r0] * kDim * kBf16);
@@ -549,8 +556,6 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
       b.tokens = static_cast<int>(off[run.r1] - off[run.r0]);
       b.pack = pack_.as<bf16>();
       b.pack_attn = pack_attn_.as<bf16>();
-      std::fprintf(stderr, "[block] %d\n", l);
-      std::fflush(stderr);
       if (is_int8_[static_cast<std::size_t>(l)]) {
         Int8Buffers ib{};
         ib.i8_y = i8_y_.as<std::int8_t>();
@@ -559,49 +564,25 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
         ib.ug = i8_ug_.as<bf16>();
         ib.gemm_out = i8_gemm_out_.as<bf16>();
         for (int op = 0; op < hip_block::kBlockOps; ++op) {
-          std::fprintf(stderr, "[int8] block %d op %d\n", l, op);
-          std::fflush(stderr);
           run_int8_block_op(op, int8_blocks_[static_cast<std::size_t>(l)], b, ib, st);
-          mark(op);
-          {
-            hipError_t e = hipDeviceSynchronize();
-            if (e != hipSuccess) std::fprintf(stderr, "[int8-sync-err] block %d op %d: %s\n", l, op, hipGetErrorString(e));
-            if (l == 1 && op == 1) {
-              // DEBUG: check b.qkv content after int8 qkv gemm
-              auto bf16_to_float = [](std::uint16_t v) -> float {
-                std::uint32_t bits = static_cast<std::uint32_t>(v) << 16;
-                float f;
-                std::memcpy(&f, &bits, sizeof(f));
-                return f;
-              };
-              {
-                std::vector<std::uint16_t> host(64);
-                hipMemcpy(host.data(), b.qkv, host.size() * sizeof(std::uint16_t), hipMemcpyDeviceToHost);
-                std::fprintf(stderr, "[qkv-head] first=%f second=%f\n", bf16_to_float(host[0]), bf16_to_float(host[1]));
-                std::fflush(stderr);
-              }
-              {
-                const std::size_t total_bytes = static_cast<std::size_t>(b.tokens) * 3 * 3072 * 2;
-                std::vector<std::uint16_t> host(64);
-                hipMemcpy(host.data(), b.qkv + total_bytes / 2 - 64, host.size() * sizeof(std::uint16_t), hipMemcpyDeviceToHost);
-                std::fprintf(stderr, "[qkv-tail] last=%f second-last=%f\n", bf16_to_float(host[63]), bf16_to_float(host[62]));
-                std::fflush(stderr);
-              }
-            }
-            std::fflush(stderr);
+          if (lb != nullptr) {
+            if (op == 1) apply_lora(lb->site[static_cast<int>(LoraSite::kQkv)], b.y, kDim, b.qkv, 3 * kDim, b.tokens, st);
+            else if (op == 4)
+              apply_lora(lb->site[static_cast<int>(LoraSite::kO)], b.attn, kDim, ib.gemm_out, kDim, b.tokens, st);
+            else if (op == 6)
+              apply_lora(lb->site[static_cast<int>(LoraSite::kUpGate)], b.y, kDim, ib.ug, 2 * kFfn, b.tokens, st);
+            else if (op == 7)
+              apply_lora(lb->site[static_cast<int>(LoraSite::kDown)], b.ffn, kFfn, ib.gemm_out, kDim, b.tokens, st);
           }
+          mark(op);
         }
       } else {
         for (int op = 0; op < hip_block::kBlockOps; ++op) {
           hip_block::run_block_op(op, blocks_[static_cast<std::size_t>(l)], b, st);
           mark(op);
-          std::fprintf(stderr, "[bf16-done] block %d op %d\n", l, op);
-          std::fflush(stderr);
         }
       }
     }
-    std::fprintf(stderr, "[block-end] %d s=%d\n", l, s);
-    std::fflush(stderr);
     if (s >= 0) slot_free_[s]->record(st);
   }
 

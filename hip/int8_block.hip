@@ -7,11 +7,15 @@
 
 #include <hip/hip_runtime.h>
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <vector>
 
 #include "device_math.h"
 #include "dit_kernels.h"
+#include "runtime.h"
 #include "int8_gemm.hip"
 #include "rotate_quantize.hip"
 
@@ -65,6 +69,9 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b,
       break;
     case 3:  // attention
       {
+        // Use the same packed attention path as the bf16 block: the row-major path's online softmax has incorrect
+        // outputs on gfx11 for this backend.
+        hip_block::pack_attention(b, stream);
         AttentionArgs a{};
         a.q = b.qkv;
         a.k = b.qkv + kDim;
@@ -84,6 +91,7 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b,
         a.max_seqlen = b.max_seqlen;
         a.heads = kHeads;
         a.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHead)));
+        a.packed = b.pack_attn;
         attention(a, stream);
       }
       break;

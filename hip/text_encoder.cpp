@@ -149,13 +149,16 @@ struct TextEncoder::Impl {
   Impl(Device& d, const std::filesystem::path& dir, TextEncoderOptions o)
       : device(d), current((d.make_current(), true)), options(o) {
     if (options.reader_threads < 1) throw std::invalid_argument("hip text encoder: reader_threads must be positive");
-    for (const auto& [name, shard] : st::read_index(dir / "model.safetensors.index.json")) {
+    // `dir` may be a bundle's text_encoder/ directory or a single .safetensors file (--te).
+    for (const auto& [name, shard] : st::index_files(dir)) {
       // Accept both "language_model.*" and "model.language_model.*" tensor naming; the file lookup keeps the original name.
       std::string key = name;
       if (key.rfind("model.", 0) == 0) key = key.substr(6);
       if (key.rfind("language_model.", 0) != 0) continue;
-      auto& file = files[shard];
-      if (!file) file = std::make_unique<st::File>(dir / shard);
+      const std::u8string shard_u8 = shard.u8string();
+      const std::string shard_key(shard_u8.begin(), shard_u8.end());
+      auto& file = files[shard_key];
+      if (!file) file = std::make_unique<st::File>(shard);
       tensors[key] = {file.get(), &file->at(name), nullptr, file->at(name).bytes};
     }
     // Dequantize the I8 ConvRot weights to host BF16 (the high tier's text encoder ships int8 weights).

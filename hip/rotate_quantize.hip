@@ -12,6 +12,7 @@
 // shift) to the row in bf16, then rotates and quantizes.
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -82,9 +83,13 @@ struct BlockShape {
   int pairs;
   static BlockShape of(int groups) {
     BlockShape bs;
-    bs.pairs = groups % 4 == 0 ? groups / 4 + 1 : (groups + 3) / 4 + 1;
-    bs.warps = (bs.pairs + 1) / 2;
+    // One warp handles one pair of 256-groups per iteration. Use enough warps to cover every group in one iteration
+    // (up to kMaxWarps) and only then more iterations; the old formula asked for nine pairs at k=8192, which the
+    // launcher's template switch did not support.
+    bs.warps = (groups + 1) / 2;
     if (bs.warps > kMaxWarps) bs.warps = kMaxWarps;
+    bs.pairs = (groups + 2 * bs.warps - 1) / (2 * bs.warps);
+    if (bs.pairs < 1) bs.pairs = 1;
     return bs;
   }
 };
@@ -111,14 +116,14 @@ struct FusedArgs {
 };
 
 template <int kPairsPerWarp>
-__global__ void rotate_quantize_kernel(RotateArgs a) {
+__global__ void rotate_quantize_kernel(RotateArgs a, int row0) {
   extern __shared__ float tiles[];  // warps x 2 x kHalfFloats
   __shared__ float warp_max[kMaxWarps];
   const int lane = static_cast<int>(threadIdx.x) & 31;
   const int warp = static_cast<int>(threadIdx.x) >> 5;
   const int warps = static_cast<int>(blockDim.x) >> 5;
   const int half = lane >> 4, h = lane & 15;
-  const int row = static_cast<int>(blockIdx.y);
+  const int row = row0 + static_cast<int>(blockIdx.y);
   const int groups = static_cast<int>(a.k) / kConvRotGroup;
 
   float v[kPairsPerWarp][16];
@@ -177,7 +182,7 @@ __global__ void rotate_quantize_kernel(RotateArgs a) {
 }
 
 template <int kPairsPerWarp>
-__global__ void rms_modulate_rotate_quantize_kernel(FusedArgs a) {
+__global__ void rms_modulate_rotate_quantize_kernel(FusedArgs a, int row0) {
   extern __shared__ float tiles[];  // warps x 2 x kHalfFloats
   __shared__ float warp_sumsq[kMaxWarps];
   __shared__ float inv_rms;
@@ -185,7 +190,7 @@ __global__ void rms_modulate_rotate_quantize_kernel(FusedArgs a) {
   const int warp = static_cast<int>(threadIdx.x) >> 5;
   const int warps = static_cast<int>(blockDim.x) >> 5;
   const int half = lane >> 4, h = lane & 15;
-  const int row = static_cast<int>(blockIdx.y);
+  const int row = row0 + static_cast<int>(blockIdx.y);
   const int groups = static_cast<int>(a.k) / kConvRotGroup;
 
   float x[kPairsPerWarp][16];
@@ -282,13 +287,19 @@ void rotate_quantize(const bf16* x, std::int64_t ldx, std::int64_t rows, std::in
   const BlockShape bs = BlockShape::of(groups);
   const int threads = 32 * bs.warps;
   const size_t smem = static_cast<size_t>(bs.warps) * 2 * kHalfFloats * sizeof(float);
-  dim3 grid(1, static_cast<unsigned>(rows), 1);
-  switch (bs.pairs) {
-    case 1: rotate_quantize_kernel<1><<<grid, dim3(threads), smem, stream>>>(RotateArgs{x, ldx, k, q, ldq, scale}); break;
-    case 2: rotate_quantize_kernel<2><<<grid, dim3(threads), smem, stream>>>(RotateArgs{x, ldx, k, q, ldq, scale}); break;
-    case 3: rotate_quantize_kernel<3><<<grid, dim3(threads), smem, stream>>>(RotateArgs{x, ldx, k, q, ldq, scale}); break;
-    case 4: rotate_quantize_kernel<4><<<grid, dim3(threads), smem, stream>>>(RotateArgs{x, ldx, k, q, ldq, scale}); break;
-    default: throw std::runtime_error("rotate_quantize: unsupported pairs");
+  const RotateArgs args{x, ldx, k, q, ldq, scale};
+  // Grid y is the token index; chunk it so a 4.2 MP image does not exceed the device's grid limit.
+  constexpr std::int64_t kChunkRows = 65535;
+  for (std::int64_t row0 = 0; row0 < rows; row0 += kChunkRows) {
+    const int chunk = static_cast<int>(std::min<std::int64_t>(kChunkRows, rows - row0));
+    const dim3 grid(1, static_cast<unsigned>(chunk), 1);
+    switch (bs.pairs) {
+      case 1: rotate_quantize_kernel<1><<<grid, dim3(threads), smem, stream>>>(args, static_cast<int>(row0)); break;
+      case 2: rotate_quantize_kernel<2><<<grid, dim3(threads), smem, stream>>>(args, static_cast<int>(row0)); break;
+      case 3: rotate_quantize_kernel<3><<<grid, dim3(threads), smem, stream>>>(args, static_cast<int>(row0)); break;
+      case 4: rotate_quantize_kernel<4><<<grid, dim3(threads), smem, stream>>>(args, static_cast<int>(row0)); break;
+      default: throw std::runtime_error("rotate_quantize: unsupported pairs");
+    }
   }
   check_launch("rotate_quantize");
 }
@@ -301,14 +312,18 @@ void rms_norm_modulate_rotate_quantize(const bf16* x, std::int64_t ldx, const bf
   const BlockShape bs = BlockShape::of(groups);
   const int threads = 32 * bs.warps;
   const size_t smem = static_cast<size_t>(bs.warps) * 2 * kHalfFloats * sizeof(float);
-  dim3 grid(1, static_cast<unsigned>(rows), 1);
-  FusedArgs fa{x, ldx, weight, scale, shift, k, q, ldq, scale_out};
-  switch (bs.pairs) {
-    case 1: rms_modulate_rotate_quantize_kernel<1><<<grid, dim3(threads), smem, stream>>>(fa); break;
-    case 2: rms_modulate_rotate_quantize_kernel<2><<<grid, dim3(threads), smem, stream>>>(fa); break;
-    case 3: rms_modulate_rotate_quantize_kernel<3><<<grid, dim3(threads), smem, stream>>>(fa); break;
-    case 4: rms_modulate_rotate_quantize_kernel<4><<<grid, dim3(threads), smem, stream>>>(fa); break;
-    default: throw std::runtime_error("rms_norm_modulate_rotate_quantize: unsupported pairs");
+  const FusedArgs fa{x, ldx, weight, scale, shift, k, q, ldq, scale_out};
+  constexpr std::int64_t kChunkRows = 65535;
+  for (std::int64_t row0 = 0; row0 < rows; row0 += kChunkRows) {
+    const int chunk = static_cast<int>(std::min<std::int64_t>(kChunkRows, rows - row0));
+    const dim3 grid(1, static_cast<unsigned>(chunk), 1);
+    switch (bs.pairs) {
+      case 1: rms_modulate_rotate_quantize_kernel<1><<<grid, dim3(threads), smem, stream>>>(fa, static_cast<int>(row0)); break;
+      case 2: rms_modulate_rotate_quantize_kernel<2><<<grid, dim3(threads), smem, stream>>>(fa, static_cast<int>(row0)); break;
+      case 3: rms_modulate_rotate_quantize_kernel<3><<<grid, dim3(threads), smem, stream>>>(fa, static_cast<int>(row0)); break;
+      case 4: rms_modulate_rotate_quantize_kernel<4><<<grid, dim3(threads), smem, stream>>>(fa, static_cast<int>(row0)); break;
+      default: throw std::runtime_error("rms_norm_modulate_rotate_quantize: unsupported pairs");
+    }
   }
   check_launch("rms_norm_modulate_rotate_quantize");
 }

@@ -131,6 +131,9 @@ struct BlockBuffers {
   bf16_bits* pack_attn = nullptr;
 };
 
+// Pack q/k/v into the fragment layout attention() expects when AttentionArgs::packed is set.
+void pack_attention(const BlockBuffers& b, hipStream_t stream);
+
 // The block's ops, in order, so a caller can time each one.
 inline constexpr int kBlockOps = 8;
 const char* block_op_name(int op);

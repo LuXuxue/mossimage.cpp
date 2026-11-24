@@ -19,7 +19,11 @@
 namespace mi::hip {
 
 struct GenerateRequest {
-  std::filesystem::path model_dir;  // MOSS-Image directory: text_encoder/, transformer/, vae/
+  std::filesystem::path model_dir;  // MOSS-Image directory: tokenizer/ and the configs
+  // Optional single-file overrides; empty: the corresponding directory under model_dir.
+  std::filesystem::path dit_file, te_file, vae_file;
+  std::filesystem::path lora_file;  // optional LoRA safetensors applied to the DiT blocks
+  float lora_scale = 1.0f;
   std::vector<std::int32_t> cond_ids;
   std::vector<std::int32_t> uncond_ids;  // unused when cfg == 1
   std::uint32_t width = 0, height = 0;   // pixels, multiples of 16

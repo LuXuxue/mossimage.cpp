@@ -48,6 +48,10 @@ class File {
 // model.safetensors.index.json's weight_map: tensor name -> shard file name (relative to the index's directory).
 std::map<std::string, std::string> read_index(const std::filesystem::path& path);
 
+// The file holding every tensor name, for one .safetensors file, a directory with a weight_map index, or a directory
+// with exactly one .safetensors. Unlike Index, this keeps the file paths so a caller can open them itself.
+std::map<std::string, std::filesystem::path> index_files(const std::filesystem::path& path);
+
 // The tensors of one file, or of every shard of a model directory, by name.
 class Index {
  public:

@@ -30,5 +30,8 @@ if errorlevel 1 exit /b 1
 
 if not exist "%DIST%" mkdir "%DIST%"
 copy /y "%BUILD%\moss-infer-hip.exe" "%DIST%\" >nul
+rem The HIP runtime's amdhip64_7.dll needs these two SDK DLLs (rocm_kpack, amd_comgr) next to it.
 copy /y "%BUILD%\amdhip64*.dll" "%DIST%\" >nul
+copy /y "%BUILD%\rocm_kpack.dll" "%DIST%\" >nul
+copy /y "%BUILD%\amd_comgr.dll" "%DIST%\" >nul
 exit /b 0

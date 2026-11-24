@@ -133,7 +133,6 @@ struct QkArgs {
 
 __global__ __launch_bounds__(kWave) void qk_norm_rope_kernel(const QkArgs a, std::int64_t start) {
   __shared__ float red[kWave];
-  __shared__ float norm[kHeadDim];
   const int lane = thread_id();
   const std::int64_t item = start + static_cast<std::int64_t>(blockIdx.x);
   const std::int64_t token = item / (2 * a.heads);
@@ -153,16 +152,16 @@ __global__ __launch_bounds__(kWave) void qk_norm_rope_kernel(const QkArgs a, std
   HIP_BLOCK_UNROLL
   for (int i = 0; i < 4; ++i) {
     y[i] = rbf(mul(rbf(mul(x[i], r)), f(weight[i])));  // rms_norm_moss output (bf16)
-    norm[4 * lane + i] = y[i];
   }
-  leaf::barrier();
 
-  // Table row [sin(64) | cos(64)]; pair index t = dim mod 64.
+  // Table row [sin(64) | cos(64)]; pair index t = dim mod 64. The RoPE partner of lane l is lane l ^ 16: a wavefront
+  // fence is not enough to publish one lane's shared-memory write to another, so exchange the partner's value with a
+  // lane shuffle instead of reading it back from __shared__.
   const bf16_bits* tab = a.table + token * a.table_ld + 4 * (lane & 15);
   const bool lo_half = lane < 16;
   HIP_BLOCK_UNROLL
   for (int i = 0; i < 4; ++i) {
-    const float other = norm[(4 * lane + i) ^ 64];
+    const float other = __shfl_xor_sync(0xffffffffull, y[i], 16);
     const float si = f(tab[i]), co = f(tab[64 + i]);
     const float lo = lo_half ? y[i] : other, hi = lo_half ? other : y[i];
     // moss_rope_apply's rotate_pair: lo' = lo*cos + (-hi)*sin, hi' = hi*cos + lo*sin, each op rounded.
@@ -290,7 +289,7 @@ __global__ __launch_bounds__(kWave) void attention_kernel(const AttnArgs a) {
       mma_walk(acc_s, q, a.ldq, rows, b, a.ldk, b_cols, kHeadDim, pad);
     }
     store_tile(s_mem, acc_s);
-    leaf::barrier();
+    __syncthreads();
 
     // softmax_rescale_o. One lane per row: this row's new maximum and the rescale of its running sum.
     if (t < rows) {
@@ -315,7 +314,7 @@ __global__ __launch_bounds__(kWave) void attention_kernel(const AttnArgs a) {
       row_sum[t] = sum;
       row_max_scaled[t] = cur == -INFINITY ? 0.0f : mul(cur, a.scale_log2);
     }
-    leaf::barrier();
+    __syncthreads();
     // The weights on every lane, then each row's sum on one lane, in the order of its columns.
     for (int i = t; i < kAttnTileM * kAttnStepN; i += kWave) {
       const int r = i / kAttnStepN, c = i % kAttnStepN;
@@ -327,7 +326,7 @@ __global__ __launch_bounds__(kWave) void attention_kernel(const AttnArgs a) {
         p_mem[i] = 0;
       }
     }
-    leaf::barrier();
+    __syncthreads();
     if (t < rows) {
       float sum = row_sum[t];
       const float* w_row = w_mem + t * kAttnStepN;
@@ -339,7 +338,7 @@ __global__ __launch_bounds__(kWave) void attention_kernel(const AttnArgs a) {
       for (; c2 < cols; ++c2) sum = add(sum, w_row[c2]);
       row_sum[t] = sum;
     }
-    leaf::barrier();
+    __syncthreads();
 
     // The rescale of acc_o needs each element's row, which a fragment does not expose: through memory and back. A row whose
     // maximum did not change has a rescale of exactly 1, and if every row's is, there is nothing to do.
@@ -352,9 +351,9 @@ __global__ __launch_bounds__(kWave) void attention_kernel(const AttnArgs a) {
     }
     if (rescale_any) {
       store_tile(o_mem, acc_o);
-      leaf::barrier();
+      __syncthreads();
       for (int i = t; i < rows * kHeadDim; i += kWave) o_mem[i] = mul(o_mem[i], row_scale[i / kHeadDim]);
-      leaf::barrier();
+      __syncthreads();
       HIP_BLOCK_UNROLL
       for (int mf = 0; mf < kMf; ++mf) {
         HIP_BLOCK_UNROLL
@@ -398,7 +397,7 @@ __global__ __launch_bounds__(kWave) void attention_kernel(const AttnArgs a) {
     const float sum = row_sum[t];
     row_scale[t] = sum == 0.0f || sum != sum ? 1.0f : div(1.0f, sum);
   }
-  leaf::barrier();
+  __syncthreads();
   bf16_bits* o = a.o + q_row0 * a.ldo + head * a.hso;
   for (int i = t; i < rows * kHeadDim; i += kWave) {
     const int r = i / kHeadDim, c = i % kHeadDim;
@@ -447,7 +446,9 @@ void qk_norm_rope(bf16_bits* qkv, std::int64_t ld, std::int64_t tokens, int head
   const QkArgs a{qkv, ld, q_norm, k_norm, table, table_ld, heads,
                  static_cast<float>(rows) / static_cast<float>(rows * kHeadDim)};
   const std::int64_t total = tokens * 2 * heads;
-  constexpr std::int64_t kChunk = 1;  // 780M iGPU grid limit
+  // Grid x is (token, head); chunk it only at the device's grid limit. One launch per item would mean hundreds of
+  // thousands of launches per block per step.
+  constexpr std::int64_t kChunk = 65535;
   for (std::int64_t s = 0; s < total; s += kChunk) {
     const std::int64_t xn = total - s < kChunk ? total - s : kChunk;
     qk_norm_rope_kernel<<<dim3(static_cast<unsigned>(xn)), dim3(kWave), 0, stream>>>(a, s);
@@ -506,20 +507,10 @@ void packed_gemm_plain(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std
 void packed_gemm_gated(bf16_bits* residual, std::int64_t ldr, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const bf16_bits* gate, const BlockBuffers& b, int n, int k, hipStream_t stream) {
   if (b.tokens == 0) return;
   pack_fragments(b.pack, x, ldx, b.tokens, pack_rows(b.tokens), k, stream);
-  std::fprintf(stderr, "[gated] pack done, tokens=%d n=%d k=%d\n", b.tokens, n, k);
-  std::fflush(stderr);
-  hipDeviceSynchronize();
-  std::fprintf(stderr, "[gated] pack synced\n");
-  std::fflush(stderr);
   const Blocking bl = blocking_of(b.tokens, n, k, kGemmTileM, kGemmTileN, kGemmTileN);
   const GemmArgs a{residual, ldr, nullptr, 0, nullptr, 0, gate, b.tokens, n, k, bl.bm, bl.bn, b.pack, wp};
   gemm_kernel<Epilogue::kGatedResidual><<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("gemm_gated_residual (packed)");
-  std::fprintf(stderr, "[gated] gemm launched, workgroups=%u\n", bl.workgroups);
-  std::fflush(stderr);
-  hipDeviceSynchronize();
-  std::fprintf(stderr, "[gated] gemm synced\n");
-  std::fflush(stderr);
 }
 void packed_gemm_situ(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const BlockBuffers& b, int f, int k, hipStream_t stream) {
   if (b.tokens == 0) return;
@@ -529,6 +520,8 @@ void packed_gemm_situ(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std:
   gemm_situ_kernel<<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("gemm_situ_glu (packed)");
 }
+}  // namespace
+
 void pack_attention(const BlockBuffers& b, hipStream_t stream) {
   const PackAttnArgs a{b.pack_attn, b.qkv, 3 * kDim, b.cu_seqlens, 3 * kDim / kFrag};
   const unsigned groups = static_cast<unsigned>((b.max_seqlen + kAttentionStepN - 1) / kAttentionStepN * (kAttentionStepN / kFrag));
@@ -536,13 +529,9 @@ void pack_attention(const BlockBuffers& b, hipStream_t stream) {
   check_launch("pack_attention");
 }
 
-}  // namespace
-
 void run_block_op(int op, const BlockWeights& w, const BlockBuffers& b, hipStream_t stream) {
   constexpr std::int64_t ldx = kDim, ldq = 3 * kDim;
   const bool packed = w.qkv_packed != nullptr && b.pack != nullptr && b.pack_attn != nullptr;
-  std::fprintf(stderr, "[bf16-op] %d packed=%d\n", op, (int)packed);
-  std::fflush(stderr);
   const auto mod = [&](int i) { return b.mod + static_cast<std::int64_t>(i) * kDim; };
   const bf16_bits* k = b.qkv + kDim;
   const bf16_bits* v = b.qkv + 2 * kDim;

@@ -48,7 +48,8 @@ constexpr double kMaxVramBytes = static_cast<double>(std::uint64_t{1024} << 30);
 constexpr const char* kUsage =
     "usage: moss-infer-hip --model <bundle_dir> --prompt <text> [-o <out.png>] [--latent-out <latents.npy>]\n"
     "                      [--negative <text>] [--size <W>x<H>] [--width N] [--height N] [--steps N] [--cfg X]\n"
-    "                      [--shift X] [--seed N|-1] [--skip-layers \"22\"] [--max-seq N] [--tier reference]\n"
+    "                      [--shift X] [--seed N|-1] [--skip-layers \"22\"] [--max-seq N] [--tier high|reference]\n"
+    "                      [--dit <file>] [--te <file>] [--vae <file>] [--lora <file> [--lora-scale S]]\n"
     "                      [--device N] [--vram-budget GiB] [--no-metadata] [--quiet]\n"
     "       moss-infer-hip --list-devices | --version | --help\n"
     "Text to image with MOSS-Image Base or SFT (the bundle's bf16 files) on an AMD GPU through ROCm, with the official\n"
@@ -62,8 +63,12 @@ constexpr const char* kUsage =
     "`vae`, then a summary.\n";
 
 struct Args {
-  fs::path model, out_png, out_latent;
+  fs::path model, out_png, out_latent, dit, te, vae, lora;
   std::string prompt, negative;
+  float lora_scale = 1.0f;
+  std::string lora_placement;
+  bool lora_strict = false;
+  std::string tier = "high";
   bool have_prompt = false, metadata = true, quiet = false, list = false, help = false, version = false;
   int width = 1024, height = 1024, steps = 50, max_seq = 4096, device = -1;
   double cfg = 3.0, shift = 5.0;
@@ -140,6 +145,10 @@ Args parse(const std::vector<std::string>& argv) {
       a.metadata = false;
       continue;
     }
+    if (f == "--lora-strict") {
+      a.lora_strict = true;
+      continue;
+    }
     if (f == "--quiet") {
       a.quiet = true;
       continue;
@@ -159,6 +168,12 @@ Args parse(const std::vector<std::string>& argv) {
     if (i + 1 >= argv.size()) usage(f + " needs a value");
     const std::string& v = argv[++i];
     if (f == "--model") a.model = util::path_from_utf8(v);
+    else if (f == "--dit") a.dit = util::path_from_utf8(v);
+    else if (f == "--te") a.te = util::path_from_utf8(v);
+    else if (f == "--vae") a.vae = util::path_from_utf8(v);
+    else if (f == "--lora") a.lora = util::path_from_utf8(v);
+    else if (f == "--lora-scale") a.lora_scale = static_cast<float>(number(f, v));
+    else if (f == "--lora-placement") a.lora_placement = v;
     else if (f == "--prompt") a.prompt = v, a.have_prompt = true;
     else if (f == "--negative") a.negative = v;
     else if (f == "-o" || f == "--output") a.out_png = util::path_from_utf8(v);
@@ -183,6 +198,13 @@ Args parse(const std::vector<std::string>& argv) {
       // reference: bf16 weights; high: the INT8 ConvRot DiT (int8 x int8 -> int32 -> bf16), auto-detected per block from the
       // model's safetensors dtypes. The other tiers are CUDA-only.
       if (v != "reference" && v != "high") usage("moss-infer-hip runs --tier reference or high");
+      a.tier = v;
+    }
+    // CUDA-only knobs: accept them so a CUDA launcher can drive this binary, but say what is ignored.
+    else if (f == "--mode" || f == "--attention" || f == "--dit-blocks" || f == "--sampler" || f == "--scheduler" ||
+             f == "--cache-dir" || f == "--step-cache" || f == "--step-cache-threshold" || f == "--direct-io" ||
+             f == "--buffered-io") {
+      std::fprintf(stderr, "moss-infer-hip: note: %s is a CUDA-only option, ignored\n", f.c_str());
     }
     else usage("unknown or unsupported flag " + f);
   }
@@ -230,9 +252,29 @@ int run(const Args& a) {
   std::fprintf(stderr, "hip: device %d, %s (%s); kernels: %s, %s\n", device.info().index, device.info().name.c_str(),
                device.info().arch.c_str(), hip::build_target(), hip_block::leaf_name());
 
+  for (const fs::path* p : {&a.dit, &a.te, &a.vae, &a.lora}) {
+    if (!p->empty() && !fs::is_regular_file(*p)) {
+      throw std::runtime_error("moss-infer-hip: file not found: " + util::path_utf8(*p));
+    }
+  }
+  if (!a.lora_placement.empty() && a.lora_placement != "side_branch" && a.lora_placement != "merge" &&
+      a.lora_placement != "default") {
+    usage("--lora-placement takes default, merge or side_branch");
+  }
+  if (!a.lora.empty() && a.lora_placement != "side_branch") {
+    std::fprintf(stderr, "moss-infer-hip: note: LoRA runs as a side branch (--lora-placement=%s)\n",
+                 a.lora_placement.empty() ? "default" : a.lora_placement.c_str());
+  }
+  if (a.lora_strict) std::fprintf(stderr, "moss-infer-hip: note: --lora-strict is not enforced by this backend\n");
+
   const tok::Tokenizer tokenizer = tok::Tokenizer::load(a.model / "tokenizer" / "tokenizer.json");
   hip::GenerateRequest g;
   g.model_dir = a.model;
+  g.dit_file = a.dit;
+  g.te_file = a.te;
+  g.vae_file = a.vae;
+  g.lora_file = a.lora;
+  g.lora_scale = a.lora_scale;
   tok::PromptTokenReport cond_report, uncond_report;
   g.cond_ids = tok::encode_moss_prompt_report(tokenizer, a.prompt, static_cast<std::size_t>(a.max_seq), cond_report);
   const bool cfg = a.cfg != 1.0;

@@ -4,6 +4,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 
 #include "device_math.h"
@@ -36,20 +37,10 @@ __global__ __launch_bounds__(kWave) void int8_gemm_kernel(const Int8GemmArgs a, 
   const int row = i8leaf::row_of_thread();
   const int col = i8leaf::col_of_thread();
 
-  // Zero the accumulator: build it as the mma of a zero A fragment with any B (a zero A contributes nothing).
-  i8leaf::FragA zero_a;
-  i8leaf::FragB zero_b;
-  {
-    // A zero tile in local memory, identical across the wave; load_a is collective over the same address.
-    alignas(16) __shared__ int8_t s_zero[16 * 32];
-    for (int i = 0; i < 16 * 32 / kWave; ++i) s_zero[i * kWave + static_cast<int>(threadIdx.x)] = 0;
-    i8leaf::barrier();
-    i8leaf::load_a(zero_a, s_zero, 32);
-    i8leaf::load_b(zero_b, s_zero, 32);
-  }
+  // mma_sync(c, a, b, c) accumulates into c: c must be initialized before the walk. A "zero A" MMA would still read
+  // the uninitialized c, so fill it explicitly.
   i8leaf::FragAcc acc;
-  i8leaf::mma(acc, zero_a, zero_b);  // acc = 0
-  i8leaf::barrier();
+  i8leaf::clear(acc);
 
   for (int k0 = 0; k0 < a.k; k0 += i8leaf::kK) {
     i8leaf::FragA fa;
@@ -67,11 +58,16 @@ __global__ __launch_bounds__(kWave) void int8_gemm_kernel(const Int8GemmArgs a, 
   const int r = m0 + row;
   if (r < a.m) {
     const float xs = a.x_scale[r];
-    for (int c = n0 + col; c < n0 + 16 && c < a.n; c += 4) {
+    // Each lane owns eight contiguous columns of the 16x16 tile (see i8leaf::col_of_thread): columns col .. col + 7.
+    // store_acc wrote the whole tile row-major into s_acc, so all sixteen columns must be covered by the wave's
+    // two column halves, without overlap or gaps.
+    for (int i = 0; i < 8; ++i) {
+      const int c = n0 + col + i;
+      if (c >= n0 + 16 || c >= a.n) break;
       const float ws = a.w_scale[c];
       float v = static_cast<float>(s_acc[row * 16 + (c - n0)]) * xs * ws;
       if (a.bias != nullptr) v += a.bias[c];
-      a.y[static_cast<std::int64_t>(r) * a.ldy + c] = rbf(v);
+      a.y[static_cast<std::int64_t>(r) * a.ldy + c] = bf(v);
     }
   }
 }
@@ -86,12 +82,11 @@ inline void int8_gemm(hip_block::bf16_bits* y, std::int64_t ldy, const std::int8
                       int k, hipStream_t stream) {
   hip_block::Int8GemmArgs a{x, ldx, x_scale, w, w_scale, bias, y, ldy, m, n, k};
   const int gx = (m + 15) / 16, gy = (n + 15) / 16;
-  std::fprintf(stderr, "[i8gemm-init] m=%d n=%d gx=%d gy=%d\n", m, n, gx, gy);
-  constexpr int kChunkX = 64;  // 780M iGPU grid limit
+  // Chunk the grid's x dimension: a 4.2 MP image's token count would otherwise exceed the device's grid limit.
+  constexpr int kChunkX = 4096;
   for (int x0 = 0; x0 < gx; x0 += kChunkX) {
     const int xn = std::min(kChunkX, gx - x0);
     hip_block::int8_gemm_kernel<<<dim3(xn, gy, 1), hip_block::kWave, 0, stream>>>(a, x0);
-    std::fprintf(stderr, "[i8gemm] chunk x0=%d xn=%d gy=%d\n", x0, xn, gy);
   }
 }
 

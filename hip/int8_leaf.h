@@ -26,12 +26,14 @@
 
 namespace hip_block::i8leaf {
 
-inline constexpr const char* kName = "rocWMMA v_wmma_i8_16x16x32_i8";
-inline constexpr int kK = 32;  // the int8 WMMA's native depth
+inline constexpr const char* kName = "rocWMMA v_wmma_i32_16x16x16_iu8";
+// RDNA3 (gfx11) has no 16x16x32 int8 WMMA: that shape's rocWMMA path is the gfx9 MFMA intrinsic and is a no-op here.
+// The native gfx11 int8 instruction is v_wmma_i32_16x16x16_iu8.
+inline constexpr int kK = 16;
 
-using FragA = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 32, rocwmma::int8_t, rocwmma::row_major>;
-using FragB = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 32, rocwmma::int8_t, rocwmma::col_major>;
-using FragAcc = rocwmma::fragment<rocwmma::accumulator, 16, 16, 32, int>;
+using FragA = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, rocwmma::int8_t, rocwmma::row_major>;
+using FragB = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, rocwmma::int8_t, rocwmma::col_major>;
+using FragAcc = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, int>;
 
 // The 16x16 output tile: lane t owns row t / 2 and columns (t & 1) * 8 .. + 8, as the bf16 leaf's dequant.
 __device__ __forceinline__ int row_of_thread() { return static_cast<int>(threadIdx.x) / 2; }

@@ -339,6 +339,32 @@ std::map<std::string, std::string> read_index(const std::filesystem::path& file)
   return out;
 }
 
+std::map<std::string, std::filesystem::path> index_files(const std::filesystem::path& path) {
+  std::map<std::string, std::filesystem::path> out;
+  const auto add = [&](const std::filesystem::path& file) {
+    File f(file);
+    for (const TensorInfo& t : f.tensors()) out.emplace(t.name, file);
+  };
+  if (!std::filesystem::is_directory(path)) {
+    add(path);
+    return out;
+  }
+  std::vector<std::filesystem::path> indexes, files;
+  for (const auto& entry : std::filesystem::directory_iterator(path)) {
+    const std::string name = utf8(entry.path().filename());
+    if (name.ends_with(".safetensors.index.json")) indexes.push_back(entry.path());
+    else if (name.ends_with(".safetensors")) files.push_back(entry.path());
+  }
+  if (indexes.size() > 1) fail("safetensors: " + utf8(path) + " holds more than one index file");
+  if (indexes.empty()) {
+    if (files.size() != 1) fail("safetensors: " + utf8(path) + " holds no index file and not exactly one .safetensors file");
+    add(files.front());
+    return out;
+  }
+  for (const auto& [name, shard] : read_index(indexes.front())) out.emplace(name, path / shard);
+  return out;
+}
+
 std::vector<float> File::read_f32(const std::string& name) const {
   const TensorInfo& t = at(name);
   if (t.dtype == "F32") {

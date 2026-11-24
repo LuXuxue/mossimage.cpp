@@ -50,4 +50,5 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const hip_block::Block
 void int8_gate_residual(bf16* residual, std::int64_t ldr, const bf16* out, const bf16* gate, std::int64_t m, int n,
                         hipStream_t stream);
 
+
 }  // namespace mi::hip

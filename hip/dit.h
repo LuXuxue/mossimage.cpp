@@ -17,6 +17,7 @@
 
 #include "hip_block.h"
 #include "int8_block.h"
+#include "lora.h"
 #include "runtime.h"
 
 namespace mi::hip {
@@ -38,6 +39,8 @@ struct DitOptions {
   std::uint64_t device_budget = 0;
   // Time each op of every forward with events on the stream (last_op_ms()).
   bool time_ops = false;
+  // Optional runtime LoRA stack, applied as a bf16 side branch to the block GEMMs. The object must outlive the Dit.
+  const Lora* lora = nullptr;
 };
 
 class Dit {
@@ -92,6 +95,8 @@ class Dit {
   void stage_time(float timestep);  // the time sinusoid to the device, the time scratch sized
   void time_modulation();            // the time MLP and both modulations, on the stream
   void mark(int what);  // time_ops: an event on the stream, its interval since the last one counted as `what`
+  // Adds a LoRA branch's delta to a site's bf16 output: t = x · Aᵀ (rounded to bf16), delta = t · Bᵀ, out += delta.
+  void apply_lora(const LoraBranch& branch, const bf16* x, int k, bf16* out, int n, int m, hipStream_t stream);
 
   Device& device_;
   DitOptions options_;
@@ -112,6 +117,7 @@ class Dit {
   DeviceBuffer x_, y_, qkv_, attn_, ffn_, rope_, tokens_, proj_, up_gate_, embeds_, pack_, pack_attn_, cu_;
   DeviceBuffer mod_, head_, t_in_, hidden_, time_;
   DeviceBuffer i8_y_, i8_ffn_, i8_scale_, i8_ug_, i8_gemm_out_;  // the INT8 block's scratch
+  DeviceBuffer lora_t32_, lora_delta_;  // the LoRA side branch: x · Aᵀ and (x · Aᵀ) · Bᵀ
 
   std::vector<std::unique_ptr<Event>> events_;  // time_ops
   std::vector<int> event_what_;

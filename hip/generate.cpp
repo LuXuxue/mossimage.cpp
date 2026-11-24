@@ -14,6 +14,7 @@
 #include <windows.h>
 #endif
 
+#include "lora.h"
 #include "text_encoder.h"
 #include "vae.h"
 
@@ -65,12 +66,16 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
   GenerateResult out;
   out.width = r.width;
   out.height = r.height;
+  // A component may be a single safetensors file (--dit/--te/--vae) instead of the bundle's directory.
+  const auto component = [&](const std::filesystem::path& file, const char* sub) {
+    return file.empty() ? r.model_dir / sub : file;
+  };
 
   // The VAE first (about 0.1 GiB of weights, kept through the run), so a decode the device cannot hold fails before the
   // text encoder and the steps run rather than after them.
   std::optional<VaeDecoder> vae;
   if (r.decode) {
-    vae.emplace(device, r.model_dir / "vae" / "diffusion_pytorch_model.safetensors");
+    vae.emplace(device, component(r.vae_file, "vae/diffusion_pytorch_model.safetensors"));
     vae->require_fits(lh, lw);  // also refuses a size past the decoder's limits
     if (const std::uint64_t need = vae->weight_bytes() + vae->workspace_bytes(lh, lw); r.vram_budget != 0 && need > r.vram_budget) {
       char msg[256];
@@ -170,7 +175,7 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
   {
     double t0 = now_s();
     report("text encoder", 0, 1);
-    TextEncoder encoder(device, r.model_dir / "text_encoder");
+    TextEncoder encoder(device, component(r.te_file, "text_encoder"));
     std::vector<std::vector<std::int32_t>> sequences{r.cond_ids};
     if (cfg) sequences.push_back(r.uncond_ids);
     embeds = encoder.encode(sequences);
@@ -186,7 +191,12 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     const DitPlan p = plan(lengths, device.free_memory());
     DitOptions options;
     options.device_budget = p.weights;  // >= Dit::minimum_weight_bytes(), so never 0 (every block resident)
-    Dit dit(device, r.model_dir / "transformer", options);
+    std::optional<Lora> lora;
+    if (!r.lora_file.empty()) {
+      lora.emplace(r.lora_file, r.lora_scale, kDiTLayers);
+      options.lora = &*lora;
+    }
+    Dit dit(device, component(r.dit_file, "transformer"), options);
     out.dit_resident_blocks = dit.resident_blocks();
     // What is left must hold the activations; the reserve absorbs the runtime's own allocations and the rounding.
     out.dit_free_bytes = device.free_memory();
