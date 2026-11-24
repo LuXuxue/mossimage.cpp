@@ -16,6 +16,7 @@
 #include "device_math.h"
 #include "dit_kernels.h"
 #include "runtime.h"
+#include "int8_attn.h"
 #include "int8_gemm.h"
 #include "rotate_quantize.hip"
 
@@ -68,33 +69,11 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b,
     case 2:  // qk norm + rope (in place on qkv)
       qk_norm_rope(b.qkv, kQkv, tokens, kHeads, w.q_norm, w.k_norm, b.rope, kHead, stream);
       break;
-    case 3:  // attention
-      {
-        // Use the same packed attention path as the bf16 block: the row-major path's online softmax has incorrect
-        // outputs on gfx11 for this backend.
-        hip_block::pack_attention(b, stream);
-        AttentionArgs a{};
-        a.q = b.qkv;
-        a.k = b.qkv + kDim;
-        a.v = b.qkv + 2 * kDim;
-        a.o = b.attn;
-        a.ldq = kQkv;
-        a.ldk = kQkv;
-        a.ldv = kQkv;
-        a.ldo = kDim;
-        a.hsq = kHeadDim;
-        a.hsk = kHeadDim;
-        a.hsv = kHeadDim;
-        a.hso = kHeadDim;
-        a.cu_q = b.cu_seqlens;
-        a.cu_k = b.cu_seqlens;
-        a.batch = b.batch;
-        a.max_seqlen = b.max_seqlen;
-        a.heads = kHeads;
-        a.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHead)));
-        a.packed = b.pack_attn;
-        attention(a, stream);
-      }
+    case 3:  // attention: int8 QK + int8 PV, comfy-kitchen's gfx1103 SageAttention path
+      int8_attn_quantize(b.qkv, kQkv, ib.attn, static_cast<int>(tokens),
+                         static_cast<std::size_t>(ib.attn.padded) * kHeads * kHeadDim, stream);
+      int8_attn_run(ib.attn, b.attn, kDim, b.max_seqlen,
+                    static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHead))), stream);
       break;
     case 4:  // x += int8_gemm(rotate_quantize(attn)) * gate_msa
       rotate_quantize(b.attn, kDim, tokens, kDim, ib.i8_y, kDim, ib.scale, stream);

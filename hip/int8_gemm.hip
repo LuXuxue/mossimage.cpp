@@ -200,16 +200,18 @@ void int8_gemm(hip_block::bf16_bits* y, std::int64_t ldy, const std::int8_t* x, 
                        int k, hipStream_t stream, const hip_block::bf16_bits* lora_delta, std::int64_t ldl) {
   if (m == 0 || n == 0 || k == 0) return;
   hip_block::Int8GemmArgs a{x, ldx, x_scale, w, w_scale, bias, y, ldy, m, n, k, lora_delta, ldl};
-  // Chunk the grid's x dimension so a multi-megapixel image's token count cannot exceed the device's grid limit.
-  constexpr int kTileM = 128, kTileN = 128, kChunk = 4096;
-  const int gx = (m + kTileM - 1) / kTileM;
-  const int gy = (n + kTileN - 1) / kTileN;
+  // Chunk the grid's y dimension so a multi-megapixel image's token count cannot exceed the device's grid limit.
+  constexpr int kChunk = 4096;
+  const bool deep = k >= 4096;
+  constexpr int bm = 128, bn = 128;
+  const int gx = (m + bm - 1) / bm;
+  const int gy = (n + bn - 1) / bn;
   for (int x0 = 0; x0 < gx; x0 += kChunk) {
     const int xn = std::min(kChunk, gx - x0);
     dim3 grid(gy, xn, 1);  // x = N blocks, y = M blocks (matches the kernel's grouped ordering)
     // Deep K: the 128-thread 4x4 fragment grid has the highest matrix density and the LDS reads are amortised. Shallow
     // K: the 512-thread 2x2 grid yields more blocks to interleave across the six WGPs of the 780M.
-    if (k >= 4096) {
+    if (deep) {
       hip_block::int8_gemm_tiled<128, 128, 128, 2, 2, 4, 4><<<grid, 128, 0, stream>>>(a, xn);
     } else {
       hip_block::int8_gemm_tiled<128, 128, 64, 4, 4, 2, 2><<<grid, 512, 0, stream>>>(a, xn);

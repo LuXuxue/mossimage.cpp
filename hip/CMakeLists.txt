@@ -60,9 +60,9 @@ list(APPEND MI_HIP_WARN -ffp-contract=off)
 # Kernel sources. block_kernels.hip is the DiT block (tools/hip_block checks it against the engine); dit_kernels.hip the
 # DiT's other ops; te_kernels.hip the text encoder's; vae_kernels.hip the VAE decoder's.
 set(MI_HIP_KERNELS block_kernels.hip dit_kernels.hip te_kernels.hip vae_kernels.hip int8_gemm.hip rotate_quantize.hip
-                    int8_block.hip lora.hip)
+                    int8_block.hip int8_attn.hip bf16_gemm.hip lora.hip)
 set(MI_HIP_KERNEL_HEADERS device_math.h dit_kernels.h gemm_tile.h hip_block.h mma_leaf.h te_kernels.h vae_kernels.h
-                           int8_leaf.h int8_block.h int8_gemm.h lora.h)
+                           int8_leaf.h int8_block.h int8_gemm.h int8_attn.h bf16_gemm.h lora.h)
 set(MI_HIP_HOST runtime.cpp safetensors.cpp dit.cpp text_encoder.cpp vae.cpp generate.cpp lora.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../src/weights/quant/quant_codec.cpp)
 
@@ -104,7 +104,9 @@ else()
   set_property(SOURCE ${MI_HIP_HOST} PROPERTY COMPILE_OPTIONS ${MI_HIP_WARN})
 
   add_library(mossinfer_hip STATIC ${MI_HIP_KERNELS} ${MI_HIP_HOST})
+  set(MI_I8ATTN_ROT "4" CACHE STRING "Rotation used by the int8 attention quantizers (4 or 128)")
   target_compile_definitions(mossinfer_hip PUBLIC __HIP_PLATFORM_AMD__=1 PRIVATE HIP_BLOCK_LEAF_ROCWMMA ROCWMMA_I8_LEAF
+                                                  MI_I8ATTN_ROT=${MI_I8ATTN_ROT}
                                                   MI_HIP_TARGET="${MI_HIP_TARGET_NAMES}")
   target_include_directories(mossinfer_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../src)
   target_include_directories(mossinfer_hip SYSTEM PUBLIC ${ROCM_PATH}/include)
@@ -223,6 +225,11 @@ add_executable(hip_attn_probe tools/hip_attn_probe.cpp)
 target_compile_options(hip_attn_probe PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_attn_probe PRIVATE mossinfer_hip)
 
+# The int8 attention path against a CPU fp32 reference.
+add_executable(hip_int8_attn_probe tools/hip_int8_attn_probe.cpp)
+target_compile_options(hip_int8_attn_probe PRIVATE ${MI_HIP_WARN})
+target_link_libraries(hip_int8_attn_probe PRIVATE mossinfer_hip)
+
 add_executable(hip_check tools/hip_check.cpp)
 target_compile_options(hip_check PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_check PRIVATE mossinfer_hip)
@@ -231,6 +238,16 @@ target_link_libraries(hip_check PRIVATE mossinfer_hip)
 add_executable(hip_int8_gemm_check tools/hip_int8_gemm_check.cpp)
 target_compile_options(hip_int8_gemm_check PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_int8_gemm_check PRIVATE mossinfer_hip)
+
+# Throughput of the four real GEMM shapes for each tile variant.
+add_executable(hip_int8_gemm_bench tools/hip_int8_gemm_bench.cpp)
+target_compile_options(hip_int8_gemm_bench PRIVATE ${MI_HIP_WARN})
+target_link_libraries(hip_int8_gemm_bench PRIVATE mossinfer_hip)
+
+# The tiled bf16 GEMM used by the LoRA side branch.
+add_executable(hip_bf16_gemm_check tools/hip_bf16_gemm_check.cpp)
+target_compile_options(hip_bf16_gemm_check PRIVATE ${MI_HIP_WARN})
+target_link_libraries(hip_bf16_gemm_check PRIVATE mossinfer_hip)
 
 # dit_kernels.h's ops against host replays; the replays round every fp32 operation, as the kernels do.
 add_executable(hip_dit_kernel_check tools/hip_dit_kernel_check.cpp)

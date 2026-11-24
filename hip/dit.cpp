@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "bf16_gemm.h"
 #include "dit_kernels.h"
 #include "safetensors.h"
 
@@ -336,7 +337,15 @@ std::uint64_t Dit::activation_bytes(std::uint64_t tokens, std::uint64_t rows, st
   // The INT8 path adds quantized activations and a bf16 GEMM output; the LoRA side branch adds its low-rank t and the
   // full-size delta fused into the base GEMM. Include them in the planner's accounting so a large image cannot be
   // planned as if those buffers were free (they were previously omitted, ~0.5 GiB at 1536x1024).
-  if (int8) bytes += tokens * (3 * kDim + 5 * kFfn + 1) + tokens * sizeof(float);
+  if (int8) {
+    bytes += tokens * (3 * kDim + 5 * kFfn + 1) + tokens * sizeof(float);
+    // The int8 attention's q/k/v, scales and varlen metadata.
+    const std::uint64_t padded = (tokens + 63u) / 64u * 64u + 64u * rows;
+    const std::uint64_t h = static_cast<std::uint64_t>(hip_block::kHeads) * hip_block::kHeadDim;
+    bytes += padded * 3u * h + padded * hip_block::kHeads * sizeof(float) +
+             padded / 16u * hip_block::kHeads * sizeof(float) + tokens * sizeof(std::int32_t) +
+             ((tokens + 255u) / 256u) * h * sizeof(float);
+  }
   if (lora) bytes += tokens * (2 * kFfn) * kBf16;
   return bytes;
 }
@@ -364,8 +373,8 @@ const bf16* Dit::compute_lora_delta(const LoraBranch& branch, const bf16* x, int
   const int r = branch.rank;
   bf16* t = lora_t32_.as<bf16>();
   bf16* delta = lora_delta_.as<bf16>();
-  hip_block::gemm(t, r, x, k, branch.a, k, m, r, k, stream);
-  hip_block::gemm(delta, n, t, r, branch.b, r, m, n, r, stream);
+  bf16_gemm_tiled(t, r, x, k, branch.a, k, m, r, k, stream);
+  bf16_gemm_tiled(delta, n, t, r, branch.b, r, m, n, r, stream);
   return delta;
 }
 
@@ -482,6 +491,15 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
     scratch(i8_scale_, total * sizeof(float));
     scratch(i8_ug_, total * 2 * kFfn * kBf16);
     scratch(i8_gemm_out_, total * kDim * kBf16);
+    const std::size_t padded = int8_attn_padded(static_cast<int>(total), static_cast<int>(rows.size()));
+    const std::size_t h = static_cast<std::size_t>(hip_block::kHeads) * hip_block::kHeadDim;
+    scratch(i8_q_, padded * h);
+    scratch(i8_k_, padded * h);
+    scratch(i8_v_, padded * h);
+    scratch(i8_q_scale_, padded * hip_block::kHeads * sizeof(float));
+    scratch(i8_k_scale_, padded / 16 * hip_block::kHeads * sizeof(float));
+    scratch(i8_v_scale_, h * sizeof(float));
+    scratch(i8_part_, ((static_cast<std::size_t>(total) + 255) / 256) * h * sizeof(float));
   }
   if (options_.lora != nullptr && options_.lora->loaded()) {
     scratch(lora_t32_, total * options_.lora->max_rank() * kBf16);
@@ -573,6 +591,17 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
         ib.scale = i8_scale_.as<float>();
         ib.ug = i8_ug_.as<bf16>();
         ib.gemm_out = i8_gemm_out_.as<bf16>();
+        ib.attn.q = i8_q_.as<std::int8_t>();
+        ib.attn.k = i8_k_.as<std::int8_t>();
+        ib.attn.v = i8_v_.as<std::int8_t>();
+        ib.attn.q_scale = i8_q_scale_.as<float>();
+        ib.attn.k_scale = i8_k_scale_.as<float>();
+        ib.attn.v_scale = i8_v_scale_.as<float>();
+        ib.attn.part = i8_part_.as<float>();
+        ib.attn.cu = cu.as<std::int32_t>() + run.cu_at;
+        ib.attn.batch = b.batch;
+        ib.attn.padded = static_cast<int>(int8_attn_padded(static_cast<int>(total),
+                                                          static_cast<int>(rows.size())));
         for (int op = 0; op < hip_block::kBlockOps; ++op) {
           const bf16* lora_delta = nullptr;
           std::int64_t ldl = 0;

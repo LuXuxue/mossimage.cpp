@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "hip_block.h"
+#include "int8_attn.h"
 
 namespace mi::hip {
 
@@ -39,6 +40,7 @@ struct Int8Buffers {
   float* scale;           // [tokens]
   bf16* ug;               // [tokens, 2 kFfnDim] bf16
   bf16* gemm_out;         // [tokens, kDim] bf16
+  Int8AttnBuffers attn;   // quantized q/k/v and scales for the int8 attention op
 };
 
 // One run of `tokens` tokens; b's x, y, qkv, attn, ffn, rope, mod, cu_seqlens, batch, max_seqlen are the shared bf16

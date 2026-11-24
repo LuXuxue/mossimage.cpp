@@ -95,15 +95,27 @@ other than euler) are accepted but print a clear `no effect on this backend` /
   512-thread 2x2 fragment grid, deep K a 128-thread 4x4 grid.
   `hip_int8_gemm_check` checks all of it bit-for-bit (with a fused LoRA delta)
   against a host replay on tail shapes, deep K and real layer shapes.
-- The attention key step is 128 (was 32) and softmax uses gfx1103's single-instruction
-  `__builtin_amdgcn_exp2f`. `hip_attn_probe` checks both packed and unpacked paths
-  against a CPU reference.
-- At 1536x1024 with the 4-step LoRA, a step takes about 21 s on the 780M (down
-  from 150 s before the attention and GEMM changes, and 54 s after the first GEMM
-  tiling). The GEMMs fell from ~56 s to ~9.5 s; attention is now the bottleneck
-  at ~11 s. Still above ComfyUI's ~9.4 s/it: closing the remaining gap needs the
-  int8/FP8 flash attention from the ROCm-optimised ComfyUI kernels (the CUDA high
-  tier also uses int8 attention, not exact bf16), which is not ported here.
+- The high tier's attention is now comfy-kitchen's gfx1103 SageAttention path:
+  signed int8 QK and int8 PV with u8 probabilities kept in registers, per-row Q,
+  per-16-key K and per-channel V scales, and a 128-query / 64-key tile evaluated
+  transposed (`Sᵀ = K·Qᵀ`, `Oᵀ = Vᵀ·Pᵀ`) so the online softmax is scalar per lane.
+  A Hadamard sign rotation spreads quantization outliers; Q/K/V quantizers derive
+  every varlen offset from `cu_seqlens` on the device, so there is no host traffic
+  between layers. `hip_int8_attn_probe` checks it against a CPU fp32 reference.
+  The V padding is deliberately left uninitialized: keys past the sequence end
+  get probability zero, and `hipMemsetAsync` of the 19 MB tensor cost ~40 ms —
+  more than all quantization kernels combined.
+- The LoRA side branch uses the same LDS-staged 128x128 tile, with a bf16 WMMA
+  leaf (32-byte K-step). `hip_bf16_gemm_check` checks it against a host replay.
+- At 1536x1024 the 780M's denoise step is about 10.4 s with the 4-step LoRA and
+  **9.3 s without it** (from 150 s at the start, 21 s after the int8 GEMM port,
+  and 12.7 s after the int8 attention port). The remaining LoRA overhead is
+  ~1.1 s/step, so ComfyUI's 9.41 s/it is reached without LoRA and approached with
+  it. `MI_HIP_OP_TIME=1` prints the per-op breakdown.
+- The Q/K rotation defaults to the local H4 (`MI_I8ATTN_ROT=4`); the reference's
+  full H128 improves outlier spreading but measured slower here and moved the
+  output further from the CUDA high tier (256px latent correlation 0.83 against
+  0.89 for H4).
 - The DiT block's attention output head stride is the head dimension (128), not
   the full residual width; using the latter silently overwrites adjacent token
   rows and produces grey noise.
