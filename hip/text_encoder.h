@@ -48,6 +48,9 @@ struct TextEncoderOptions {
   // Bit-exact reference Hadamard dequantization (O(g^2), ~30 s for a 9B encoder) versus the
   // fast radix-4 transform (~6 s) that differs from it at ~0.1% of bf16 values.
   bool exact_dequant = false;
+  // Route the projection GEMMs through the LDS-staged tiled bf16 kernel on row-major weights,
+  // dropping the per-layer weight/activation packing (2-3x faster GEMMs, slightly different rounding).
+  bool tiled_gemm = true;
 };
 
 // Times of the last encode().

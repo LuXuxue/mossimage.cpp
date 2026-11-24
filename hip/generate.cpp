@@ -77,6 +77,7 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
   std::optional<VaeDecoder> vae;
   if (r.decode) {
     vae.emplace(device, component(r.vae_file, "vae/diffusion_pytorch_model.safetensors"));
+    vae->set_profile(std::getenv("MI_HIP_VAE_PROFILE") != nullptr);
     vae->require_fits(lh, lw);  // also refuses a size past the decoder's limits
     if (const std::uint64_t need = vae->weight_bytes() + vae->workspace_bytes(lh, lw); r.vram_budget != 0 && need > r.vram_budget) {
       char msg[256];
@@ -178,6 +179,7 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     report("text encoder load", 0, 1);
     TextEncoderOptions te_options;
     te_options.exact_dequant = std::getenv("MI_HIP_TE_EXACT_DEQUANT") != nullptr;
+    te_options.tiled_gemm = std::getenv("MI_HIP_TE_PACKED_GEMM") == nullptr;
     TextEncoder encoder(device, component(r.te_file, "text_encoder"), te_options);
     const double load_s = now_s() - t0;
     out.text_encoder_s = load_s;
@@ -259,7 +261,12 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
   if (r.decode) {
     const double t0 = now_s();
     report("vae", 0, 1);
-    vae->decode(out.latents.data(), lh, lw, out.rgb);
+    const auto vst = vae->decode(out.latents.data(), lh, lw, out.rgb);
+    if (!vst.profile.empty()) {
+      std::fprintf(stderr, "[vae-op]");
+      for (const auto& [name, ms] : vst.profile) std::fprintf(stderr, " %s=%.0fms", name.c_str(), ms);
+      std::fprintf(stderr, "\n");
+    }
     out.vae_s = now_s() - t0;
     report("vae", 1, 1);
   }

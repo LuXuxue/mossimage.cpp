@@ -15,6 +15,7 @@
 
 #include "text_encoder.h"
 
+#include "bf16_gemm.h"
 #include "dequant_fast.h"
 #include "half.h"
 #include "hip_block.h"
@@ -237,7 +238,7 @@ struct TextEncoder::Impl {
     staging[0] = HostBuffer(layer_bytes);
     staging[1] = HostBuffer(layer_bytes);
     raw[0] = DeviceBuffer(layer_bytes);
-    if (options.packed) {
+    if (options.packed && !options.tiled_gemm) {
       packed = DeviceBuffer(packed_bytes);
     } else {
       raw[1] = DeviceBuffer(layer_bytes);
@@ -400,7 +401,7 @@ std::vector<std::vector<bf16>> TextEncoder::Impl::encode(const std::vector<std::
   }
   const auto T = static_cast<std::uint32_t>(cu.back());
   const int nseq = static_cast<int>(seqs.size());
-  const bool packed_path = options.packed;
+  const bool packed_path = options.packed && !options.tiled_gemm;
   const int nraw = packed_path ? 1 : 2;
   stats = TextEncoderStats{};
   stats.tokens = T;
@@ -463,7 +464,9 @@ std::vector<std::vector<bf16>> TextEncoder::Impl::encode(const std::vector<std::
   const auto linear = [&](const char* name, bf16* out, std::int64_t ldo, const bf16* in, std::int64_t ldi, const bf16* w,
                           const Gemm& g) {
     op(name, [&] {
-      if (packed_path) {
+      if (options.tiled_gemm) {
+        bf16_gemm_tiled(out, ldo, in, ldi, w + g.raw / 2, g.k, static_cast<int>(T), g.n, g.k, s);
+      } else if (packed_path) {
         te::gemm_packed(out, ldo, xp, w + g.packed / 2, static_cast<int>(T), g.n, g.k, s);
       } else {
         hip_block::gemm(out, ldo, in, ldi, w + g.raw / 2, g.k, static_cast<int>(T), g.n, g.k, s);
@@ -472,7 +475,9 @@ std::vector<std::vector<bf16>> TextEncoder::Impl::encode(const std::vector<std::
   };
   const auto linear_residual = [&](const char* name, const bf16* in, std::int64_t ldi, const bf16* w, const Gemm& g) {
     op(name, [&] {
-      if (packed_path) {
+      if (options.tiled_gemm) {
+        bf16_gemm_tiled(x, kTeHidden, in, ldi, w + g.raw / 2, g.k, static_cast<int>(T), g.n, g.k, s, x);
+      } else if (packed_path) {
         te::gemm_packed_residual(x, kTeHidden, xp, w + g.packed / 2, ones, static_cast<int>(T), g.n, g.k, s);
       } else {
         hip_block::gemm_gated_residual(x, kTeHidden, in, ldi, w + g.raw / 2, g.k, ones, static_cast<int>(T), g.n, g.k, s);

@@ -33,7 +33,7 @@
 namespace hip_block::leaf {
 
 inline constexpr const char* kName =
-    "rocWMMA bf16 (block/TE GEMMs); native gfx11 WMMA int8 (DiT GEMM/attention) + bf16 (LoRA GEMM)";
+    "rocWMMA bf16 (reference block GEMMs); native gfx11 WMMA int8 (DiT GEMM/attention) + bf16 (TE/LoRA GEMMs)";
 
 using FragA = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, rocwmma::bfloat16_t, rocwmma::row_major>;
 using FragB = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, rocwmma::bfloat16_t, rocwmma::col_major>;

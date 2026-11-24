@@ -13,6 +13,7 @@ struct Bf16GemmArgs {
   const hip_block::bf16_bits* a;
   const hip_block::bf16_bits* b;
   hip_block::bf16_bits* c;
+  const hip_block::bf16_bits* residual;  // optional [m, ldc], added before the bf16 store
   std::int64_t lda, ldb, ldc;
   int m, n, k;
 };
@@ -20,6 +21,7 @@ struct Bf16GemmArgs {
 void bf16_gemm_tiled(hip_block::bf16_bits* c, std::int64_t ldc,
                      const hip_block::bf16_bits* a, std::int64_t lda,
                      const hip_block::bf16_bits* b, std::int64_t ldb,
-                     int m, int n, int k, hipStream_t stream);
+                     int m, int n, int k, hipStream_t stream,
+                     const hip_block::bf16_bits* residual = nullptr);
 
 }  // namespace mi::hip

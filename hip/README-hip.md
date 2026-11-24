@@ -61,7 +61,10 @@ outside the repository.
   several threads. This cuts construction from ~165 s to ~6 s and `encode()` is
   ~1.5 s. The fast transform differs from the reference at ~0.1% of bf16 weight
   values; set `MI_HIP_TE_EXACT_DEQUANT=1` for bit-exact (but much slower) weights.
-  The reported "text encoder load" and "text encoder" timings are separate.
+  Projection GEMMs use the LDS-staged tiled kernel on row-major weights, removing the
+  per-layer weight packing and taking encode() to ~1.2 s; `MI_HIP_TE_PACKED_GEMM=1`
+  selects the original packed rocWMMA path. "text encoder load" and "text encoder"
+  are reported separately.
 - The DiT attention output head stride is the head dimension (128), not the
   full residual width; using the latter corrupts adjacent token rows.
 - The LoRA delta must be added before the base GEMM's bf16 rounding, not to the
@@ -76,6 +79,7 @@ outside the repository.
 - `hip_int8_gemm_check`, `hip_bf16_gemm_check`, `hip_int8_attn_probe`,
   `hip_attn_probe` — compare kernels against host references
 - `hip_int8_gemm_bench`, `hip_bf16_gemm_bench`, `hip_rotate_quantize_bench`,
-  `hip_lora_info`, `hip_te_profile`, `hip_dequant_fast_check` — report kernel
-  throughput, LoRA branch shapes and text-encoder timing/accuracy
+  `hip_lora_info`, `hip_te_profile`, `hip_dequant_fast_check`,
+  `hip_bf16_small_bench` — report kernel throughput, LoRA branch shapes and
+  text-encoder timing/accuracy; `MI_HIP_VAE_PROFILE=1` prints VAE per-op times
 - `MI_HIP_OP_TIME=1` prints a per-op DiT timing breakdown

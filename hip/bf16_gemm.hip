@@ -150,7 +150,9 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_tiled(const Bf16
       for (int j = 0; j < TN; ++j) {
         const int col = n0 + wn * (TN * 16) + j * 16 + (lane & 15);
         if (col >= a.n) continue;
-        a.c[static_cast<std::size_t>(row) * a.ldc + col] = hip_block::detail::bf(acc[i][j][e]);
+        const std::size_t at = static_cast<std::size_t>(row) * a.ldc + col;
+        const float add = a.residual != nullptr ? hip_block::detail::f(a.residual[at]) : 0.0f;
+        a.c[at] = hip_block::detail::bf(acc[i][j][e] + add);
       }
     }
   }
@@ -159,9 +161,10 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_tiled(const Bf16
 }  // namespace
 
 void bf16_gemm_tiled(bf16* c, std::int64_t ldc, const bf16* a, std::int64_t lda,
-                     const bf16* b, std::int64_t ldb, int m, int n, int k, hipStream_t stream) {
+                     const bf16* b, std::int64_t ldb, int m, int n, int k, hipStream_t stream,
+                     const bf16* residual) {
   if (m == 0 || n == 0 || k == 0) return;
-  const Bf16GemmArgs args{a, b, c, lda, ldb, ldc, m, n, k};
+  const Bf16GemmArgs args{a, b, c, residual, lda, ldb, ldc, m, n, k};
   const bool deep = k >= 2048;
   constexpr int kChunk = 4096;
   const int gx = (m + 127) / 128;
@@ -187,7 +190,8 @@ void bf16_gemm_tiled(bf16* c, std::int64_t ldc, const bf16* a, std::int64_t lda,
 #include "bf16_gemm.h"
 namespace mi::hip {
 void bf16_gemm_tiled(hip_block::bf16_bits*, std::int64_t, const hip_block::bf16_bits*, std::int64_t,
-                     const hip_block::bf16_bits*, std::int64_t, int, int, int, hipStream_t) {
+                     const hip_block::bf16_bits*, std::int64_t, int, int, int, hipStream_t,
+                     const hip_block::bf16_bits*) {
   throw std::runtime_error("bf16 tiled GEMM needs an AMD gfx11 build");
 }
 }  // namespace mi::hip
