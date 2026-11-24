@@ -60,7 +60,4 @@ class Lora {
   std::vector<LoraBlock> blocks_;
 };
 
-// dst[i] = bf16(f(dst[i]) + f(src[i])); used to add a LoRA delta to a base GEMM's bf16 output.
-void lora_add(bf16* dst, const bf16* src, std::uint64_t count, hipStream_t stream);
-
 }  // namespace mi::hip

@@ -219,6 +219,10 @@ if(NOT MOSSINFER_HIP_TOOLS)
   return()
 endif()
 
+add_executable(hip_attn_probe tools/hip_attn_probe.cpp)
+target_compile_options(hip_attn_probe PRIVATE ${MI_HIP_WARN})
+target_link_libraries(hip_attn_probe PRIVATE mossinfer_hip)
+
 add_executable(hip_check tools/hip_check.cpp)
 target_compile_options(hip_check PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_check PRIVATE mossinfer_hip)

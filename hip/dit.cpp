@@ -347,8 +347,8 @@ void Dit::mark(int what) {
   events_[events_used_++]->record(stream_.get());
 }
 
-void Dit::apply_lora(const LoraBranch& branch, const bf16* x, int k, bf16* out, int n, int m, hipStream_t stream) {
-  if (!branch.active || branch.k != k || branch.n != n || m == 0) return;
+const bf16* Dit::compute_lora_delta(const LoraBranch& branch, const bf16* x, int k, int n, int m, hipStream_t stream) {
+  if (!branch.active || branch.k != k || branch.n != n || m == 0) return nullptr;
   // t = bf16(x · Aᵀ); delta = bf16(t · Bᵀ); out += delta before the site's epilogue. B's columns already carry the
   // adapter's coefficient (folded in on load), so no separate scaling kernel is needed.
   const int r = branch.rank;
@@ -356,7 +356,7 @@ void Dit::apply_lora(const LoraBranch& branch, const bf16* x, int k, bf16* out, 
   bf16* delta = lora_delta_.as<bf16>();
   hip_block::gemm(t, r, x, k, branch.a, k, m, r, k, stream);
   hip_block::gemm(delta, n, t, r, branch.b, r, m, n, r, stream);
-  lora_add(out, delta, static_cast<std::uint64_t>(m) * n, stream);
+  return delta;
 }
 
 DeviceBuffer Dit::encode_text(const std::vector<std::uint16_t>& embeds, std::uint32_t length) {
@@ -564,16 +564,24 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
         ib.ug = i8_ug_.as<bf16>();
         ib.gemm_out = i8_gemm_out_.as<bf16>();
         for (int op = 0; op < hip_block::kBlockOps; ++op) {
-          run_int8_block_op(op, int8_blocks_[static_cast<std::size_t>(l)], b, ib, st);
+          const bf16* lora_delta = nullptr;
+          std::int64_t ldl = 0;
           if (lb != nullptr) {
-            if (op == 1) apply_lora(lb->site[static_cast<int>(LoraSite::kQkv)], b.y, kDim, b.qkv, 3 * kDim, b.tokens, st);
-            else if (op == 4)
-              apply_lora(lb->site[static_cast<int>(LoraSite::kO)], b.attn, kDim, ib.gemm_out, kDim, b.tokens, st);
-            else if (op == 6)
-              apply_lora(lb->site[static_cast<int>(LoraSite::kUpGate)], b.y, kDim, ib.ug, 2 * kFfn, b.tokens, st);
-            else if (op == 7)
-              apply_lora(lb->site[static_cast<int>(LoraSite::kDown)], b.ffn, kFfn, ib.gemm_out, kDim, b.tokens, st);
+            if (op == 1) {
+              lora_delta = compute_lora_delta(lb->site[static_cast<int>(LoraSite::kQkv)], b.y, kDim, 3 * kDim, b.tokens, st);
+              ldl = 3 * kDim;
+            } else if (op == 4) {
+              lora_delta = compute_lora_delta(lb->site[static_cast<int>(LoraSite::kO)], b.attn, kDim, kDim, b.tokens, st);
+              ldl = kDim;
+            } else if (op == 6) {
+              lora_delta = compute_lora_delta(lb->site[static_cast<int>(LoraSite::kUpGate)], b.y, kDim, 2 * kFfn, b.tokens, st);
+              ldl = 2 * kFfn;
+            } else if (op == 7) {
+              lora_delta = compute_lora_delta(lb->site[static_cast<int>(LoraSite::kDown)], b.ffn, kFfn, kDim, b.tokens, st);
+              ldl = kDim;
+            }
           }
+          run_int8_block_op(op, int8_blocks_[static_cast<std::size_t>(l)], b, ib, st, lora_delta, ldl);
           mark(op);
         }
       } else {

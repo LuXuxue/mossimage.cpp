@@ -12,9 +12,9 @@ iGPU through HIP, not Vulkan.
 | Windows / TheRock build (`moss-infer-hip.exe`) | **Done** — `build-win.bat` configures, builds and copies the runtime DLLs (`amdhip64_7`, `rocm_kpack`, `amd_comgr`) into `dist/` |
 | 780M (gfx1103) device detection | **Done** — `--list-devices` shows the device |
 | `--dit`/`--te`/`--vae` single-file weights | **Done** — same model files as the CUDA launcher |
-| `--tier high` (INT8 ConvRot DiT + 8-bit attention) | **Runs end to end** — INT8 GEMM uses the native gfx11 `v_wmma_i32_16x16x16_iu8`; quantization verified bit-exactly against a CPU reference |
-| Runtime LoRA (`--lora`, `--lora-scale`) | **Runs** — low-rank side branch on all four DiT block GEMMs, with q/k/v adapters merged into the fused QKV site |
-| Image fidelity vs CUDA | **Work in progress** — the pipeline produces images, but the gfx11 attention path still differs from the CUDA reference for most query rows; expect lower quality until that is resolved |
+| `--tier high` (INT8 ConvRot DiT) | **Done** — INT8 GEMM uses the native gfx11 `v_wmma_i32_16x16x16_iu8`; quantization and every block op verified against CPU references |
+| Runtime LoRA (`--lora`, `--lora-scale`) | **Done** — low-rank side branch on all four DiT block GEMMs, with q/k/v adapters merged into the fused QKV site and the delta fused into the base GEMM's fp32 accumulator before bf16 rounding, as on CUDA |
+| Image fidelity vs CUDA | **Matches** — for the same prompt/seed/steps, the final latent correlates 0.99 (no LoRA) / 0.88 (with the 4-step LoRA) with the CUDA engine, and the decoded images agree visually |
 
 The local models under `E:\ComfyUI\models` are **INT8 ConvRot** (the `--tier high`
 layout). The reference tier needs **bf16** DiT/TE weights, which are not present
@@ -74,5 +74,9 @@ reported as ignored.
   weight at `i8_norms`.
 - Grid dimensions that scale with the token count are chunked so 4.2 MP images
   do not exceed the device grid limits.
-- `pack_attention` / the bf16 attention kernels share the same online-softmax
-  implementation; that path is the remaining fidelity gap on this GPU.
+- The DiT block's attention output head stride is the head dimension (128), not
+  the full residual width; using the latter silently overwrites adjacent token
+  rows and produces grey noise.
+- The LoRA delta must be added to the base GEMM's fp32 accumulator *before* the
+  bf16 rounding, not to the rounded output; fusing it into `int8_gemm` matches
+  the CUDA side branch's magnitude.

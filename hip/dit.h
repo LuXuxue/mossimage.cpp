@@ -95,8 +95,9 @@ class Dit {
   void stage_time(float timestep);  // the time sinusoid to the device, the time scratch sized
   void time_modulation();            // the time MLP and both modulations, on the stream
   void mark(int what);  // time_ops: an event on the stream, its interval since the last one counted as `what`
-  // Adds a LoRA branch's delta to a site's bf16 output: t = x · Aᵀ (rounded to bf16), delta = t · Bᵀ, out += delta.
-  void apply_lora(const LoraBranch& branch, const bf16* x, int k, bf16* out, int n, int m, hipStream_t stream);
+  // Computes a LoRA branch's delta t = bf16(x · Aᵀ), delta = bf16(t · Bᵀ) into scratch. The caller fuses delta into the
+  // base GEMM's fp32 accumulator before its bf16 rounding (as the CUDA side branch does). Returns the delta pointer.
+  const bf16* compute_lora_delta(const LoraBranch& branch, const bf16* x, int k, int n, int m, hipStream_t stream);
 
   Device& device_;
   DitOptions options_;

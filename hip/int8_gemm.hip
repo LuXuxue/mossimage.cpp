@@ -29,6 +29,8 @@ struct Int8GemmArgs {
   bf16_bits* y;
   std::int64_t ldy;
   int m, n, k;
+  const bf16_bits* lora_delta;  // optional [m, n] bf16 low-rank term, added before the bf16 rounding
+  std::int64_t ldl;
 };
 
 __global__ __launch_bounds__(kWave) void int8_gemm_kernel(const Int8GemmArgs a, int x0 = 0) {
@@ -67,6 +69,7 @@ __global__ __launch_bounds__(kWave) void int8_gemm_kernel(const Int8GemmArgs a, 
       const float ws = a.w_scale[c];
       float v = static_cast<float>(s_acc[row * 16 + (c - n0)]) * xs * ws;
       if (a.bias != nullptr) v += a.bias[c];
+      if (a.lora_delta != nullptr) v += f(a.lora_delta[r * a.ldl + c]);
       a.y[static_cast<std::int64_t>(r) * a.ldy + c] = bf(v);
     }
   }
@@ -79,8 +82,8 @@ namespace mi::hip {
 // Launch the INT8 ConvRot GEMM: y [m, n] = bf16((x @ w^T) * xs * ws + bias). x [m, k] int8, w [n, k] int8.
 inline void int8_gemm(hip_block::bf16_bits* y, std::int64_t ldy, const std::int8_t* x, std::int64_t ldx,
                       const float* x_scale, const std::int8_t* w, const float* w_scale, const float* bias, int m, int n,
-                      int k, hipStream_t stream) {
-  hip_block::Int8GemmArgs a{x, ldx, x_scale, w, w_scale, bias, y, ldy, m, n, k};
+                      int k, hipStream_t stream, const hip_block::bf16_bits* lora_delta = nullptr, std::int64_t ldl = 0) {
+  hip_block::Int8GemmArgs a{x, ldx, x_scale, w, w_scale, bias, y, ldy, m, n, k, lora_delta, ldl};
   const int gx = (m + 15) / 16, gy = (n + 15) / 16;
   // Chunk the grid's x dimension: a 4.2 MP image's token count would otherwise exceed the device's grid limit.
   constexpr int kChunkX = 4096;

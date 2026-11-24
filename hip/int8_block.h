@@ -44,7 +44,7 @@ struct Int8Buffers {
 // One run of `tokens` tokens; b's x, y, qkv, attn, ffn, rope, mod, cu_seqlens, batch, max_seqlen are the shared bf16
 // buffers (hip_block::BlockBuffers). Same op order as hip_block::run_block_op.
 void run_int8_block_op(int op, const Int8BlockWeights& w, const hip_block::BlockBuffers& b, const Int8Buffers& ib,
-                       hipStream_t stream);
+                       hipStream_t stream, const bf16* lora_delta = nullptr, std::int64_t ldl = 0);
 
 // x[m, n] += bf16(out[m, n] * gate[n]) in place (the gated residual after an int8 GEMM).
 void int8_gate_residual(bf16* residual, std::int64_t ldr, const bf16* out, const bf16* gate, std::int64_t m, int n,

@@ -52,7 +52,8 @@ void int8_gate_residual(bf16* residual, std::int64_t ldr, const bf16* out, const
   check_launch("int8_gate_residual");
 }
 
-void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b, const Int8Buffers& ib, hipStream_t stream) {
+void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b, const Int8Buffers& ib, hipStream_t stream,
+                       const bf16* lora_delta, std::int64_t ldl) {
   const std::int64_t tokens = b.tokens;
   const auto mod = [&](int i) { return b.mod + static_cast<std::int64_t>(i) * kDim; };
   switch (op) {
@@ -62,7 +63,7 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b,
     case 1:  // qkv = int8_gemm(rotate_quantize(y))
       rotate_quantize(b.y, kDim, tokens, kDim, ib.i8_y, kDim, ib.scale, stream);
       int8_gemm(b.qkv, kQkv, ib.i8_y, kDim, ib.scale, w.qkv.q, w.qkv.scale, nullptr,
-                static_cast<int>(tokens), static_cast<int>(kQkv), static_cast<int>(kDim), stream);
+                static_cast<int>(tokens), static_cast<int>(kQkv), static_cast<int>(kDim), stream, lora_delta, ldl);
       break;
     case 2:  // qk norm + rope (in place on qkv)
       qk_norm_rope(b.qkv, kQkv, tokens, kHeads, w.q_norm, w.k_norm, b.rope, kHead, stream);
@@ -84,7 +85,7 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b,
         a.hsq = kHeadDim;
         a.hsk = kHeadDim;
         a.hsv = kHeadDim;
-        a.hso = kDim;
+        a.hso = kHeadDim;
         a.cu_q = b.cu_seqlens;
         a.cu_k = b.cu_seqlens;
         a.batch = b.batch;
@@ -98,7 +99,7 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b,
     case 4:  // x += int8_gemm(rotate_quantize(attn)) * gate_msa
       rotate_quantize(b.attn, kDim, tokens, kDim, ib.i8_y, kDim, ib.scale, stream);
       int8_gemm(ib.gemm_out, kDim, ib.i8_y, kDim, ib.scale, w.o.q, w.o.scale, nullptr,
-                static_cast<int>(tokens), static_cast<int>(kDim), static_cast<int>(kDim), stream);
+                static_cast<int>(tokens), static_cast<int>(kDim), static_cast<int>(kDim), stream, lora_delta, ldl);
       int8_gate_residual(b.x, kDim, ib.gemm_out, mod(2), tokens, kDim, stream);
       break;
     case 5:  // norm2 + modulate -> y (bf16)
@@ -107,13 +108,13 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b,
     case 6:  // ffn = situ_glu(int8_gemm(rotate_quantize(y)))
       rotate_quantize(b.y, kDim, tokens, kDim, ib.i8_y, kDim, ib.scale, stream);
       int8_gemm(ib.ug, kFfn * 2, ib.i8_y, kDim, ib.scale, w.up_gate.q, w.up_gate.scale, nullptr,
-                static_cast<int>(tokens), static_cast<int>(kFfn * 2), static_cast<int>(kDim), stream);
+                static_cast<int>(tokens), static_cast<int>(kFfn * 2), static_cast<int>(kDim), stream, lora_delta, ldl);
       situ_glu(ib.ug, kFfn * 2, b.ffn, kFfn, tokens, kFfn, stream);
       break;
     default:  // x += int8_gemm(rotate_quantize(ffn)) * gate_mlp
       rotate_quantize(b.ffn, kFfn, tokens, kFfn, ib.i8_ffn, kFfn, ib.scale, stream);
       int8_gemm(ib.gemm_out, kDim, ib.i8_ffn, kFfn, ib.scale, w.down.q, w.down.scale, nullptr,
-                static_cast<int>(tokens), static_cast<int>(kDim), static_cast<int>(kFfn), stream);
+                static_cast<int>(tokens), static_cast<int>(kDim), static_cast<int>(kFfn), stream, lora_delta, ldl);
       int8_gate_residual(b.x, kDim, ib.gemm_out, mod(5), tokens, kDim, stream);
       break;
   }
