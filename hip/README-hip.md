@@ -83,16 +83,17 @@ other than euler) are accepted but print a clear `no effect on this backend` /
   the activation buffer at large token counts and faults asynchronously (the
   error surfacing much later as `hipMemcpy to the host: unspecified launch
   failure`). The kernel now also checks launch errors at its call site.
-- One INT8 GEMM workgroup computes a 64x32 output tile so four M fragments reuse
-  the same weight fragments. `hip_int8_gemm_check` checks it bit-for-bit (with a
-  fused LoRA delta) against a host replay on several tail shapes.
+- One INT8 GEMM workgroup computes a 128x32 output tile so eight M fragments
+  reuse the same weight fragments. `hip_int8_gemm_check` checks it bit-for-bit
+  (with a fused LoRA delta) against a host replay on several tail shapes.
 - The attention key step is 64 (was 32), halving the number of softmax passes
   and barriers per head. `hip_attn_probe` checks both packed and unpacked paths
   against a CPU reference.
-- At 1536x1024 with the 4-step LoRA, a step takes about 68 s on the 780M; about
-  56 s of that is the four INT8 GEMMs. This is still well above ComfyUI's ~9.4
-  s/it: reaching it needs the larger software-pipelined 128x128 LDS GEMM from
-  the ROCm-optimised ComfyUI kernels, which is not ported here.
+- At 1536x1024 with the 4-step LoRA, a step takes about 54 s on the 780M (down
+  from 150 s before the attention and GEMM tiling changes). This is still well
+  above ComfyUI's ~9.4 s/it: reaching it needs the software-pipelined 128x128
+  multi-wave LDS GEMM from the ROCm-optimised ComfyUI kernels, which is not
+  ported here.
 - The DiT block's attention output head stride is the head dimension (128), not
   the full residual width; using the latter silently overwrites adjacent token
   rows and produces grey noise.

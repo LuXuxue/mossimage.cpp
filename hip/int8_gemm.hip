@@ -39,7 +39,7 @@ struct Int8GemmArgs {
 // One workgroup computes a 64x32 output tile: four A fragments and two B fragments produce eight int32 accumulators.
 // The weight and activation fragments are therefore reused four times / twice respectively instead of being reloaded
 // for every 16x16 output tile.
-constexpr int kTileM = 64;
+constexpr int kTileM = 128;
 constexpr int kTileN = 32;
 constexpr int kMf = kTileM / 16, kNf = kTileN / 16;
 
