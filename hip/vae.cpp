@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -30,6 +31,8 @@ std::uint64_t align_up(std::uint64_t v, std::uint64_t a = kAlign) { return (v + 
 void require(bool condition, const std::string& message) {
   if (!condition) throw std::invalid_argument("hip vae: " + message);
 }
+
+int attn_pieces();  // defined below layout(); selected by MI_HIP_VAE_ATTN_PIECES
 
 // Device pointers as byte offsets into the weight buffer until it exists.
 struct Conv {
@@ -166,7 +169,8 @@ Layout layout(int c, std::uint32_t h, std::uint32_t w) {
   l.l_k = hip_vae::round_up(l.l, 16);
   l.mid_cols = hip_vae::round_up(static_cast<std::int64_t>(mid), hip_vae::kTileN);
   const auto lk = static_cast<std::uint64_t>(l.l_k), ll = static_cast<std::uint64_t>(l.l);
-  const std::uint64_t per_row = lk * (4 + 3 * 2);
+  const int pcs = attn_pieces();
+  const std::uint64_t per_row = lk * (4 + static_cast<std::uint64_t>(pcs) * 2);
   l.slab = static_cast<int>(std::min<std::uint64_t>(static_cast<std::uint64_t>(l.l_rows),
                                                     std::max<std::uint64_t>(32, kSlabBytes / per_row / 32 * 32)));
   const auto slab = static_cast<std::uint64_t>(l.slab);
@@ -178,11 +182,11 @@ Layout layout(int c, std::uint32_t h, std::uint32_t w) {
   };
   l.xn = take(ll * mid * 4);
   l.qkv = take(ll * 3 * mid * 4);
-  l.qp = take(3 * static_cast<std::uint64_t>(l.l_rows) * mid * 2);
-  l.kp = take(3 * static_cast<std::uint64_t>(l.l_cols) * mid * 2);
-  l.vtp = take(3 * static_cast<std::uint64_t>(l.mid_cols) * lk * 2);
+  l.qp = take(static_cast<std::uint64_t>(pcs) * l.l_rows * mid * 2);
+  l.kp = take(static_cast<std::uint64_t>(pcs) * l.l_cols * mid * 2);
+  l.vtp = take(static_cast<std::uint64_t>(pcs) * l.mid_cols * lk * 2);
   l.scores = take(slab * lk * 4);
-  l.pp = take(3 * slab * lk * 2);
+  l.pp = take(static_cast<std::uint64_t>(pcs) * slab * lk * 2);
   const std::uint64_t tail = 2ull * static_cast<std::uint64_t>(c) * full * 4;  // up_blocks[2]'s upsampler output
   l.region = align_up(std::max(tail, at), 2 * kAlign);
   l.latents = align_up(128ull * h * w * 4);
@@ -192,6 +196,17 @@ Layout layout(int c, std::uint32_t h, std::uint32_t w) {
 }
 
 double gib(std::uint64_t b) { return static_cast<double>(b) / (1024.0 * 1024.0 * 1024.0); }
+
+// Attention operands are packed as 2 TF32 bf16 pieces by default (3 instead of 6 GEMM products, ~0.5 s faster at
+// 1536x1024; the decoded image differs from the fp32-accurate path by at most 1 byte on <0.5% of pixels).
+// MI_HIP_VAE_ATTN_PIECES=3 restores the fp32-accurate 3-piece path.
+int attn_pieces() {
+  if (const char* s = std::getenv("MI_HIP_VAE_ATTN_PIECES")) {
+    const int v = std::atoi(s);
+    if (v == 2 || v == 3) return v;
+  }
+  return 2;
+}
 
 // Records each op between two timing events when profiling.
 class Ops {
@@ -295,12 +310,14 @@ class Run {
     auto* pp = reinterpret_cast<std::uint16_t*>(ws + l.pp);
     norm(w_.attn_norm, x, l.l, xn, false);
     linear("attention qkv", w_.qkv, xn, len, qkv, nullptr);
+    const int pcs = attn_pieces();
+    // A stride is the size of *one* packed piece; the buffer holds `pcs` pieces at that stride.
     const std::int64_t q_stride = l.l_rows * mid, k_stride = l.l_cols * mid, v_stride = l.mid_cols * l.l_k;
     ops_.run("attention split q, k, v", [&] {
-      hip_vae::split_pack(qkv, 3 * mid, false, len, mid, qp, static_cast<int>(l.l_rows), mid, stream_);
-      hip_vae::split_pack(qkv + mid, 3 * mid, false, len, mid, kp, static_cast<int>(l.l_cols), mid, stream_);
+      hip_vae::split_pack(qkv, 3 * mid, false, len, mid, qp, static_cast<int>(l.l_rows), mid, stream_, pcs);
+      hip_vae::split_pack(qkv + mid, 3 * mid, false, len, mid, kp, static_cast<int>(l.l_cols), mid, stream_, pcs);
       hip_vae::split_pack(qkv + 2 * mid, 3 * mid, true, mid, len, vtp, static_cast<int>(l.mid_cols), static_cast<int>(l.l_k),
-                          stream_);
+                          stream_, pcs);
     });
     // SDPA's scale as the engine forms it: 1 / sqrt(E) in fp32.
     const float scale = 1.0f / std::sqrt(static_cast<float>(mid));
@@ -309,12 +326,12 @@ class Run {
     for (int r0 = 0; r0 < len; r0 += l.slab) {
       const int rows = std::min(l.slab, len - r0);
       ops_.run("attention scores", [&] {
-        hip_vae::piece_gemm(qp + static_cast<std::int64_t>(r0) * mid, q_stride, kp, k_stride, mid, scores, l.l_k, rows, len, stream_);
+        hip_vae::piece_gemm(qp + static_cast<std::int64_t>(r0) * mid, q_stride, kp, k_stride, mid, scores, l.l_k, rows, len, stream_, pcs);
       });
-      ops_.run("attention softmax", [&] { hip_vae::softmax_pack(scores, l.l_k, rows, len, scale, pp, p_stride, static_cast<int>(l.l_k), stream_); });
+      ops_.run("attention softmax", [&] { hip_vae::softmax_pack(scores, l.l_k, rows, len, scale, pp, p_stride, static_cast<int>(l.l_k), stream_, pcs); });
       ops_.run("attention P V", [&] {
         hip_vae::piece_gemm(pp, p_stride, vtp, v_stride, static_cast<int>(l.l_k), o + static_cast<std::int64_t>(r0) * mid, mid, rows,
-                            mid, stream_);
+                            mid, stream_, pcs);
       });
     }
     // The reference order: round(to_out(o) + bias), then + residual.

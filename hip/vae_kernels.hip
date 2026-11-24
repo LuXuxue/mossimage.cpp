@@ -285,29 +285,29 @@ struct SplitArgs {
   int rows, cols, rows_pad, col_groups;
 };
 // One thread per (row, 16 columns) of the packed output; along rows first when transposed (coalesced reads).
-template <bool kTranspose>
+template <bool kTranspose, int kPieces = 3>
 __global__ __launch_bounds__(kWave) void split_pack_kernel(const SplitArgs a) {
   const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * kWave + thread_id();
   if (idx >= static_cast<std::int64_t>(a.rows_pad) * a.col_groups) return;
   const int r = static_cast<int>(kTranspose ? idx % a.rows_pad : idx / a.col_groups);
   const int g = static_cast<int>(kTranspose ? idx / a.rows_pad : idx % a.col_groups);
-  std::uint32_t word[3][8];
+  std::uint32_t word[kPieces][8];
   HIP_BLOCK_UNROLL
   for (int c = 0; c < 8; ++c) {
-    std::uint16_t p[2][3];
+    std::uint16_t p[2][kPieces];
     HIP_BLOCK_UNROLL
     for (int e = 0; e < 2; ++e) {
       const int col = g * kFrag + 2 * c + e;
       float v = 0.0f;
       if (r < a.rows && col < a.cols) v = kTranspose ? a.src[static_cast<std::int64_t>(col) * a.ld + r] : a.src[r * a.ld + col];
-      split<3, false>(v, p[e]);
+      split<kPieces, false>(v, p[e]);
     }
     HIP_BLOCK_UNROLL
-    for (int i = 0; i < 3; ++i) word[i][c] = static_cast<std::uint32_t>(p[0][i]) | static_cast<std::uint32_t>(p[1][i]) << 16;
+    for (int i = 0; i < kPieces; ++i) word[i][c] = static_cast<std::uint32_t>(p[0][i]) | static_cast<std::uint32_t>(p[1][i]) << 16;
   }
   const std::int64_t at = (static_cast<std::int64_t>(r / kFrag) * a.col_groups + g) * (kFrag * kFrag) + r % kFrag * kFrag;
   HIP_BLOCK_UNROLL
-  for (int i = 0; i < 3; ++i) {
+  for (int i = 0; i < kPieces; ++i) {
     uint4* d = reinterpret_cast<uint4*>(a.dst + i * a.stride + at);
     d[0] = make_uint4(word[i][0], word[i][1], word[i][2], word[i][3]);
     d[1] = make_uint4(word[i][4], word[i][5], word[i][6], word[i][7]);
@@ -323,7 +323,9 @@ struct PieceGemmArgs {
   std::int64_t ldo;
   int ksteps, m, n, n_tiles;
 };
-// Products i + j <= 2 of 3 pieces each, all operands packed fragments in global memory.
+// Products i + j <= kMaxSum of kPieces pieces each, all operands packed fragments in global memory. The fp32-accurate
+// attention uses 3 pieces / kMaxSum 2 (6 products); the TF32 option uses 2 / 1 (3 products, dropping lo x lo).
+template <int kPieces = 3, int kMaxSum = 2>
 __global__ __launch_bounds__(kWave) void piece_gemm_kernel(const PieceGemmArgs g) {
   alignas(16) __shared__ float epi[kFrag * kFrag];
   const std::int64_t tile = blockIdx.x;
@@ -334,26 +336,26 @@ __global__ __launch_bounds__(kWave) void piece_gemm_kernel(const PieceGemmArgs g
   FragAcc acc[kMf][kNf];
   clear_tile(acc);
   for (int step = 0; step < g.ksteps; ++step) {
-    FragA fa[3][kMf];
+    FragA fa[kPieces][kMf];
     HIP_BLOCK_UNROLL
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < kPieces; ++i) {
       HIP_BLOCK_UNROLL
       for (int mf = 0; mf < kMf; ++mf) {
         leaf::load_a(fa[i][mf], ap + i * g.a_stride + (static_cast<std::int64_t>(mf) * g.ksteps + step) * (kFrag * kFrag), kFrag);
       }
     }
     HIP_BLOCK_UNROLL
-    for (int jj = 0; jj < 3; ++jj) {
-      const int j = 2 - jj;
+    for (int jj = 0; jj < kPieces; ++jj) {
+      const int j = kPieces - 1 - jj;
       FragB fb[kNf];
       HIP_BLOCK_UNROLL
       for (int nf = 0; nf < kNf; ++nf) {
         leaf::load_b(fb[nf], bp + j * g.b_stride + (static_cast<std::int64_t>(nf) * g.ksteps + step) * (kFrag * kFrag), kFrag);
       }
       HIP_BLOCK_UNROLL
-      for (int ii = 0; ii < 3; ++ii) {
-        const int i = 2 - ii;
-        if (i + j > 2) continue;
+      for (int ii = 0; ii < kPieces; ++ii) {
+        const int i = kPieces - 1 - ii;
+        if (i + j > kMaxSum) continue;
         HIP_BLOCK_UNROLL
         for (int nf = 0; nf < kNf; ++nf) {
           HIP_BLOCK_UNROLL
@@ -390,6 +392,7 @@ struct SoftmaxArgs {
   float scale;
 };
 // One row per wave: the row's max, the sum of exp(s * scale - max * scale), then the probabilities' pieces.
+template <int kPieces = 3>
 __global__ __launch_bounds__(kWave) void softmax_pack_kernel(const SoftmaxArgs a) {
   __shared__ float red[kWave];
   const int t = thread_id();
@@ -404,11 +407,11 @@ __global__ __launch_bounds__(kWave) void softmax_pack_kernel(const SoftmaxArgs a
   const std::int64_t row_at = static_cast<std::int64_t>(r / kFrag) * (a.l_pad / kFrag) * (kFrag * kFrag) + r % kFrag * kFrag;
   for (int j = t; j < a.l_pad; j += kWave) {
     const float pv = j < a.l ? div(expf(add(mul(s[j], a.scale), -shift)), total) : 0.0f;
-    std::uint16_t piece[3];
-    split<3, false>(pv, piece);
+    std::uint16_t piece[kPieces];
+    split<kPieces, false>(pv, piece);
     const std::int64_t at = row_at + static_cast<std::int64_t>(j / kFrag) * (kFrag * kFrag) + j % kFrag;
     HIP_BLOCK_UNROLL
-    for (int i = 0; i < 3; ++i) a.p[i * a.p_stride + at] = piece[i];
+    for (int i = 0; i < kPieces; ++i) a.p[i * a.p_stride + at] = piece[i];
   }
 }
 
@@ -720,39 +723,48 @@ void conv_narrow(const float* x, const float* w_tf32, const float* bias, float* 
 }
 
 void split_pack(const float* src, std::int64_t ld, bool transpose, int rows, int cols, std::uint16_t* dst, int rows_pad,
-                int cols_pad, hipStream_t stream) {
+                int cols_pad, hipStream_t stream, int pieces) {
   require(rows_pad % kFrag == 0 && cols_pad % kFrag == 0 && rows <= rows_pad && cols <= cols_pad, "split_pack",
           "padded sizes must be multiples of 16 covering the operand");
   require(aligned16(dst), "split_pack", "dst must be 16-byte aligned");
+  require(pieces == 2 || pieces == 3, "split_pack", "pieces must be 2 or 3");
   const SplitArgs a{src, ld, dst, static_cast<std::int64_t>(rows_pad) * cols_pad, rows, cols, rows_pad, cols_pad / kFrag};
   const dim3 grid(grid_of(static_cast<std::int64_t>(rows_pad) * a.col_groups, kWave, "split_pack"));
-  if (transpose) {
-    split_pack_kernel<true><<<grid, dim3(kWave), 0, stream>>>(a);
-  } else {
-    split_pack_kernel<false><<<grid, dim3(kWave), 0, stream>>>(a);
-  }
+#define MI_SPLIT(T)                                                                                \
+  do {                                                                                             \
+    if (pieces == 2) split_pack_kernel<T, 2><<<grid, dim3(kWave), 0, stream>>>(a);                  \
+    else split_pack_kernel<T, 3><<<grid, dim3(kWave), 0, stream>>>(a);                              \
+  } while (0)
+  if (transpose) MI_SPLIT(true);
+  else MI_SPLIT(false);
+#undef MI_SPLIT
   check_launch("split_pack");
 }
 
 void piece_gemm(const std::uint16_t* a, std::int64_t a_stride, const std::uint16_t* b, std::int64_t b_stride, int k_pad,
-                float* out, std::int64_t ldo, int m_rows, int n_cols, hipStream_t stream) {
+                float* out, std::int64_t ldo, int m_rows, int n_cols, hipStream_t stream, int pieces) {
   require(k_pad > 0 && k_pad % kFrag == 0, "piece_gemm", "k_pad must be a positive multiple of 16");
   require(ldo >= n_cols && ldo % 4 == 0, "piece_gemm", "ldo must cover n and be a multiple of 4");
   require(aligned16(a) && aligned16(b) && aligned16(out), "piece_gemm", "pointers must be 16-byte aligned");
+  require(pieces == 2 || pieces == 3, "piece_gemm", "pieces must be 2 or 3");
   if (m_rows <= 0 || n_cols <= 0) return;
   const PieceGemmArgs g{a, a_stride, b, b_stride, out, ldo, k_pad / kFrag, m_rows, n_cols,
                         static_cast<int>(round_up(n_cols, kTileN) / kTileN)};
   const dim3 grid(grid_of(static_cast<std::int64_t>(round_up(m_rows, kTileM) / kTileM) * g.n_tiles, 1, "piece_gemm"));
-  piece_gemm_kernel<<<grid, dim3(kWave), 0, stream>>>(g);
+  if (pieces == 2) piece_gemm_kernel<2, 1><<<grid, dim3(kWave), 0, stream>>>(g);
+  else piece_gemm_kernel<3, 2><<<grid, dim3(kWave), 0, stream>>>(g);
   check_launch("piece_gemm");
 }
 
 void softmax_pack(const float* s, std::int64_t lds, int rows, int l, float scale, std::uint16_t* p, std::int64_t p_stride,
-                  int l_pad, hipStream_t stream) {
+                  int l_pad, hipStream_t stream, int pieces) {
   require(l > 0 && l_pad >= l && l_pad % kFrag == 0 && lds >= l, "softmax_pack", "l_pad must be a multiple of 16 covering l");
+  require(pieces == 2 || pieces == 3, "softmax_pack", "pieces must be 2 or 3");
   if (rows <= 0) return;
   const SoftmaxArgs a{s, lds, p, p_stride, l, l_pad, scale};
-  softmax_pack_kernel<<<dim3(static_cast<unsigned>(rows)), dim3(kWave), 0, stream>>>(a);
+  const dim3 grid(static_cast<unsigned>(rows));
+  if (pieces == 2) softmax_pack_kernel<2><<<grid, dim3(kWave), 0, stream>>>(a);
+  else softmax_pack_kernel<3><<<grid, dim3(kWave), 0, stream>>>(a);
   check_launch("softmax_pack");
 }
 

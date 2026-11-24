@@ -65,6 +65,11 @@ outside the repository.
   per-layer weight packing and taking encode() to ~1.2 s; `MI_HIP_TE_PACKED_GEMM=1`
   selects the original packed rocWMMA path. "text encoder load" and "text encoder"
   are reported separately.
+- The VAE decoder's mid attention packs Q/K/V/P into 2 TF32 bf16 pieces by
+  default (3 GEMM products instead of 6), saving ~0.5 s at 1536x1024 with a
+  decoded-image difference of at most 1 byte on <0.5% of pixels. Set
+  `MI_HIP_VAE_ATTN_PIECES=3` for the fp32-accurate 3-piece path;
+  `MI_HIP_VAE_PROFILE=1` prints per-op VAE times.
 - The DiT attention output head stride is the head dimension (128), not the
   full residual width; using the latter corrupts adjacent token rows.
 - The LoRA delta must be added before the base GEMM's bf16 rounding, not to the

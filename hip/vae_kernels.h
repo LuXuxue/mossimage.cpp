@@ -115,21 +115,22 @@ void conv_narrow(const float* x, const float* w_tf32, const float* bias, float* 
 
 // src [rows, cols] fp32 (element (r, c) = src[r * ld + c], or src[c * ld + r] when `transpose`) -> 3 packed pieces of
 // [rows_pad, cols_pad] (multiples of 16) in dst, zeros past rows and cols.
+// `pieces` selects 3 (the fp32-accurate default) or 2 (TF32 precision, ~2x fewer products) packed bf16 pieces.
 void split_pack(const float* src, std::int64_t ld, bool transpose, int rows, int cols, std::uint16_t* dst, int rows_pad,
-                int cols_pad, hipStream_t stream);
+                int cols_pad, hipStream_t stream, int pieces = 3);
 
-// out[m, n] = sum_k A[m, k] B[n, k] over 3-piece packed operands with the products i + j <= 2 (fp32-accurate: every
-// dropped product is at most 2^-24 |a b|), fp32, for m < m_rows and n < n_cols. a: [a_rows_pad, k_pad] packed, piece
-// stride a_stride elements, a_rows_pad >= round_up(m_rows, kTileM); b likewise with b_rows_pad >= round_up(n_cols,
-// kTileN). ldo a multiple of 4.
+// out[m, n] = sum_k A[m, k] B[n, k] over packed operands, fp32, for m < m_rows and n < n_cols. With 3 pieces the products
+// i + j <= 2 are kept (fp32-accurate: every dropped product is at most 2^-24 |a b|); with 2, i + j <= 1 (TF32, dropping
+// lo x lo). a: [a_rows_pad, k_pad] packed, piece stride a_stride elements, a_rows_pad >= round_up(m_rows, kTileM); b
+// likewise with b_rows_pad >= round_up(n_cols, kTileN). ldo a multiple of 4.
 void piece_gemm(const std::uint16_t* a, std::int64_t a_stride, const std::uint16_t* b, std::int64_t b_stride, int k_pad,
-                float* out, std::int64_t ldo, int m_rows, int n_cols, hipStream_t stream);
+                float* out, std::int64_t ldo, int m_rows, int n_cols, hipStream_t stream, int pieces = 3);
 
 // Row softmax of attention scores into packed P pieces: p(r, j) = exp(s[r, j] * scale - max_j(s[r, :]) * scale) /
-// sum_j(...) for j < l, as 3 packed pieces of [rows_pad, l_pad] at piece stride p_stride (rows r < rows written; columns
-// past l written as 0). s: [rows, lds] fp32.
+// sum_j(...) for j < l, as `pieces` packed pieces of [rows_pad, l_pad] at piece stride p_stride (rows r < rows written;
+// columns past l written as 0). s: [rows, lds] fp32.
 void softmax_pack(const float* s, std::int64_t lds, int rows, int l, float scale, std::uint16_t* p, std::int64_t p_stride,
-                  int l_pad, hipStream_t stream);
+                  int l_pad, hipStream_t stream, int pieces = 3);
 
 // ---- GroupNorm ------------------------------------------------------------------------------------------------------
 
