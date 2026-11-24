@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -112,6 +114,7 @@ int Dit::resident_blocks_for(std::uint64_t device_budget) {
 
 Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const DitOptions& options)
     : device_(device), options_(options) {
+  if (std::getenv("MI_HIP_OP_TIME") != nullptr) options_.time_ops = true;  // perf diagnostics, off by default
   device_.make_current();
   const st::Index index(transformer_dir);
   const auto check_tensor = [&](const std::string& name, const std::vector<std::int64_t>& shape) {
@@ -321,14 +324,21 @@ Dit::~Dit() {
   }
 }
 
-std::uint64_t Dit::activation_bytes(std::uint64_t tokens, std::uint64_t rows, std::uint64_t hw) {
+std::uint64_t Dit::activation_bytes(std::uint64_t tokens, std::uint64_t rows, std::uint64_t hw, bool int8, bool lora) {
   // x, y, attn [T, 3072]; qkv [T, 9216]; ffn [T, 8192]; rope [T, 128]; the packed GEMM input [T rounded up to 96, 8192]
   // and the packed attention input [T + 32 rows, 9216]; the video tokens [hw, 128] and each row's projection; the time
   // and modulation vectors.
   const std::uint64_t pack_rows = (tokens + hip_block::kPackRowsMultiple - 1) / hip_block::kPackRowsMultiple * hip_block::kPackRowsMultiple;
-  return (tokens * (3 * kDim + kQkv + kFfn + kHead) + pack_rows * kFfn + (tokens + 32 * rows) * kQkv +
-          hw * kDiTLatentChannels * (1 + rows) + 10 * kDim + kDiTFreqDim) *
-         kBf16;
+  std::uint64_t bytes = (tokens * (3 * kDim + kQkv + kFfn + kHead) + pack_rows * kFfn +
+                         (tokens + hip_block::kAttentionStepN * rows) * kQkv +
+                         hw * kDiTLatentChannels * (1 + rows) + 10 * kDim + kDiTFreqDim) *
+                        kBf16;
+  // The INT8 path adds quantized activations and a bf16 GEMM output; the LoRA side branch adds its low-rank t and the
+  // full-size delta fused into the base GEMM. Include them in the planner's accounting so a large image cannot be
+  // planned as if those buffers were free (they were previously omitted, ~0.5 GiB at 1536x1024).
+  if (int8) bytes += tokens * (3 * kDim + 5 * kFfn + 1) + tokens * sizeof(float);
+  if (lora) bytes += tokens * (2 * kFfn) * kBf16;
+  return bytes;
 }
 
 DeviceBuffer& Dit::scratch(DeviceBuffer& b, std::size_t bytes) {
@@ -461,7 +471,7 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
   const std::uint64_t pack_rows =
       (total + hip_block::kPackRowsMultiple - 1) / hip_block::kPackRowsMultiple * hip_block::kPackRowsMultiple;
   scratch(pack_, pack_rows * kFfn * kBf16);
-  scratch(pack_attn_, (total + 32 * rows.size()) * kQkv * kBf16);
+  scratch(pack_attn_, (total + hip_block::kAttentionStepN * rows.size()) * kQkv * kBf16);
   DeviceBuffer& rope = scratch(rope_, total * kHead * kBf16);
   DeviceBuffer& tokens = scratch(tokens_, hw * kDiTLatentChannels * kBf16);
   DeviceBuffer& proj = scratch(proj_, rows.size() * hw * kDiTLatentChannels * kBf16);
@@ -619,6 +629,11 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
       const int what = event_what_[i];
       const double ms = static_cast<double>(events_[i]->elapsed_ms(*events_[i - 1]));
       op_ms_[static_cast<std::size_t>(what < 0 ? hip_block::kBlockOps + 1 : what)] += ms;
+    }
+    if (std::getenv("MI_HIP_OP_TIME") != nullptr) {
+      std::fprintf(stderr, "[op-time]");
+      for (std::size_t i = 0; i < op_ms_.size(); ++i) std::fprintf(stderr, " %zu=%.0fms", i, op_ms_[i]);
+      std::fprintf(stderr, "\n");
     }
   }
   return out;

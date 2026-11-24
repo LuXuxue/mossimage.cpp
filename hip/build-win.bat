@@ -4,7 +4,19 @@ setlocal
 call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 exit /b 1
 
-set "ROCM_SDK=C:\Users\LuXuxue\AppData\Local\Programs\Python\Python314\Lib\site-packages\_rocm_sdk_devel"
+rem Ask the installed TheRock SDK where its devel root is instead of hardcoding a machine-specific path.
+rem ROCM_PATH still works as an override (also for a system ROCm installation).
+set "ROCM_SDK="
+for /f "usebackq delims=" %%R in (`rocm-sdk path --root 2^>nul`) do if not defined ROCM_SDK set "ROCM_SDK=%%R"
+if not defined ROCM_SDK if defined ROCM_PATH set "ROCM_SDK=%ROCM_PATH%"
+if not defined ROCM_SDK (
+  echo [ERROR] Cannot locate the ROCm SDK. Install it with rocm-sdk, or set ROCM_PATH to its root.
+  exit /b 1
+)
+if not exist "%ROCM_SDK%\include\hip\hip_runtime.h" (
+  echo [ERROR] ROCm SDK at "%ROCM_SDK%" has no include\hip\hip_runtime.h
+  exit /b 1
+)
 set "SRC=%~dp0"
 if "%SRC:~-1%"=="\" set "SRC=%SRC:~0,-1%"
 

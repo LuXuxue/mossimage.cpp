@@ -448,7 +448,9 @@ void qk_norm_rope(bf16_bits* qkv, std::int64_t ld, std::int64_t tokens, int head
   const std::int64_t total = tokens * 2 * heads;
   // Grid x is (token, head); chunk it only at the device's grid limit. One launch per item would mean hundreds of
   // thousands of launches per block per step.
-  constexpr std::int64_t kChunk = 65535;
+  // gfx11/PAL refuses a launch with 65535 workgroups in one dimension (the theoretical grid limit) at high token
+  // counts; a smaller chunk keeps every launch well inside what the driver can submit.
+  constexpr std::int64_t kChunk = 8192;
   for (std::int64_t s = 0; s < total; s += kChunk) {
     const std::int64_t xn = total - s < kChunk ? total - s : kChunk;
     qk_norm_rope_kernel<<<dim3(static_cast<unsigned>(xn)), dim3(kWave), 0, stream>>>(a, s);

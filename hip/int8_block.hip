@@ -16,7 +16,7 @@
 #include "device_math.h"
 #include "dit_kernels.h"
 #include "runtime.h"
-#include "int8_gemm.hip"
+#include "int8_gemm.h"
 #include "rotate_quantize.hip"
 
 namespace mi::hip {

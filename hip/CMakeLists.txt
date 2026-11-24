@@ -62,7 +62,7 @@ list(APPEND MI_HIP_WARN -ffp-contract=off)
 set(MI_HIP_KERNELS block_kernels.hip dit_kernels.hip te_kernels.hip vae_kernels.hip int8_gemm.hip rotate_quantize.hip
                     int8_block.hip lora.hip)
 set(MI_HIP_KERNEL_HEADERS device_math.h dit_kernels.h gemm_tile.h hip_block.h mma_leaf.h te_kernels.h vae_kernels.h
-                           int8_leaf.h int8_block.h lora.h)
+                           int8_leaf.h int8_block.h int8_gemm.h lora.h)
 set(MI_HIP_HOST runtime.cpp safetensors.cpp dit.cpp text_encoder.cpp vae.cpp generate.cpp lora.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../src/weights/quant/quant_codec.cpp)
 
@@ -226,6 +226,11 @@ target_link_libraries(hip_attn_probe PRIVATE mossinfer_hip)
 add_executable(hip_check tools/hip_check.cpp)
 target_compile_options(hip_check PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_check PRIVATE mossinfer_hip)
+
+# The INT8 GEMM against a host replay, including partial M/N tiles and a fused LoRA delta.
+add_executable(hip_int8_gemm_check tools/hip_int8_gemm_check.cpp)
+target_compile_options(hip_int8_gemm_check PRIVATE ${MI_HIP_WARN})
+target_link_libraries(hip_int8_gemm_check PRIVATE mossinfer_hip)
 
 # dit_kernels.h's ops against host replays; the replays round every fp32 operation, as the kernels do.
 add_executable(hip_dit_kernel_check tools/hip_dit_kernel_check.cpp)

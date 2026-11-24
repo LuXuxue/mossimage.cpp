@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
   bb.max_seqlen = T;
   bb.tokens = T;
   if (packed) {
-    dpack = DeviceBuffer(static_cast<std::size_t>((T + 32) * K * 2));
+    dpack = DeviceBuffer(static_cast<std::size_t>((T + hip_block::kAttentionStepN) * K * 2));
     bb.pack_attn = dpack.as<bf16>();
     hip_block::pack_attention(bb, 0);
   }

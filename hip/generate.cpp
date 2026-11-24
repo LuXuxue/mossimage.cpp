@@ -117,7 +117,7 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
       text_rows += length;
       longest = std::max(longest, length);
     }
-    const std::uint64_t activations = Dit::activation_bytes(tokens, lengths.size(), hw) +
+    const std::uint64_t activations = Dit::activation_bytes(tokens, lengths.size(), hw, true, !r.lora_file.empty()) +
                                       longest * (kDiTTextDim + 2 * std::uint64_t{kDiTFfnDim}) * kBf16 +
                                       text_rows * kDiTDim * kBf16;
     const std::uint64_t need = activations + kReserve;

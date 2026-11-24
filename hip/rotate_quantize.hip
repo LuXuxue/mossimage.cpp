@@ -289,7 +289,7 @@ void rotate_quantize(const bf16* x, std::int64_t ldx, std::int64_t rows, std::in
   const size_t smem = static_cast<size_t>(bs.warps) * 2 * kHalfFloats * sizeof(float);
   const RotateArgs args{x, ldx, k, q, ldq, scale};
   // Grid y is the token index; chunk it so a 4.2 MP image does not exceed the device's grid limit.
-  constexpr std::int64_t kChunkRows = 65535;
+  constexpr std::int64_t kChunkRows = 8192;
   for (std::int64_t row0 = 0; row0 < rows; row0 += kChunkRows) {
     const int chunk = static_cast<int>(std::min<std::int64_t>(kChunkRows, rows - row0));
     const dim3 grid(1, static_cast<unsigned>(chunk), 1);
@@ -313,7 +313,7 @@ void rms_norm_modulate_rotate_quantize(const bf16* x, std::int64_t ldx, const bf
   const int threads = 32 * bs.warps;
   const size_t smem = static_cast<size_t>(bs.warps) * 2 * kHalfFloats * sizeof(float);
   const FusedArgs fa{x, ldx, weight, scale, shift, k, q, ldq, scale_out};
-  constexpr std::int64_t kChunkRows = 65535;
+  constexpr std::int64_t kChunkRows = 8192;
   for (std::int64_t row0 = 0; row0 < rows; row0 += kChunkRows) {
     const int chunk = static_cast<int>(std::min<std::int64_t>(kChunkRows, rows - row0));
     const dim3 grid(1, static_cast<unsigned>(chunk), 1);

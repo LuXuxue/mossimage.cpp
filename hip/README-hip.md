@@ -15,6 +15,9 @@ iGPU through HIP, not Vulkan.
 | `--tier high` (INT8 ConvRot DiT) | **Done** — INT8 GEMM uses the native gfx11 `v_wmma_i32_16x16x16_iu8`; quantization and every block op verified against CPU references |
 | Runtime LoRA (`--lora`, `--lora-scale`) | **Done** — low-rank side branch on all four DiT block GEMMs, with q/k/v adapters merged into the fused QKV site and the delta fused into the base GEMM's fp32 accumulator before bf16 rounding, as on CUDA |
 | Image fidelity vs CUDA | **Matches** — for the same prompt/seed/steps, the final latent correlates 0.99 (no LoRA) / 0.88 (with the 4-step LoRA) with the CUDA engine, and the decoded images agree visually |
+| CLI parity with `moss-infer generate` | **Done** — every CUDA generate flag is accepted; `--params`, `--json-report`, schedulers, flow multiplier, noise layout, sampler selection and the `generate` subcommand prefix work; backend-specific flags print a clear notice |
+| Chinese / UTF-8 prompts | **Done** — the Windows entry point converts UTF-16 argv to UTF-8 (`wmain`), as the CUDA and Vulkan CLIs do |
+| High resolution (1536x1024) | **Done** — the INT8 GEMM pads its partial M tile and checks launches, so a 6157-token joint sequence no longer faults |
 
 The local models under `E:\ComfyUI\models` are **INT8 ConvRot** (the `--tier high`
 layout). The reference tier needs **bf16** DiT/TE weights, which are not present
@@ -26,9 +29,11 @@ on this machine.
 hip\build-win.bat
 ```
 
-This loads the MSVC environment, configures CMake (Ninja) against the TheRock
-SDK, and builds `moss-infer-hip`. All compile-time intermediates stay in the
-git-ignored `hip\build-win\`; the final artifacts (exe + the SDK's `amdhip64*.dll`,
+This loads the MSVC environment, locates the SDK with
+`rocm-sdk path --root` (or the `ROCM_PATH`/`ROCM_HOME` override), configures CMake
+(Ninja) and builds `moss-infer-hip`. No machine-specific SDK path is stored in
+the script. All compile-time intermediates stay in the git-ignored
+`hip\build-win\`; the final artifacts (exe + the SDK's `amdhip64*.dll`,
 `rocm_kpack.dll`, `amd_comgr.dll`) are copied to the git-ignored `hip\dist\`.
 Key CMake inputs:
 
@@ -44,25 +49,24 @@ The TheRock SDK ships the HIP device library at
 
 ## Run
 
-```bat
-hip\moss_infer_hip_gfx1103.bat
-```
-
-The launcher uses the same bundle/weight files as the CUDA launcher. With
-`LORA_FILE` empty it runs the base model with **steps 30 / cfg 4**; setting
-`LORA_FILE` to the 4-step distill LoRA switches to **steps 6 / cfg 1** and adds
-`--lora`.
+Use the same launcher as the CUDA build (e.g.
+`E:\ComfyUI\output\moss_image_sft_int8_convrot-4step-hip.bat`), or call the binary
+directly. Launcher scripts are intentionally kept outside the repository because
+they are edited per experiment.
 
 ```bat
-moss-infer-hip --model <bundle> --dit <file> --te <file> --vae <file> ^
+moss-infer-hip generate --model <bundle> --dit <file> --te <file> --vae <file> ^
   --prompt "..." --tier high --steps 30 --cfg 4 ^
   [--lora <file> --lora-scale 1.0] -o out.png
 ```
 
 `--model` supplies the tokenizer and configs; the three weight files may be
-single `.safetensors` files. CUDA-only knobs (`--mode`, `--attention`,
-`--sampler`, `--scheduler`, `--dit-blocks`, step-cache flags) are accepted but
-reported as ignored.
+single `.safetensors` files. The CLI accepts the full `moss-infer generate` flag
+set: the `generate` prefix, `--params`/`--json-report`, all sampler/scheduler and
+SLG/CFG-accelerator flags, memory flags and I/O flags. Flags that need CUDA-only
+machinery (planner modes, GGUF cache, image conditioning, LoRA merging, samplers
+other than euler) are accepted but print a clear `no effect on this backend` /
+`not implemented` notice instead of being silently ignored.
 
 ## Implementation notes
 
@@ -73,7 +77,22 @@ reported as ignored.
   `norm1=0`, `norm2=d*2`, `q_norm=2*d*2`, `k_norm=(2*d+128)*2`, before the qkv
   weight at `i8_norms`.
 - Grid dimensions that scale with the token count are chunked so 4.2 MP images
-  do not exceed the device grid limits.
+  do not exceed driver limits.
+- The INT8 GEMM stages a partial M tile through shared memory with zero rows:
+  `load_a` always fetches 16 rows, so without padding the last tile reads past
+  the activation buffer at large token counts and faults asynchronously (the
+  error surfacing much later as `hipMemcpy to the host: unspecified launch
+  failure`). The kernel now also checks launch errors at its call site.
+- One INT8 GEMM workgroup computes a 64x32 output tile so four M fragments reuse
+  the same weight fragments. `hip_int8_gemm_check` checks it bit-for-bit (with a
+  fused LoRA delta) against a host replay on several tail shapes.
+- The attention key step is 64 (was 32), halving the number of softmax passes
+  and barriers per head. `hip_attn_probe` checks both packed and unpacked paths
+  against a CPU reference.
+- At 1536x1024 with the 4-step LoRA, a step takes about 68 s on the 780M; about
+  56 s of that is the four INT8 GEMMs. This is still well above ComfyUI's ~9.4
+  s/it: reaching it needs the larger software-pipelined 128x128 LDS GEMM from
+  the ROCm-optimised ComfyUI kernels, which is not ported here.
 - The DiT block's attention output head stride is the head dimension (128), not
   the full residual width; using the latter silently overwrites adjacent token
   rows and produces grey noise.
