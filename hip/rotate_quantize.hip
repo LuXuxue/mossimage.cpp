@@ -100,6 +100,8 @@ struct RotateArgs {
   std::int8_t* q;
   std::int64_t ldq;
   float* scale;
+  const bf16* gate;  // optional second half for the fused SiTU-GLU read (up_gate row: [hidden, gate])
+  int split;         // gate offset = split
 };
 
 template <int kPairsPerWarp>
@@ -121,8 +123,29 @@ __global__ void rotate_quantize_kernel(RotateArgs a, int row0) {
     const int g = 2 * (warp + i * warps) + half;
     if (g >= groups) continue;
     const bf16* src = base + static_cast<std::int64_t>(g) * kConvRotGroup + 16 * h;
-    HIP_BLOCK_UNROLL
-    for (int j = 0; j < 16; ++j) v[i][j] = f(src[j]);
+    // Two 16-byte loads instead of sixteen 2-byte ones: the scaler is the bottleneck on RDNA2 (comfy-kitchen
+    // measures 76 GB/s with vector loads on this GPU vs scalar loads well below that).
+    const uint4 lo = *reinterpret_cast<const uint4*>(src);
+    const uint4 hi = *reinterpret_cast<const uint4*>(src + 8);
+    const std::uint32_t w[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+    if (a.gate != nullptr) {
+      // Fused SiTU-GLU: read the gate half of the same row, round the product to bf16 exactly as situ_glu does, then
+      // rotate and quantize it. Saves a full [rows, k] bf16 round trip per block.
+      const bf16* gsrc = a.gate + static_cast<std::int64_t>(row) * a.ldx + a.split +
+                         static_cast<std::int64_t>(g) * kConvRotGroup + 16 * h;
+      const uint4 glo = *reinterpret_cast<const uint4*>(gsrc);
+      const uint4 ghi = *reinterpret_cast<const uint4*>(gsrc + 8);
+      const std::uint32_t gw[8] = {glo.x, glo.y, glo.z, glo.w, ghi.x, ghi.y, ghi.z, ghi.w};
+      HIP_BLOCK_UNROLL
+      for (int j = 0; j < 16; ++j) {
+        const float hv = f(static_cast<bf16>(w[j >> 1] >> (16 * (j & 1))));
+        const float gv = f(static_cast<bf16>(gw[j >> 1] >> (16 * (j & 1))));
+        v[i][j] = detail::rbf(detail::situ_value(hv, gv));  // situ_glu rounds the product to bf16 first
+      }
+    } else {
+      HIP_BLOCK_UNROLL
+      for (int j = 0; j < 16; ++j) v[i][j] = f(static_cast<bf16>(w[j >> 1] >> (16 * (j & 1))));
+    }
   }
 
   float amax = 0.0f;
@@ -182,7 +205,7 @@ void rotate_quantize(const bf16* x, std::int64_t ldx, std::int64_t rows, std::in
   const BlockShape bs = BlockShape::of(groups);
   const int threads = 32 * bs.warps;
   const size_t smem = static_cast<size_t>(bs.warps) * 2 * kHalfFloats * sizeof(float);
-  const RotateArgs args{x, ldx, k, q, ldq, scale};
+  const RotateArgs args{x, ldx, k, q, ldq, scale, nullptr, 0};
   // Grid y is the token index; chunk it so a 4.2 MP image does not exceed the device's grid limit.
   constexpr std::int64_t kChunkRows = 8192;
   for (std::int64_t row0 = 0; row0 < rows; row0 += kChunkRows) {
@@ -197,6 +220,30 @@ void rotate_quantize(const bf16* x, std::int64_t ldx, std::int64_t rows, std::in
     }
   }
   check_launch("rotate_quantize");
+}
+
+// Rotate-and-quantize bf16(situ_glu([rows, 2*k])) into int8 [rows, k]. The row stride of the source is 2*k; `k` is the
+// length of each half. Numerically identical to situ_glu followed by rotate_quantize, without the intermediate tensor.
+void rotate_quantize_situ(const bf16* up_gate, std::int64_t ld, std::int64_t rows, std::int64_t k, std::int8_t* q,
+                          std::int64_t ldq, float* scale, hipStream_t stream) {
+  const int groups = static_cast<int>(k) / kConvRotGroup;
+  const BlockShape bs = BlockShape::of(groups);
+  const int threads = 32 * bs.warps;
+  const size_t smem = static_cast<size_t>(bs.warps) * 2 * kHalfFloats * sizeof(float);
+  const RotateArgs args{up_gate, ld, k, q, ldq, scale, up_gate, static_cast<int>(k)};
+  constexpr std::int64_t kChunkRows = 8192;
+  for (std::int64_t row0 = 0; row0 < rows; row0 += kChunkRows) {
+    const int chunk = static_cast<int>(std::min<std::int64_t>(kChunkRows, rows - row0));
+    const dim3 grid(1, static_cast<unsigned>(chunk), 1);
+    switch (bs.pairs) {
+      case 1: rotate_quantize_kernel<1><<<grid, dim3(threads), smem, stream>>>(args, static_cast<int>(row0)); break;
+      case 2: rotate_quantize_kernel<2><<<grid, dim3(threads), smem, stream>>>(args, static_cast<int>(row0)); break;
+      case 3: rotate_quantize_kernel<3><<<grid, dim3(threads), smem, stream>>>(args, static_cast<int>(row0)); break;
+      case 4: rotate_quantize_kernel<4><<<grid, dim3(threads), smem, stream>>>(args, static_cast<int>(row0)); break;
+      default: throw std::runtime_error("rotate_quantize_situ: unsupported pairs");
+    }
+  }
+  check_launch("rotate_quantize_situ");
 }
 
 }  // namespace mi::hip

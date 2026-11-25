@@ -29,6 +29,12 @@ double now_s() {
 
 double gib(std::uint64_t bytes) { return static_cast<double>(bytes) / static_cast<double>(1ull << 30); }
 
+// MI_HIP_MEM_TRACE=1 prints the device memory at the points where the text encoder and the DiT are loaded and freed.
+void trace_mem(const char* where, const Device& device) {
+  static const bool enabled = std::getenv("MI_HIP_MEM_TRACE") != nullptr;
+  if (enabled) std::fprintf(stderr, "[mem] %s: %.3f GiB free\n", where, gib(device.free_memory()));
+}
+
 // What the host can give to a pinned allocation: MemAvailable of /proc/meminfo on Linux (the page cache it would drop
 // included), the physical memory the processes can use on Windows.
 std::uint64_t host_available_bytes() {
@@ -114,7 +120,7 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
       text_rows += length;
       longest = std::max(longest, length);
     }
-    const std::uint64_t activations = Dit::activation_bytes(tokens, lengths.size(), hw, true, !r.lora_file.empty()) +
+    const std::uint64_t activations = Dit::activation_bytes(tokens, lengths.size(), hw, r.int8_dit, !r.lora_file.empty()) +
                                       longest * (kDiTTextDim + 2 * std::uint64_t{kDiTFfnDim}) * kBf16 +
                                       text_rows * kDiTDim * kBf16;
     const std::uint64_t need = activations + kReserve;
@@ -167,7 +173,9 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     plan(lengths, device.free_memory());
   }
 
-  // Text encoder: streamed layer by layer, freed before the DiT loads.
+  // Text encoder: streamed layer by layer, freed before the DiT loads. The reset is explicit rather than relying on
+  // the scope's destructor so the release happens right here, before the DiT's budget is measured; the synchronize
+  // makes hipMemGetInfo see the reclaimed memory on drivers that defer the free until the queue drains.
   std::vector<std::vector<std::uint16_t>> embeds;
   {
     double t0 = now_s();
@@ -179,7 +187,9 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     te_options.tiled_gemm = pg == nullptr || std::strcmp(pg, "0") == 0;
     const char* dd = std::getenv("MI_HIP_TE_DEVICE_DEQUANT");
     te_options.device_dequant = dd == nullptr || std::strcmp(dd, "0") != 0;
-    TextEncoder encoder(device, component(r.te_file, "text_encoder"), te_options);
+    trace_mem("before text encoder", device);
+    std::optional<TextEncoder> encoder;
+    encoder.emplace(device, component(r.te_file, "text_encoder"), te_options);
     const double load_s = now_s() - t0;
     out.text_encoder_s = load_s;
     report("text encoder load", 1, 1);
@@ -187,10 +197,13 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     report("text encoder", 0, 1);
     std::vector<std::vector<std::int32_t>> sequences{r.cond_ids};
     if (cfg) sequences.push_back(r.uncond_ids);
-    embeds = encoder.encode(sequences);
+    embeds = encoder->encode(sequences);
     out.text_encoder_s = now_s() - t0;
     report("text encoder", 1, 1);
     out.text_encoder_load_s = load_s;
+    encoder.reset();
+    device.synchronize();
+    trace_mem("after text encoder", device);
   }
 
   // DiT: resident, the text refiner once per prompt, then the steps.
@@ -210,6 +223,7 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     out.dit_resident_blocks = dit.resident_blocks();
     // What is left must hold the activations; the reserve absorbs the runtime's own allocations and the rounding.
     out.dit_free_bytes = device.free_memory();
+    trace_mem("after DiT load", device);
     if (out.dit_free_bytes < p.activations + kActivationMargin) {
       char msg[512];
       std::snprintf(msg, sizeof msg,
@@ -254,6 +268,8 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     out.denoise_s = now_s() - t0;
     out.latents = std::move(latents);
   }
+  device.synchronize();
+  trace_mem("after DiT", device);
 
   // VAE decode, after handing the final latents to the caller (a failed decode keeps them).
   if (r.on_latents) r.on_latents(out.latents);
@@ -261,18 +277,43 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     const double t0 = now_s();
     report("vae", 0, 1);
     VaeDecodeStats vst;
-    const bool force_tiled = std::getenv("MI_HIP_VAE_TILED") != nullptr;
+    const bool force_approx = std::getenv("MI_HIP_VAE_TILED") != nullptr;  // legacy ComfyUI-style switch
+    const bool force_exact = std::getenv("MI_HIP_VAE_EXACT") != nullptr;
+    bool decoded = false;
     try {
-      if (force_tiled) throw std::runtime_error("tiled decode requested");
+      if (force_approx || force_exact) throw std::runtime_error("tiled decode requested");
       vst = vae->decode(out.latents.data(), lh, lw, out.rgb);
+      decoded = true;
     } catch (const std::runtime_error& e) {
       std::fprintf(stderr, "moss-infer-hip: full VAE decode (%s); decoding in tiles\n", e.what());
-      int tile_px = 512, overlap_px = 128;
-      if (const char* tp = std::getenv("MI_HIP_VAE_TILE_PX")) tile_px = std::atoi(tp);
-      if (const char* opx = std::getenv("MI_HIP_VAE_OVERLAP_PX")) overlap_px = std::atoi(opx);
-      vst = vae->decode_tiled(out.latents.data(), lh, lw, out.rgb, nullptr,
-                              static_cast<std::uint32_t>(std::max(tile_px, 32)),
-                              static_cast<std::uint32_t>(std::max(overlap_px, 0)));
+      // Prefer the byte-identical band-tiled decode. It recomputes overlapped rows, so it is slower than the full
+      // decode but produces exactly the same pixels; the ComfyUI-style overlap-and-blend path is a last resort.
+      if (!force_approx) {
+        constexpr std::uint64_t kDecodeReserve = 64ull << 20;
+        const std::uint64_t free = device.free_memory();
+        const std::uint64_t budget = free > kDecodeReserve ? free - kDecodeReserve : 0;
+        int tile = 0;
+        if (const char* tp = std::getenv("MI_HIP_VAE_BAND_TILE_PX")) tile = std::atoi(tp);
+        std::optional<VaeTilePlan> plan = VaeDecoder::plan_tiled(vae->base_channels(), lh, lw, budget, tile);
+        if (!plan) {
+          const VaeTilePlan p = tile > 0 ? VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, tile)
+                                         : VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, 8);
+          if (p.workspace_bytes <= budget) plan = p;
+        }
+        if (plan) {
+          std::fprintf(stderr, "moss-infer-hip: exact band-tiled VAE: %s\n", plan->describe().c_str());
+          vst = vae->decode_tiled_exact(out.latents.data(), lh, lw, out.rgb, *plan);
+          decoded = true;
+        }
+      }
+      if (!decoded) {
+        int tile_px = 512, overlap_px = 128;
+        if (const char* tp = std::getenv("MI_HIP_VAE_TILE_PX")) tile_px = std::atoi(tp);
+        if (const char* opx = std::getenv("MI_HIP_VAE_OVERLAP_PX")) overlap_px = std::atoi(opx);
+        vst = vae->decode_tiled(out.latents.data(), lh, lw, out.rgb, nullptr,
+                                static_cast<std::uint32_t>(std::max(tile_px, 32)),
+                                static_cast<std::uint32_t>(std::max(overlap_px, 0)));
+      }
     }
     if (!vst.profile.empty()) {
       std::fprintf(stderr, "[vae-op]");

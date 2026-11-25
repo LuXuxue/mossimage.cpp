@@ -550,6 +550,7 @@ int run(const Args& a) {
   g.cfg = static_cast<float>(a.cfg);
   for (const int l : a.skip) g.uncond_skip.set(static_cast<std::size_t>(l));
   g.vram_budget = a.vram_budget;
+  g.int8_dit = (a.tier == "high");
   g.decode = !a.out_png.empty();
   if (!a.out_latent.empty()) {
     g.on_latents = [&](const std::vector<float>& latents) {

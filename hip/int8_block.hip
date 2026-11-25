@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "device_math.h"
@@ -39,7 +40,7 @@ constexpr std::int64_t kHead = 128;
 }  // namespace
 
 void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b, const Int8Buffers& ib, hipStream_t stream,
-                       const bf16* lora_delta, std::int64_t ldl) {
+                       const bf16* lora_delta, std::int64_t ldl, bool fuse_situ) {
   const std::int64_t tokens = b.tokens;
   const auto mod = [&](int i) { return b.mod + static_cast<std::int64_t>(i) * kDim; };
   switch (op) {
@@ -58,7 +59,10 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b,
       if (device_is_rdna2()) {
         // The comfy-kitchen gfx103x int8 attention: Q/K come from the same quantized buffers as the gfx11 path,
         // V is copied to fp16, and cu_seqlens is read on device so each sequence keeps its own padded columns.
-        int8_attn_quantize(b.qkv, kQkv, ib.attn, static_cast<int>(tokens), stream);
+        // The gfx103x kernel reads Q/K in int8 and V in fp16, so the int8 V quantizer's three kernels are dead work.
+        // MI_I8ATTN_QUANT_V=1 restores them for A/B measurements.
+        const bool quant_v = std::getenv("MI_I8ATTN_QUANT_V") == nullptr;
+        int8_attn_quantize(b.qkv, kQkv, ib.attn, static_cast<int>(tokens), stream, quant_v);
         gfx103x_v_to_fp16(b.qkv, kQkv, b.cu_seqlens, ib.attn.v_fp16, static_cast<int>(tokens), b.batch, stream);
         gfx103x_attn({ib.attn.q, ib.attn.k, ib.attn.v_fp16, b.attn, ib.attn.q_scale, ib.attn.k_scale,
                       kHeads * kHead, kHeads, kHeads, kDim, b.cu_seqlens, b.batch, b.max_seqlen, kHeads,
@@ -83,10 +87,13 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b,
       rotate_quantize(b.y, kDim, tokens, kDim, ib.i8_y, kDim, ib.scale, stream);
       int8_gemm(ib.ug, kFfn * 2, ib.i8_y, kDim, ib.scale, w.up_gate.q, w.up_gate.scale, nullptr,
                 static_cast<int>(tokens), static_cast<int>(kFfn * 2), static_cast<int>(kDim), stream, lora_delta, ldl);
-      situ_glu(ib.ug, kFfn * 2, b.ffn, kFfn, tokens, kFfn, stream);
+      if (!fuse_situ) situ_glu(ib.ug, kFfn * 2, b.ffn, kFfn, tokens, kFfn, stream);
       break;
     default:  // x += int8_gemm(rotate_quantize(ffn)) * gate_mlp
-      rotate_quantize(b.ffn, kFfn, tokens, kFfn, ib.i8_ffn, kFfn, ib.scale, stream);
+      if (fuse_situ)
+        rotate_quantize_situ(ib.ug, kFfn * 2, tokens, kFfn, ib.i8_ffn, kFfn, ib.scale, stream);
+      else
+        rotate_quantize(b.ffn, kFfn, tokens, kFfn, ib.i8_ffn, kFfn, ib.scale, stream);
       int8_gemm(b.x, kDim, ib.i8_ffn, kFfn, ib.scale, w.down.q, w.down.scale, nullptr,
                 static_cast<int>(tokens), static_cast<int>(kDim), static_cast<int>(kFfn), stream, lora_delta, ldl,
                 mod(5), b.x, kDim);  // gate+residual fused: no gemm_out round trip

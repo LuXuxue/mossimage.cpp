@@ -67,7 +67,7 @@ constexpr int seq_base(int cu_b, int b) { return ((cu_b + 63) / 64) * 64 + 64 * 
 // Quantize q/k/v out of the [tokens, 3 * kDim] qkv tensor into the buffers above.
 // b.cu, b.base, b.len, b.pos and b.padded must already be set.
 void int8_attn_quantize(const i8attn_bf16* qkv, std::int64_t ld, const Int8AttnBuffers& b, int tokens,
-                        hipStream_t stream);
+                        hipStream_t stream, bool quant_v = true);
 
 // Run attention, writing bf16 [tokens, ldo] with head columns 128 apart.
 void int8_attn_run(const Int8AttnBuffers& b, i8attn_bf16* out, std::int64_t ldo, int max_seqlen,

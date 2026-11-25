@@ -471,7 +471,7 @@ void fail(const char* what, hipError_t e) {
 }  // namespace
 
 void int8_attn_quantize(const bf16* qkv, std::int64_t ld, const Int8AttnBuffers& b, int tokens,
-                        hipStream_t stream) {
+                        hipStream_t stream, bool quant_v) {
   const dim3 qgrid(static_cast<unsigned>((tokens + kWaves - 1) / kWaves),
                    static_cast<unsigned>(kHeads), 1);
   quant_q_kernel<<<qgrid, kThreads, 0, stream>>>(qkv, ld, b.cu, b.q, b.q_scale, tokens, kHeads, b.batch);
@@ -481,13 +481,15 @@ void int8_attn_quantize(const bf16* qkv, std::int64_t ld, const Int8AttnBuffers&
                    static_cast<unsigned>(kHeads), static_cast<unsigned>(b.batch));
   quant_k_kernel<<<kgrid, kThreads, 0, stream>>>(qkv, ld, b.cu, b.k, b.k_scale, kHeads);
 
-  const int chunks = (tokens + 255) / 256;
-  const dim3 vgrid(static_cast<unsigned>(chunks), static_cast<unsigned>(kHeads * kHeadDim / 256), 1);
-  // No memset of the V padding: keys past the sequence end get zero probability in the attention
-  // kernel, so their uninitialized V bytes never contribute to PV.
-  v_amax_partial<<<vgrid, 256, 0, stream>>>(qkv, ld, b.part, tokens);
-  v_finalize<<<dim3(static_cast<unsigned>(kHeads * kHeadDim / 256)), 256, 0, stream>>>(b.part, b.v_scale, chunks);
-  v_quant_kernel<<<vgrid, 256, 0, stream>>>(qkv, ld, b.cu, b.v_scale, b.v, tokens, b.padded, b.batch);
+  if (quant_v) {
+    const int chunks = (tokens + 255) / 256;
+    const dim3 vgrid(static_cast<unsigned>(chunks), static_cast<unsigned>(kHeads * kHeadDim / 256), 1);
+    // No memset of the V padding: keys past the sequence end get zero probability in the attention
+    // kernel, so their uninitialized V bytes never contribute to PV.
+    v_amax_partial<<<vgrid, 256, 0, stream>>>(qkv, ld, b.part, tokens);
+    v_finalize<<<dim3(static_cast<unsigned>(kHeads * kHeadDim / 256)), 256, 0, stream>>>(b.part, b.v_scale, chunks);
+    v_quant_kernel<<<vgrid, 256, 0, stream>>>(qkv, ld, b.cu, b.v_scale, b.v, tokens, b.padded, b.batch);
+  }
 
   const hipError_t e = hipGetLastError();
   if (e != hipSuccess) fail("int8_attn_quantize", e);

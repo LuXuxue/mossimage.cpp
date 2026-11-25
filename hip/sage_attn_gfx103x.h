@@ -12,17 +12,17 @@ namespace mi::hip {
 using sage_bf16 = hip_block::bf16_bits;
 
 struct Gfx103xAttnArgs {
-  const std::int8_t* q;         // [padded, heads * 128] int8, varlen rows
-  const std::int8_t* k;
-  const std::uint16_t* v;       // fp16 bits, [padded, heads * 128], native [row, head*128 + d]
-  sage_bf16* out;               // [tokens, 3*kDim] bf16, head at head*128
-  const float* q_scale;         // [padded, heads], one per query row
-  const float* k_scale;         // [padded / 16, heads], one per 16 keys
+  const std::int8_t* __restrict__ q;         // [padded, heads * 128] int8, varlen rows
+  const std::int8_t* __restrict__ k;
+  const std::uint16_t* __restrict__ v;       // fp16 bits, [padded, heads * 128], native [row, head*128 + d]
+  sage_bf16* __restrict__ out;               // [tokens, 3*kDim] bf16, head at head*128
+  const float* __restrict__ q_scale;         // [padded, heads], one per query row
+  const float* __restrict__ k_scale;         // [padded / 16, heads], one per 16 keys
   std::int64_t q_stride_n;      // row stride of q/k/v (heads * 128)
   std::int64_t q_scale_stride_n;// row stride of q_scale (heads)
   std::int64_t k_scale_stride_n;// group stride of k_scale (heads)
   std::int64_t ldo;             // output row stride (kDim)
-  const std::int32_t* cu;       // [batch + 1] cu_seqlens on device
+  const std::int32_t* __restrict__ cu;       // [batch + 1] cu_seqlens on device
   int batch, max_seqlen;
   int heads;
   float sm_scale_log2e;         // (1 / sqrt(head_dim)) * log2(e)

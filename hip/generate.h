@@ -36,6 +36,9 @@ struct GenerateRequest {
   // activations and a reserve for the code objects and the runtime. The DiT's blocks past what it leaves stream from
   // pinned host memory every step. 0: the automatic budget, what the device has free.
   std::uint64_t vram_budget = 0;
+  // Whether the DiT's blocks use the INT8 ConvRot path. The planner adds its activation scratch only then; a bf16
+  // ("reference") DiT does not allocate those buffers.
+  bool int8_dit = true;
   bool decode = true;  // false: stop at the final latents
   // Called with the final latents before the decode.
   std::function<void(const std::vector<float>& latents)> on_latents;

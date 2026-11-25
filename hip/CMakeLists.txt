@@ -293,6 +293,11 @@ add_executable(hip_rotate_quantize_bench tools/hip_rotate_quantize_bench.cpp)
 target_compile_options(hip_rotate_quantize_bench PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_rotate_quantize_bench PRIVATE mossinfer_hip)
 
+# Fused SiTU-GLU + ConvRot quantizer: byte-identical to the two separate ops.
+add_executable(hip_fused_quant_check tools/hip_fused_quant_check.cpp)
+target_compile_options(hip_fused_quant_check PRIVATE ${MI_HIP_WARN})
+target_link_libraries(hip_fused_quant_check PRIVATE mossinfer_hip)
+
 # Compare the small rocWMMA GEMM with the tiled GEMM on text-encoder shapes.
 add_executable(hip_bf16_small_bench tools/hip_bf16_small_bench.cpp)
 target_compile_options(hip_bf16_small_bench PRIVATE ${MI_HIP_WARN})

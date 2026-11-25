@@ -103,7 +103,9 @@ __global__ __launch_bounds__(256) void int8_gemm_valu(const Int8GemmArgs a, int 
     if (next < a.k) load_tile((buf + PREFETCH) % NBUFFERS, next);
     const std::int8_t* ac = &As[buf][0];
     const std::int8_t* bc = &Bs[buf][0];
-#pragma unroll
+// Keep only one 16-byte K chunk's operands live at a time. Unrolling all four chunks keeps four times the v4i
+    // operands in VGPRs, which costs an entire wave/SIMD (comfy-kitchen gemm_gfx10.h measured 5.97 vs 3.97 TOPS).
+#pragma unroll 1
     for (int c = 0; c < VPR; ++c) {
       v4i av[TM], bv[TN];
 #pragma unroll
@@ -125,22 +127,35 @@ __global__ __launch_bounds__(256) void int8_gemm_valu(const Int8GemmArgs a, int 
     buf = (buf + 1) % NBUFFERS;
   }
 
+  // Hoist the per-column operands: without this the compiler must assume the bf16 output store aliases w_scale/bias/
+  // gate and re-issues every load for every row (comfy-kitchen gemm_wmma.h:346 has the same note).
+  float wsc[TN], bi[TN];
+  bf16_bits gt[TN];
+  bool valid[TN];
+#pragma unroll
+  for (int j = 0; j < TN; ++j) {
+    const int col = n0 + ocol + j;
+    valid[j] = col < a.n;
+    wsc[j] = valid[j] ? a.w_scale[col] : 0.0f;
+    bi[j] = (valid[j] && a.bias != nullptr) ? a.bias[col] : 0.0f;
+    gt[j] = (valid[j] && a.gate != nullptr) ? a.gate[col] : 0;
+  }
 #pragma unroll
   for (int i = 0; i < TM; ++i) {
     const int row = m0 + orow + i;
     if (row >= a.m) continue;
     const float xs = a.x_scale[row];
+    const bf16_bits* ldrow = a.lora_delta != nullptr ? a.lora_delta + static_cast<std::int64_t>(row) * a.ldl : nullptr;
 #pragma unroll
     for (int j = 0; j < TN; ++j) {
+      if (!valid[j]) continue;
       const int col = n0 + ocol + j;
-      if (col >= a.n) continue;
-      float v = static_cast<float>(acc[i][j]) * xs * a.w_scale[col];
-      if (a.bias != nullptr) v += a.bias[col];
-      if (a.lora_delta != nullptr) v += f(a.lora_delta[static_cast<std::int64_t>(row) * a.ldl + col]);
+      float v = static_cast<float>(acc[i][j]) * xs * wsc[j] + bi[j];
+      if (ldrow != nullptr) v += f(ldrow[col]);
       const bf16_bits g = bf(v);
       const std::size_t at = static_cast<std::size_t>(row) * a.ldy + col;
       if (a.gate != nullptr) {
-        const float prod = f(g) * f(a.gate[col]);
+        const float prod = f(g) * f(gt[j]);
         const float res = a.residual != nullptr ? f(a.residual[static_cast<std::int64_t>(row) * a.ldr + col]) : 0.0f;
         a.y[at] = bf(add(res, prod));
       } else {
@@ -297,6 +312,19 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void int8_gemm_tiled(
     }
   }
 
+  // Hoist the per-column operands: the bf16 output store could alias them, so without this the compiler re-issues
+  // every scale/bias/gate load for each row (the same fix as comfy-kitchen's gemm_wmma.h epilogue).
+  float wsc[TN], bi[TN];
+  bf16_bits gt[TN];
+  bool valid[TN];
+#pragma unroll
+  for (int j = 0; j < TN; ++j) {
+    const int c = n0 + wn * (TN * 16) + j * 16 + (lane & 15);
+    valid[j] = c < a.n;
+    wsc[j] = valid[j] ? a.w_scale[c] : 0.0f;
+    bi[j] = (valid[j] && a.bias != nullptr) ? a.bias[c] : 0.0f;
+    gt[j] = (valid[j] && a.gate != nullptr) ? a.gate[c] : 0;
+  }
   // Each accumulator element e is output row 2*e + lane/16, column lane%16 on gfx11.
 #pragma unroll
   for (int i = 0; i < TM; ++i) {
@@ -305,18 +333,18 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void int8_gemm_tiled(
       const int r = m0 + wm * (TM * 16) + i * 16 + 2 * e + (lane >> 4);
       if (r >= a.m) continue;
       const float xs = a.x_scale[r];
+      const bf16_bits* ldrow = a.lora_delta != nullptr ? a.lora_delta + static_cast<std::int64_t>(r) * a.ldl : nullptr;
 #pragma unroll
       for (int j = 0; j < TN; ++j) {
+        if (!valid[j]) continue;
         const int c = n0 + wn * (TN * 16) + j * 16 + (lane & 15);
-        if (c >= a.n) continue;
-        float v = static_cast<float>(acc[i][j][e]) * xs * a.w_scale[c];
-        if (a.bias != nullptr) v += a.bias[c];
-        if (a.lora_delta != nullptr) v += f(a.lora_delta[static_cast<std::int64_t>(r) * a.ldl + c]);
+        float v = static_cast<float>(acc[i][j][e]) * xs * wsc[j] + bi[j];
+        if (ldrow != nullptr) v += f(ldrow[c]);
         const bf16_bits g = bf(v);  // the GEMM's own bf16 rounding, before the optional gate+residual epilogue
         const std::size_t at = static_cast<std::size_t>(r) * a.ldy + c;
         if (a.gate != nullptr) {
           // bf(x + bf(gemm_out)*gate): read the residual before storing to it (it may alias y).
-          const float prod = f(g) * f(a.gate[c]);
+          const float prod = f(g) * f(gt[j]);
           const float res = a.residual != nullptr ? f(a.residual[static_cast<std::int64_t>(r) * a.ldr + c]) : 0.0f;
           a.y[at] = bf(add(res, prod));
         } else {
