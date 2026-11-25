@@ -580,6 +580,9 @@ int main(int argc, char** argv) {
   options.query_free_memory = false;
   const mi::backend::ProbeResult probe = mi::backend::probe(options);
   std::printf("%s", mi::backend::format_report(probe).c_str());
+  if (mi::kernels::sm75::turing()) {
+    std::printf("sm_75 tensor cores: %s\n", mi::kernels::sm75::no_tensor_cores() ? "no" : "yes");
+  }
   int failures = 0;
   try {
     if (what == "convert" || what == "all") failures += run_convert();

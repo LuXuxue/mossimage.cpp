@@ -175,7 +175,12 @@ bool turing_q8_kernel() { return kernels::sm75::turing() && !kernels::sm70::volt
 }  // namespace
 
 bool supported(Variant v) {
-  if (turing_q8_kernel()) return v == Variant::kInt8Fp16 || v == Variant::kInt8Fp16F32Acc;
+  if (turing_q8_kernel()) {
+    // TU116/TU117 have no tensor cores: the SM runs m8n8k16 INT8 MMA on its ordinary arithmetic units, which at
+    // 1024^2 makes q8 attention orders of magnitude slower than exact attention (and effectively a hang).
+    if (kernels::sm75::no_tensor_cores()) return false;
+    return v == Variant::kInt8Fp16 || v == Variant::kInt8Fp16F32Acc;
+  }
   int device = 0;
   MI_CUDA_CHECK(cudaGetDevice(&device));
   return support(device, v) == Support::kOk;
@@ -214,6 +219,10 @@ void attention_q8(const Options& o, const Tensor& q, const Tensor& k, const Tens
                   std::size_t workspace_bytes, cudaStream_t stream, const QkNormRope* norm_rope) {
   const bool turing = turing_q8_kernel();
   if (turing) {
+    if (kernels::sm75::no_tensor_cores()) {
+      throw std::runtime_error("attention_q8: this Turing GPU has no tensor cores; q8 attention is not supported "
+                               "(use attention exact)");
+    }
     if (o.variant != Variant::kInt8Fp16 && o.variant != Variant::kInt8Fp16F32Acc) {
       throw std::runtime_error("attention_q8: the sm_75 build runs the fp16-accumulation variants only");
     }

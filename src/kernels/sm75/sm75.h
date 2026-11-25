@@ -36,6 +36,11 @@ bool fp16_weights();
 // translation units branch on this.
 inline bool turing() { return fp16_weights(); }
 
+// True on Turing cards whose SMs have no tensor cores (GTX 16xx / TU116 / TU117). They still decode mma.sync for
+// binary compatibility, but on the ordinary arithmetic units, so the INT8-QK 8-bit attention is unusably slow there.
+// Cached per device.
+bool no_tensor_cores();
+
 // Converts a bf16 GEMM weight to fp16 in place and marks the view kF16. No-op when fp16_weights() is false or the
 // tensor is already fp16; throws std::logic_error for any other dtype. For resident weights (converted once).
 void convert_weight_inplace(Tensor& w, cudaStream_t stream);
