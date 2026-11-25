@@ -134,7 +134,7 @@ __global__ __attribute__((amdgpu_waves_per_eu(2))) __launch_bounds__(kBlockM, 1)
 #pragma unroll
     for (int j0 = 0; j0 < kBlockN; j0 += 4) {
       int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-#pragma unroll
+#pragma unroll 1
       for (int dq = 0; dq < kQuads; dq += 4) {
         const int4 k0 = *reinterpret_cast<const int4*>(&k_buf[buf][(j0 + 0) * kHeadDim + dq * 4]);
         const int4 k1 = *reinterpret_cast<const int4*>(&k_buf[buf][(j0 + 1) * kHeadDim + dq * 4]);
