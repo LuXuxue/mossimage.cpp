@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,6 +32,26 @@ struct VaeDecodeStats {
   std::uint64_t device_bytes = 0;  // device memory decode() allocated (weights not included)
   // With set_profile(true): device milliseconds per op kind, in order of first use.
   std::vector<std::pair<std::string, double>> profile;
+};
+
+// Exact band-tiled schedule (the engine's plan step 23). The tail is 17 units in execution order: mid resnet 1 (0),
+// up_blocks[b]'s three resnets and upsampler (1-4, 5-8, 9-12, 13-15), and conv_norm_out + conv_out + RGB (16). A
+// segment runs units [first_unit, end_unit) from the checkpoint before first_unit; its bands are full-width row
+// bands of `band_rows` rows at that segment's *output* resolution (all rows: one band). All the bands tile the
+// image exactly, including a shorter final band. The head (latent unpack through mid attention) always runs untiled.
+struct VaeTilePlan {
+  struct Segment {
+    int first_unit = 0, end_unit = 0;
+    std::uint32_t band_rows = 0;  // band height at the segment's output resolution
+  };
+  std::uint32_t height = 0, width = 0;  // latent grid the plan is for (image = 16h x 16w)
+  int base_channels = 0;               // decoder width the plan is for
+  int tile = 0;                        // band height in image pixels (a multiple of 8)
+  std::vector<Segment> segments;
+  std::uint64_t workspace_bytes = 0;  // device bytes decode_tiled_exact() allocates
+  double relative_cost = 0;           // estimated tail work (conv MACs + memory traffic) vs the untiled tail
+
+  std::string describe() const;
 };
 
 class VaeDecoder {
@@ -58,14 +79,36 @@ class VaeDecoder {
 
   // latents: fp32 NCHW [128, h, w], the pipeline's final latents. rgb: resized to 16h x 16w x 3. image: when not null, the
   // decoder's fp32 output [16h, 16w, 3] before the clamp. Runs on its own stream and returns when the RGB is on the host.
+  // Setting MI_HIP_VAE_BAND_TILE=1 (optionally MI_HIP_VAE_BAND_TILE_PX=<multiple of 8>) inside decode() selects the
+  // byte-identical band-tiled path, so generate.cpp needs no changes to exercise it.
   VaeDecodeStats decode(const float* latents, std::uint32_t h, std::uint32_t w, std::vector<std::uint8_t>& rgb,
                         std::vector<float>* image = nullptr);
   // ComfyUI-style overlap-and-blend fallback for a device that cannot hold the full decode. Each tile is decoded on
   // its own (so GroupNorm and the mid attention see only the tile) and the RGB tiles are feathered with a cosine ramp.
-  // tile_px and overlap_px are pixel (not latent) sizes, rounded down to multiples of 16.
+  // tile_px and overlap_px are pixel (not latent) sizes, rounded down to multiples of 16. NOT byte-identical to decode().
   VaeDecodeStats decode_tiled(const float* latents, std::uint32_t h, std::uint32_t w,
                               std::vector<std::uint8_t>& rgb, std::vector<float>* image = nullptr,
                               std::uint32_t tile_px = 512, std::uint32_t overlap_px = 128);
+
+  // ---- Exact band-tiled decode (fp32/TF32 only) ----
+  // Fastest schedule (least estimated recomputation) whose workspace fits budget_bytes; tile = 0 searches the band
+  // height, otherwise it is fixed (image pixels, a multiple of 8). nullopt when nothing fits.
+  static std::optional<VaeTilePlan> plan_tiled(int base_channels, std::uint32_t h, std::uint32_t w,
+                                               std::uint64_t budget_bytes, int tile = 0);
+  // The schedule with the smallest workspace for this band height, and among those the fastest.
+  static VaeTilePlan plan_tiled_min_memory(int base_channels, std::uint32_t h, std::uint32_t w, int tile);
+  // A fixed schedule: segments of at most six units, each banded at `tile` (or one band when that covers the
+  // segment). Useful for testing every band grid, including a partial final band.
+  static VaeTilePlan plan_tiled_uniform(int base_channels, std::uint32_t h, std::uint32_t w, int tile);
+  // plan_tiled_min_memory(...).workspace_bytes.
+  static std::uint64_t tiled_workspace_bytes(int base_channels, std::uint32_t h, std::uint32_t w, int tile);
+
+  // Byte-identical to decode() in the same mode (fp32 activations, TF32 convolutions, exact integer-sum GroupNorms).
+  // Requires a plan for this latent grid and decoder width. set_profile() works as in decode(). The optional
+  // `image` receives the fp32 [16h, 16w, 3] output before the clamp, as in decode().
+  VaeDecodeStats decode_tiled_exact(const float* latents, std::uint32_t h, std::uint32_t w,
+                                    std::vector<std::uint8_t>& rgb, const VaeTilePlan& plan,
+                                    std::vector<float>* image = nullptr);
 
   struct Weights;
 

@@ -140,6 +140,13 @@ void softmax_pack(const float* s, std::int64_t lds, int rows, int l, float scale
 // NaN. accum: gn_accum_bytes(), zeroed by this call.
 std::size_t gn_accum_bytes();
 void group_norm_stats(const float* x, std::int64_t pixels, int c, float eps, void* accum, float* stats, hipStream_t stream);
+// The same statistics, split so several tensor slices can be accumulated separately (the exact band-tiled VAE
+// decoder uses one slice per band). gn_accum_zero clears the accumulators, gn_accumulate adds x [pixels, c] (any
+// number of calls, in any order), and gn_finalize writes stats[g] = {mean, rstd} using count_per_group values per
+// group (the whole tensor's pixels * c / kGroups). The sums are fixed-point integers, so splitting is bit-exact.
+void gn_accum_zero(void* accum, hipStream_t stream);
+void gn_accumulate(const float* x, std::int64_t pixels, int c, void* accum, hipStream_t stream);
+void gn_finalize(void* accum, std::int64_t count_per_group, float eps, float* stats, hipStream_t stream);
 // y = fma(a, x, fma(-a, mean, beta)) with a = rstd * gamma (torch's fused GroupNorm parameters); with silu,
 // y / (1 + exp(-y)). y may be x.
 void group_norm_apply(const float* x, float* y, std::int64_t pixels, int c, const float* stats, const float* gamma,

@@ -770,19 +770,36 @@ void softmax_pack(const float* s, std::int64_t lds, int rows, int l, float scale
 
 std::size_t gn_accum_bytes() { return static_cast<std::size_t>(kGroups) * 6 * sizeof(u64); }
 
+void gn_accum_zero(void* accum, hipStream_t stream) {
+  const hipError_t e = hipMemsetAsync(accum, 0, gn_accum_bytes(), stream);
+  if (e != hipSuccess) throw std::runtime_error(std::string("hip_vae::gn_accum_zero: hipMemsetAsync: ") + hipGetErrorString(e));
+}
+
+void gn_accumulate(const float* x, std::int64_t pixels, int c, void* accum, hipStream_t stream) {
+  require(c > 0 && c % kGroups == 0 && c <= 1024 && pixels > 0, "gn_accumulate", "c must be a multiple of 32 up to 1024");
+  const int cpg = c / kGroups;
+  require(pixels * cpg <= (std::int64_t{1} << 30), "gn_accumulate", "a group may hold up to 2^30 elements");
+  const std::int64_t ppc = std::max<std::int64_t>(1, kGnChunkElems / c);
+  const GnAccumArgs aa{x, static_cast<u64*>(accum), pixels, ppc, c, cpg};
+  gn_accumulate_kernel<<<dim3(grid_of(pixels, ppc, "gn_accumulate")), dim3(kWave), 0, stream>>>(aa);
+  check_launch("gn_accumulate");
+}
+
+void gn_finalize(void* accum, std::int64_t count_per_group, float eps, float* stats, hipStream_t stream) {
+  require(count_per_group > 0 && count_per_group <= (std::int64_t{1} << 30), "gn_finalize",
+          "a group may hold up to 2^30 elements");
+  const GnFinalizeArgs fa{static_cast<const u64*>(accum), stats, 1.0 / static_cast<double>(count_per_group), static_cast<double>(eps)};
+  gn_finalize_kernel<<<dim3(1), dim3(kWave), 0, stream>>>(fa);
+  check_launch("gn_finalize");
+}
+
 void group_norm_stats(const float* x, std::int64_t pixels, int c, float eps, void* accum, float* stats, hipStream_t stream) {
   require(c > 0 && c % kGroups == 0 && c <= 1024 && pixels > 0, "group_norm_stats", "c must be a multiple of 32 up to 1024");
   const int cpg = c / kGroups;
   require(pixels * cpg <= (std::int64_t{1} << 30), "group_norm_stats", "a group may hold up to 2^30 elements");
-  const hipError_t e = hipMemsetAsync(accum, 0, gn_accum_bytes(), stream);
-  if (e != hipSuccess) throw std::runtime_error(std::string("hip_vae::group_norm_stats: hipMemsetAsync: ") + hipGetErrorString(e));
-  const std::int64_t ppc = std::max<std::int64_t>(1, kGnChunkElems / c);
-  const GnAccumArgs aa{x, static_cast<u64*>(accum), pixels, ppc, c, cpg};
-  gn_accumulate_kernel<<<dim3(grid_of(pixels, ppc, "group_norm_stats")), dim3(kWave), 0, stream>>>(aa);
-  check_launch("group_norm_stats");
-  const GnFinalizeArgs fa{static_cast<const u64*>(accum), stats, 1.0 / static_cast<double>(pixels * cpg), static_cast<double>(eps)};
-  gn_finalize_kernel<<<dim3(1), dim3(kWave), 0, stream>>>(fa);
-  check_launch("group_norm_stats finalize");
+  gn_accum_zero(accum, stream);
+  gn_accumulate(x, pixels, c, accum, stream);
+  gn_finalize(accum, pixels * cpg, eps, stats, stream);
 }
 
 void group_norm_apply(const float* x, float* y, std::int64_t pixels, int c, const float* stats, const float* gamma,

@@ -15,10 +15,33 @@
 //   - The decode: PSNR, max and mean |diff| and identical bytes against the golden PNG. It passes with no NaN, no byte off
 //     by more than 1 and at least 99 % of the bytes identical (the CUDA engine's reference decode: 99.1-99.3 %, max 1).
 //   - Non-square decodes (run_nonsquare) and the size limits (check_limits).
+//   - --tiled-check: the same latents decoded full and band-tiled at several band heights (including a partial final
+//     band, both the min-memory planner and a uniform schedule): RGB must be byte-identical.
 // Exit status: 0 everything passed, 1 a check failed, 2 bad usage or no usable device.
 // Usage: hip_vae_check [--device N] [--kat-only | --no-kat] [--vae FILE] [--golden DIR] [--case NAME]... [--no-golden] [--no-nonsquare]
-//                      [--out-dir DIR] [--iters N] [--profile] [--conv-products 4|3]
+//                      [--out-dir DIR] [--iters N] [--profile] [--conv-products 4|3] [--tiled-check]
+// Some Windows SDK builds (notably the TheRock clang-cl toolchain) ship no zlib. Keep the check buildable there: the
+// PNG golden-image checks then report that zlib is unavailable; all other checks, including --tiled-check, work.
+#if defined(MI_HIP_VAE_NO_ZLIB)
+#include <cstddef>
+#include <stdexcept>
+namespace {
+using uLong = unsigned long;
+using uLongf = unsigned long;
+using uInt = unsigned int;
+constexpr int Z_OK = 0;
+[[noreturn]] inline uLong crc32(uLong, const unsigned char*, uInt) { throw std::runtime_error("zlib not available"); }
+[[noreturn]] inline uLongf uncompress(unsigned char*, uLongf*, const unsigned char*, uLong) {
+  throw std::runtime_error("zlib not available");
+}
+[[noreturn]] inline uLong compressBound(uLong) { throw std::runtime_error("zlib not available"); }
+[[noreturn]] inline int compress2(unsigned char*, uLongf*, const unsigned char*, uLong, int) {
+  throw std::runtime_error("zlib not available");
+}
+}  // namespace
+#else
 #include <zlib.h>
+#endif
 
 #include <algorithm>
 #include <bit>
@@ -1197,6 +1220,7 @@ struct Options {
   fs::path out_dir;
   int iters = 1;
   Products conv_products = Products::kTf32;
+  bool tiled_check = false;
 };
 
 void run_decode(Device& device, VaeDecoder& decoder, const Options& o, const std::string& name) {
@@ -1350,6 +1374,49 @@ void run_nonsquare(VaeDecoder& decoder, const Options& o) {
   }
 }
 
+// The exact band-tiled path against the full decode on the same latents. Random latents exercise the whole tail;
+// nothing here needs the golden files. Every schedule must give byte-identical RGB (the fp32 image before the clamp
+// is compared as well, as a stronger diagnostic).
+void run_tiled_exact_check(VaeDecoder& decoder) {
+  std::printf("\nexact band-tiled decode: the same latents, full vs band-tiled (RGB must be byte-identical)\n");
+  struct Case {
+    std::uint32_t h, w;
+    std::vector<int> tiles;
+  };
+  const Case cases[] = {{8, 8, {16, 40, 64, 128}}, {6, 10, {16, 40, 96}}, {16, 16, {32, 48, 256}}};
+  const int c = decoder.base_channels();
+  for (const Case& cs : cases) {
+    const std::vector<float> z = random_f32(1000 + cs.h * 100 + cs.w, 128ull * cs.h * cs.w, -2.0f, 2.0f);
+    std::vector<std::uint8_t> rgb_full;
+    std::vector<float> image_full;
+    decoder.decode(z.data(), cs.h, cs.w, rgb_full, &image_full);
+    std::printf("  latents %ux%u -> image %ux%u, full decode workspace %.3f GiB\n", cs.h, cs.w, 16 * cs.w, 16 * cs.h,
+                static_cast<double>(decoder.workspace_bytes(cs.h, cs.w)) / (1u << 30));
+    for (const int tile : cs.tiles) {
+      for (int planner = 0; planner < 2; ++planner) {
+        const VaeTilePlan plan = planner == 0 ? VaeDecoder::plan_tiled_min_memory(c, cs.h, cs.w, tile)
+                                               : VaeDecoder::plan_tiled_uniform(c, cs.h, cs.w, tile);
+        std::vector<std::uint8_t> rgb;
+        std::vector<float> image;
+        decoder.decode_tiled_exact(z.data(), cs.h, cs.w, rgb, plan, &image);
+        std::size_t bad_bytes = 0;
+        for (std::size_t i = 0; i < rgb.size(); ++i) bad_bytes += rgb[i] != rgb_full[i];
+        std::size_t bad_image = 0;
+        double max_diff = 0.0;
+        for (std::size_t i = 0; i < image.size(); ++i) {
+          bad_image += std::bit_cast<std::uint32_t>(image[i]) != std::bit_cast<std::uint32_t>(image_full[i]);
+          max_diff = std::max(max_diff, std::abs(static_cast<double>(image[i] - image_full[i])));
+        }
+        const bool ok = rgb.size() == rgb_full.size() && bad_bytes == 0;
+        if (!ok) ++failures;
+        std::printf("  %-9s %-8s %s: %s %zu of %zu bytes differ, %zu of %zu fp32 values differ (max |diff| %.3g)\n",
+                    planner == 0 ? "min-mem" : "uniform", ("tile " + std::to_string(tile)).c_str(), plan.describe().c_str(),
+                    ok ? "ok" : "FAILED", bad_bytes, rgb_full.size(), bad_image, image_full.size(), max_diff);
+      }
+    }
+  }
+}
+
 // The size limits: refused before anything runs, with the reason.
 void check_limits(Device& device, const VaeDecoder& decoder) {
   const auto expect_refused = [&](const char* what, std::uint32_t h, std::uint32_t w) {
@@ -1405,12 +1472,14 @@ int main(int argc, char** argv) {
         const std::string v = next();
         if (v != "4" && v != "3") throw std::invalid_argument("--conv-products takes 4 or 3");
         o.conv_products = v == "4" ? Products::kTf32 : Products::kTf32Drop;
+      } else if (arg == "--tiled-check") {
+        o.tiled_check = true;
       } else {
         throw std::invalid_argument("unknown argument " + arg);
       }
     } catch (const std::exception& e) {
       std::printf("%s\nusage: %s [--device N] [--kat-only | --no-kat] [--vae FILE] [--golden DIR] [--case NAME]... [--no-golden] [--no-nonsquare]\n"
-                  "       [--out-dir DIR] [--iters N] [--profile] [--conv-products 4|3]\n",
+                  "       [--out-dir DIR] [--iters N] [--profile] [--conv-products 4|3] [--tiled-check]\n",
                   e.what(), argv[0]);
       return 2;
     }
@@ -1445,6 +1514,7 @@ int main(int argc, char** argv) {
       check_limits(device, decoder);
       for (const std::string& name : o.cases) run_decode(device, decoder, o, name);
       if (o.nonsquare) run_nonsquare(decoder, o);
+      if (o.tiled_check) run_tiled_exact_check(decoder);
     }
     std::printf("\n%s (%d failed checks)\n", failures == 0 ? "PASS" : "FAIL", failures);
     return failures == 0 ? 0 : 1;

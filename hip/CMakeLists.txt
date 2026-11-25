@@ -333,13 +333,18 @@ add_executable(hip_te_check tools/hip_te_check.cpp)
 target_compile_options(hip_te_check PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_te_check PRIVATE mossinfer_hip mi_hip_engine_json)
 
-# The VAE decoder's kernels against host replays, then golden latents against the reference pipeline's PNGs (zlib).
-# TheRock SDKs do not ship zlib on Windows, so skip that one check there instead of refusing to configure the tools.
+# The VAE decoder's kernels against host replays, the exact band-tiled decode against the full one, and (with zlib)
+# golden latents against the reference pipeline's PNGs. TheRock SDKs do not ship zlib on Windows: build the check
+# without the PNG part there instead of refusing to configure the tools.
 find_package(ZLIB QUIET)
+add_executable(hip_vae_check tools/hip_vae_check.cpp)
+target_compile_options(hip_vae_check PRIVATE ${MI_HIP_WARN})
 if(ZLIB_FOUND)
-  add_executable(hip_vae_check tools/hip_vae_check.cpp)
-  target_compile_options(hip_vae_check PRIVATE ${MI_HIP_WARN})
   target_link_libraries(hip_vae_check PRIVATE mossinfer_hip ZLIB::ZLIB)
 else()
-  message(STATUS "zlib not found: skipping hip_vae_check")
+  # The Windows ROCm SDK has no zlib: build the check without PNG golden-image support (the kernel checks and the
+  # band-tiled full-vs-tiled comparison need no PNG files).
+  target_compile_definitions(hip_vae_check PRIVATE MI_HIP_VAE_NO_ZLIB=1)
+  target_link_libraries(hip_vae_check PRIVATE mossinfer_hip)
+  message(STATUS "zlib not found: hip_vae_check builds without PNG golden-image support")
 endif()
