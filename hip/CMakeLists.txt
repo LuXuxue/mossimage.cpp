@@ -115,7 +115,9 @@ else()
   list(JOIN HIP_TARGET "," MI_HIP_TARGET_NAMES)
   set_source_files_properties(${MI_HIP_KERNELS} PROPERTIES LANGUAGE CXX)
   foreach(_src IN LISTS MI_HIP_KERNELS)
-    set_property(SOURCE ${_src} PROPERTY COMPILE_OPTIONS -x hip -std=c++17 ${MI_HIP_FLAGS} ${MI_HIP_WARN})
+    # compat/cmath shadows <cmath> for these HIP sources only, ahead of MSVC's own include directory.
+    set_property(SOURCE ${_src} PROPERTY COMPILE_OPTIONS
+      -I${CMAKE_CURRENT_SOURCE_DIR}/compat -x hip -std=c++17 ${MI_HIP_FLAGS} ${MI_HIP_WARN})
   endforeach()
   set_property(SOURCE ${MI_HIP_HOST} PROPERTY COMPILE_OPTIONS ${MI_HIP_WARN})
 
