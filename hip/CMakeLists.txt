@@ -1,7 +1,9 @@
 # The HIP backend: MOSS-Image's kernels for AMD GPUs through ROCm, and the same sources through HIP's NVIDIA headers for
 # checking on a CUDA device. Its own project; the engine's build does not include it. Configure once per target (README.md):
-#   -DHIP_TARGET="gfx1100;gfx1200;gfx1201"  one or more AMD architectures in one binary (the release package: all three);
-#                                           rocWMMA leaf, ROCm's clang, links libamdhip64 / amdhip64.lib
+#   -DHIP_TARGET="gfx1100;gfx1103;gfx1200;gfx1201;gfx1035"  one or more AMD architectures in one binary:
+#                                           RDNA3/RDNA4 use the rocWMMA / native WMMA leaves;
+#                                           gfx1035 (RDNA2, no matrix cores and no bf16 instructions) uses the
+#                                           V_DOT4_I32_I8 / V_DOT2_F32_F16 dot-product leaves in the same fat binary
 #   -DHIP_TARGET=nvidia                     scalar leaf, nvcc with HIP's NVIDIA headers
 # On Linux the ROCm SDK comes from $ROCM_PATH (-DROCM_PATH=...); on Windows a TheRock SDK, e.g.
 #   -DROCM_PATH=<SDK devel root>   (its lib/llvm/bin/clang-cl builds host and device code, its
@@ -9,7 +11,7 @@
 cmake_minimum_required(VERSION 3.28)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/version.cmake)  # MOSSINFER_VERSION, from the C header
 
-set(HIP_TARGET "" CACHE STRING "Device targets: a list of gfx1100, gfx1103, gfx1200, gfx1201, or nvidia")
+set(HIP_TARGET "" CACHE STRING "Device targets: a list of gfx1100, gfx1103, gfx1200, gfx1201, gfx1035, or nvidia")
 set(ROCM_PATH "$ENV{ROCM_PATH}" CACHE PATH "ROCm root, the directory holding include/hip and lib/llvm")
 option(MI_HIP_WERROR "Treat warnings as errors" ON)
 
@@ -20,13 +22,13 @@ elseif(HIP_TARGET)
   set(MI_HIP_AMD ON)
   list(REMOVE_DUPLICATES HIP_TARGET)
   foreach(_arch IN LISTS HIP_TARGET)
-    if(NOT _arch MATCHES "^(gfx1100|gfx1103|gfx1200|gfx1201)$")
+    if(NOT _arch MATCHES "^(gfx1100|gfx1103|gfx1200|gfx1201|gfx1035)$")
       set(MI_HIP_AMD OFF)
     endif()
   endforeach()
 endif()
 if(NOT MI_HIP_AMD AND NOT HIP_TARGET STREQUAL "nvidia")
-  message(FATAL_ERROR "Set HIP_TARGET to a list of gfx1100, gfx1103, gfx1200, gfx1201, or to nvidia (got '${HIP_TARGET}')")
+  message(FATAL_ERROR "Set HIP_TARGET to a list of gfx1100, gfx1103, gfx1200, gfx1201, gfx1035, or to nvidia (got '${HIP_TARGET}')")
 endif()
 if(NOT EXISTS "${ROCM_PATH}/include/hip/hip_runtime.h")
   message(FATAL_ERROR "ROCM_PATH (cache variable or environment) must hold include/hip/hip_runtime.h (got '${ROCM_PATH}')")
@@ -41,6 +43,14 @@ if(MI_HIP_AMD)
 endif()
 
 project(mossinfer_hip VERSION ${MOSSINFER_VERSION} LANGUAGES CXX)
+
+if(MI_HIP_AMD AND WIN32)
+  # clang-cl's /Fo object-output flag with several --offload-arch flags makes the ROCm driver emit ONE architecture's
+  # code object under every target name in the fat binary: the runtime then tries to load a gfx1103 object on gfx1035
+  # and fails. With -o (the GNU-style output flag clang-cl also accepts) each offload target gets its own object.
+  # CMake picks /Fo for MSVC-mode compilers, so the compile rule has to be replaced here.
+  set(CMAKE_CXX_COMPILE_OBJECT "<CMAKE_CXX_COMPILER> <DEFINES> <INCLUDES> <FLAGS> -o <OBJECT> -c <SOURCE>")
+endif()
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
@@ -95,6 +105,12 @@ else()
   endif()
   foreach(_arch IN LISTS HIP_TARGET)
     list(APPEND MI_HIP_FLAGS --offload-arch=${_arch})
+    # RDNA2's HIP default is a 64-lane wave; every kernel here assumes one 32-lane wave per workgroup fragment. The
+    # gfx11 targets are wave32 already, so the flag only changes the gfx103x code objects. It is a global driver flag:
+    # do not combine gfx103x with gfx12 in one build, whose 256-byte WMMA needs wavefrontsize32.
+    if(_arch MATCHES "^gfx103")
+      list(APPEND MI_HIP_FLAGS -mno-wavefrontsize64)
+    endif()
   endforeach()
   list(JOIN HIP_TARGET "," MI_HIP_TARGET_NAMES)
   set_source_files_properties(${MI_HIP_KERNELS} PROPERTIES LANGUAGE CXX)
@@ -126,7 +142,11 @@ else()
     list(APPEND _deps ${CMAKE_CURRENT_SOURCE_DIR}/${_h})
   endforeach()
   set(_checks "")
-  foreach(_arch IN LISTS HIP_TARGET)
+  # check_device.sh checks WMMA instruction counts, which do not apply to gfx103x's dot-product leaves. Check the
+  # matrix-core architectures only; the same sources were still compiled for every HIP_TARGET in the library above.
+  set(_check_archs ${HIP_TARGET})
+  list(FILTER _check_archs EXCLUDE REGEX "^gfx103")
+  foreach(_arch IN LISTS _check_archs)
     foreach(_src IN LISTS MI_HIP_KERNELS)
       get_filename_component(_name ${_src} NAME_WE)
       set(_out ${_name}.${_arch})

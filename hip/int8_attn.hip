@@ -272,6 +272,12 @@ struct AttnArgs {
   float scale_log2;
 };
 
+// The int8 attention below is a gfx11 WMMA kernel. RDNA2 has no WMMA, so there the DiT block uses the bf16 attention
+// of block_kernels.hip (its GEMMs run on the same dot-product leaves as everything else). This trapping definition
+// exists only because the launcher below is host code shared by every architecture's fat-binary object.
+#if defined(__GFX10__)
+__global__ __launch_bounds__(kThreads) void int8_attn_kernel(const AttnArgs) { __builtin_trap(); }
+#else
 __global__ __launch_bounds__(kThreads) void int8_attn_kernel(const AttnArgs a) {
   constexpr int kStrideK = kHeadDim + 16;  // 144, a multiple of 16: one ds_read_b128 per fragment
   constexpr int kStrideV = kCtaK + 16;     // 80
@@ -456,6 +462,7 @@ __global__ __launch_bounds__(kThreads) void int8_attn_kernel(const AttnArgs a) {
     }
   }
 }
+#endif  // !__GFX10__
 
 void fail(const char* what, hipError_t e) {
   throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));

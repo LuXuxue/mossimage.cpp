@@ -27,8 +27,9 @@ if not exist "%ROCM_SDK%\include\hip\hip_runtime.h" (
   echo [ERROR] ROCm SDK at "%ROCM_SDK%" has no include\hip\hip_runtime.h
   exit /b 1
 )
-rem HIP_TARGET defaults to the single architecture of the development GPU; override it for a release build.
-if not defined HIP_TARGET set "HIP_TARGET=gfx1103"
+rem HIP_TARGET defaults to both supported architectures in one exe: gfx1103 (RDNA3, WMMA) and gfx1035
+rem (RDNA2, dot-product leaves). Override it to build for a single architecture only.
+if not defined HIP_TARGET set "HIP_TARGET=gfx1103;gfx1035"
 set "SRC=%~dp0"
 if "%SRC:~-1%"=="\" set "SRC=%SRC:~0,-1%"
 
@@ -38,11 +39,21 @@ set "CFG=%BUILD%\CMakeCache.txt"
 rem dist/ holds the final compiled artifacts; it is git-ignored.
 set "DIST=%SRC%\dist"
 
-if not exist "%CFG%" (
+rem Reconfigure when HIP_TARGET changes: an old cache would otherwise silently build only the previous architectures.
+set "RECONFIG="
+set "CACHED_TARGET="
+if exist "%CFG%" (
+  for /f "usebackq tokens=1,* delims==" %%A in (`findstr /b "HIP_TARGET:" "%CFG%"`) do set "CACHED_TARGET=%%B"
+  if not "%CACHED_TARGET%"=="%HIP_TARGET%" set "RECONFIG=1"
+) else (
+  set "RECONFIG=1"
+)
+
+if defined RECONFIG (
   cmake -G Ninja -S "%SRC%" -B "%BUILD%" ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DCMAKE_CXX_COMPILER="%ROCM_SDK%\lib\llvm\bin\clang-cl.exe" ^
-    -DHIP_TARGET=%HIP_TARGET% ^
+    -DHIP_TARGET="%HIP_TARGET%" ^
     -DROCM_PATH="%ROCM_SDK%" ^
     -DMI_HIP_WERROR=OFF ^
     -DMOSSINFER_HIP_TOOLS=OFF

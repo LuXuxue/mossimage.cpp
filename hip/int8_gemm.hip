@@ -18,6 +18,7 @@
 #include "hip_block.h"
 #include "int8_gemm.h"
 #include "int8_leaf.h"
+#include "runtime.h"
 
 namespace hip_block {
 
@@ -43,6 +44,117 @@ struct Int8GemmArgs {
   const bf16_bits* residual;    // optional [m, ldr], may alias y
   std::int64_t ldr;
 };
+
+#if defined(__GFX10__)
+
+// RDNA2 has no WMMA. This is comfy-kitchen's gfx1035 VALU tile (Apache-2.0, Copyright (c) 2025 Comfy Org), adapted to
+// this GEMM's scales/bias/LoRA/gate epilogue: a 128x128 block by 256 threads, each owning 16 rows x 4 columns, with
+// V_DOT4_I32_I8. B is staged chunk-major: lane chunks of eight lanes read consecutive 16-byte addresses, which removes
+// the LDS bank conflicts a 20-word row pitch would otherwise cause. The WMMA-tiled kernel below is still compiled so
+// the host launcher's symbol exists in every object of the fat binary.
+__global__ __launch_bounds__(256) void int8_gemm_valu(const Int8GemmArgs a, int x_blocks) {
+  constexpr int TM = 16, TN = 4, BM = 128, BN = 128, BK = 64, THREADS = 256;
+  constexpr int VPR = BK / 16;             // 16-byte K chunks per row per k-tile
+  constexpr int A_SIZE = BM * BK, B_SIZE = BN * BK, NBUFFERS = 2;
+  static_assert((BM / TM) * (BN / TN) == THREADS, "thread tile must cover the block");
+  static_assert(NBUFFERS * (A_SIZE + B_SIZE) <= 64 * 1024, "LDS footprint would spill");
+  __shared__ __align__(16) std::int8_t As[NBUFFERS][A_SIZE];
+  __shared__ __align__(16) std::int8_t Bs[NBUFFERS][B_SIZE];
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int trow = tid / (BN / TN), tcol = tid % (BN / TN);
+  const int orow = trow * TM, ocol = tcol * TN;
+  // The launcher's grid is (N blocks, M blocks); keep the same grouped order as the WMMA kernel.
+  const int blocks_n = gridDim.x, blocks_m = x_blocks;
+  const int bid = blockIdx.y * blocks_n + blockIdx.x;
+  constexpr int kGroupM = 4;
+  const int per_group = kGroupM * blocks_n;
+  const int group = bid / per_group, idx = bid - group * per_group;
+  const int group_rows = std::min(kGroupM, blocks_m - group * kGroupM);
+  const int m0 = (group * kGroupM + idx % group_rows) * BM, n0 = (idx / group_rows) * BN;
+
+  auto load_tile = [&](int buf, int k0) {
+    for (int i = tid; i < BM * VPR; i += THREADS) {
+      const int r = i / VPR, c = i % VPR, gk = k0 + c * 16;
+      int4 val = make_int4(0, 0, 0, 0);
+      if (m0 + r < a.m && gk + 15 < a.k)
+        val = *reinterpret_cast<const int4*>(a.x + static_cast<std::int64_t>(m0 + r) * a.ldx + gk);
+      *reinterpret_cast<int4*>(&As[buf][r * BK + c * 16]) = val;
+    }
+    for (int i = tid; i < BN * VPR; i += THREADS) {
+      const int r = i / VPR, c = i % VPR, gk = k0 + c * 16;
+      int4 val = make_int4(0, 0, 0, 0);
+      if (n0 + r < a.n && gk + 15 < a.k)
+        val = *reinterpret_cast<const int4*>(a.w + static_cast<std::int64_t>(n0 + r) * a.k + gk);
+      *reinterpret_cast<int4*>(&Bs[buf][(c * BN + r) * 16]) = val;
+    }
+  };
+
+  int acc[TM][TN] = {};
+  for (int p = 0; p < NBUFFERS - 1; ++p)
+    if (p * BK < a.k) load_tile(p, p * BK);
+  __syncthreads();
+
+  using v4i = int __attribute__((ext_vector_type(4)));
+  constexpr int PREFETCH = NBUFFERS - 1;
+  int buf = 0;
+  for (int k0 = 0; k0 < a.k; k0 += BK) {
+    const int next = k0 + PREFETCH * BK;
+    if (next < a.k) load_tile((buf + PREFETCH) % NBUFFERS, next);
+    const std::int8_t* ac = &As[buf][0];
+    const std::int8_t* bc = &Bs[buf][0];
+#pragma unroll
+    for (int c = 0; c < VPR; ++c) {
+      v4i av[TM], bv[TN];
+#pragma unroll
+      for (int i = 0; i < TM; ++i) av[i] = *reinterpret_cast<const v4i*>(&ac[(orow + i) * BK + c * 16]);
+#pragma unroll
+      for (int j = 0; j < TN; ++j) bv[j] = *reinterpret_cast<const v4i*>(&bc[(c * BN + ocol + j) * 16]);
+#pragma unroll
+      for (int i = 0; i < TM; ++i) {
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+          acc[i][j] = __builtin_amdgcn_sdot4(av[i][0], bv[j][0], acc[i][j], true);
+          acc[i][j] = __builtin_amdgcn_sdot4(av[i][1], bv[j][1], acc[i][j], true);
+          acc[i][j] = __builtin_amdgcn_sdot4(av[i][2], bv[j][2], acc[i][j], true);
+          acc[i][j] = __builtin_amdgcn_sdot4(av[i][3], bv[j][3], acc[i][j], true);
+        }
+      }
+    }
+    __syncthreads();
+    buf = (buf + 1) % NBUFFERS;
+  }
+
+#pragma unroll
+  for (int i = 0; i < TM; ++i) {
+    const int row = m0 + orow + i;
+    if (row >= a.m) continue;
+    const float xs = a.x_scale[row];
+#pragma unroll
+    for (int j = 0; j < TN; ++j) {
+      const int col = n0 + ocol + j;
+      if (col >= a.n) continue;
+      float v = static_cast<float>(acc[i][j]) * xs * a.w_scale[col];
+      if (a.bias != nullptr) v += a.bias[col];
+      if (a.lora_delta != nullptr) v += f(a.lora_delta[static_cast<std::int64_t>(row) * a.ldl + col]);
+      const bf16_bits g = bf(v);
+      const std::size_t at = static_cast<std::size_t>(row) * a.ldy + col;
+      if (a.gate != nullptr) {
+        const float prod = f(g) * f(a.gate[col]);
+        const float res = a.residual != nullptr ? f(a.residual[static_cast<std::int64_t>(row) * a.ldr + col]) : 0.0f;
+        a.y[at] = bf(add(res, prod));
+      } else {
+        a.y[at] = g;
+      }
+    }
+  }
+}
+
+#else
+
+__global__ void int8_gemm_valu(const Int8GemmArgs, int) { __builtin_trap(); }
+
+#endif
 
 // Stage a ROWS x BKB byte tile from global into registers, then write it to LDS. One 16-byte chunk per lane per pass;
 // out-of-range rows and the K tail are zero-filled so the WMMA reads never leave the tile.
@@ -139,9 +251,16 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void int8_gemm_tiled(
 
     i8leaf::FragA af[2][TM];
     i8leaf::FragB bf[2][TN];
+#if defined(__GFX10__)
+    // RDNA2: each lane loads the eight A rows its accumulators need (a broadcast within each half-wave).
+    const int half = (lane >> 4);
+#pragma unroll
+    for (int i = 0; i < TM; ++i) i8leaf::load_a(af[0][i], As, wm * (TM * 16) + i * 16, 0, kStride, half);
+#else
 #pragma unroll
     for (int i = 0; i < TM; ++i)
       af[0][i] = *reinterpret_cast<const i8leaf::v4i*>(As + (wm * (TM * 16) + i * 16 + frag_r) * kStride);
+#endif
 #pragma unroll
     for (int j = 0; j < TN; ++j)
       bf[0][j] = *reinterpret_cast<const i8leaf::v4i*>(Bs + (wn * (TN * 16) + j * 16 + frag_r) * kStride);
@@ -151,9 +270,14 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void int8_gemm_tiled(
       const int cur = kk & 1, nxt = cur ^ 1;
       if (kk + 1 < kSteps) {
         const int kb = (kk + 1) * 16;
+#if defined(__GFX10__)
+#pragma unroll
+        for (int i = 0; i < TM; ++i) i8leaf::load_a(af[nxt][i], As, wm * (TM * 16) + i * 16, kb, kStride, half);
+#else
 #pragma unroll
         for (int i = 0; i < TM; ++i)
           af[nxt][i] = *reinterpret_cast<const i8leaf::v4i*>(As + (wm * (TM * 16) + i * 16 + frag_r) * kStride + kb);
+#endif
 #pragma unroll
         for (int j = 0; j < TN; ++j)
           bf[nxt][j] = *reinterpret_cast<const i8leaf::v4i*>(Bs + (wn * (TN * 16) + j * 16 + frag_r) * kStride + kb);
@@ -225,8 +349,10 @@ void int8_gemm(hip_block::bf16_bits* y, std::int64_t ldy, const std::int8_t* x, 
     const int xn = std::min(kChunk, gx - x0);
     dim3 grid(gy, xn, 1);  // x = N blocks, y = M blocks (matches the kernel's grouped ordering)
     // Deep K: the 128-thread 4x4 fragment grid has the highest matrix density and the LDS reads are amortised. Shallow
-    // K: the 512-thread 2x2 grid yields more blocks to interleave across the GPU's WGPs.
-    if (deep) {
+    // K: the 512-thread 2x2 grid yields more blocks to interleave across the GPU's WGPs. RDNA2 runs the VALU tile.
+    if (device_is_rdna2()) {
+      hip_block::int8_gemm_valu<<<grid, 256, 0, stream>>>(a, xn);
+    } else if (deep) {
       hip_block::int8_gemm_tiled<128, 128, 128, 2, 2, 4, 4><<<grid, 128, 0, stream>>>(a, xn);
     } else {
       hip_block::int8_gemm_tiled<128, 128, 64, 4, 4, 2, 2><<<grid, 512, 0, stream>>>(a, xn);

@@ -18,6 +18,7 @@
 #include "gemm_tile.h"
 #include "hip_block.h"
 #include "mma_leaf.h"
+#include "runtime.h"
 
 namespace hip_block {
 namespace {
@@ -418,7 +419,10 @@ __global__ __launch_bounds__(kWave) void attention_kernel(const AttnArgs a) {
 
 }  // namespace
 
-const char* leaf_name() { return leaf::kName; }
+const char* leaf_name() {
+  // This is a host-only accessor: the device pass's leaf name is not what runs on the host's current device.
+  return mi::hip::device_is_rdna2() ? "RDNA2 v_dot2_f32_f16 (bf16 to fp16), emulated 16x16x16 leaf" : leaf::kName;
+}
 
 void pack_fragments(bf16_bits* to, const bf16_bits* from, std::int64_t ld, std::int64_t rows, std::int64_t rows_padded, int cols,
                     hipStream_t stream) {

@@ -1,12 +1,18 @@
 # MOSS-Image HIP backend
 
-Native HIP inference for MOSS-Image on AMD RDNA3/RDNA4 GPUs (`HIP_TARGET`: gfx1100, gfx1103,
-gfx1200, gfx1201), built with ROCm 7 (TheRock on Windows). It is the AMD counterpart of the CUDA
+Native HIP inference for MOSS-Image on AMD RDNA2/RDNA3/RDNA4 GPUs (`HIP_TARGET`: gfx1035, gfx1100,
+gfx1103, gfx1200, gfx1201), built with ROCm 7 (TheRock on Windows). One build can hold several
+architectures in a single executable, e.g. `gfx1103;gfx1035`. It is the AMD counterpart of the CUDA
 and Vulkan backends.
+
+RDNA2 (gfx1035) has neither matrix cores nor bf16 instructions. There the bf16 GEMMs convert their
+operands to fp16 and use `V_DOT2_F32_F16`, the INT8 GEMM uses `V_DOT4_I32_I8` in comfy-kitchen's
+gfx1035 VALU tile, and the DiT attention uses the shared bf16 attention kernel rather than the
+WMMA-only int8 SageAttention. The gfx1103 (and other matrix-core) paths are unchanged.
 
 ## Features
 
-- `--tier high`: INT8 ConvRot DiT with native gfx11 WMMA intrinsics
+- `--tier high`: INT8 ConvRot DiT with native gfx11 WMMA intrinsics (RDNA3/4) or RDNA2 dot-product kernels
 - Runtime LoRA on all four DiT GEMMs; the delta is fused into the base GEMM's
   fp32 accumulator before bf16 rounding
 - INT8 SageAttention-style attention (QK and PV, u8 probabilities)

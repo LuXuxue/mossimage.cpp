@@ -6,9 +6,12 @@ MOSS-Image's native kernels for AMD GPUs through ROCm, and the same sources thro
 |---|---|---|
 | `gfx1100` (RDNA3) | ROCm clang | rocWMMA, `v_wmma_f32_16x16x16_bf16` |
 | `gfx1200`, `gfx1201` (RDNA4) | ROCm clang | rocWMMA, `v_wmma_f32_16x16x16_bf16` |
+| `gfx1035` (RDNA2) | ROCm clang | `v_dot2_f32_f16` on bf16 converted to fp16; `v_dot4_i32_i8` for the INT8 GEMM |
 | `nvidia` | nvcc with HIP's NVIDIA headers | scalar: the exact bf16*bf16 product in fp32, then add, K ascending |
 
-An AMD build holds a code object for each architecture in `HIP_TARGET` (a CMake list) and runs on those only; the release package's `moss-infer-hip` holds all three. It needs ROCm 7 at run time (`libamdhip64.so.7`). Every kernel launches workgroups of one wave (32 threads) and depends on that (`mma_leaf.h`).
+RDNA2 has no matrix cores and no bf16 instructions: `mma_leaf.h` converts bf16 operands to fp16 on load and accumulates with fp16 dot products, `int8_gemm.hip` uses comfy-kitchen's gfx1035 VALU tile with `V_DOT4_I32_I8`, and the DiT's attention uses the bf16 attention of `block_kernels.hip` instead of the WMMA-only int8 SageAttention. The other GEMM kernels keep their usual shapes; the only runtime dispatch is the current device's architecture (`device_is_rdna2()`).
+
+An AMD build holds a code object for each architecture in `HIP_TARGET` (a CMake list) and runs on those only; a build with `gfx1103` and `gfx1035` produces one exe for both. It needs ROCm 7 at run time (`libamdhip64.so.7`). Every kernel launches workgroups of one wave (32 threads) and depends on that (`mma_leaf.h`). On Windows, clang-cl's `/Fo` makes the ROCm driver duplicate one architecture's code object under every target name, so the CMake compile rule is changed to use `-o`.
 
 ## Files
 
@@ -18,7 +21,7 @@ An AMD build holds a code object for each architecture in `HIP_TARGET` (a CMake 
 | `gemm_tile.h` | The per-wave GEMM walk the kernel sources share: fragment loads with zero-padded tails, the K-ascending walk over row-major or packed operands, the 2D block order of the tiles, the GEMM kernel and its epilogues (plain, gated residual, bias, bias then residual add), launch helpers. |
 | `dit_kernels.h`, `dit_kernels.hip` | The DiT's ops outside its blocks: the linears with a bias, the text refiner's un-modulated RMSNorm, SiLU, SiTU-GLU over a `[hidden \| gate]` GEMM output. |
 | `dit.h`, `dit.cpp` | The whole MOSS-Image DiT (below). |
-| `mma_leaf.h`, `device_math.h` | The 16x16x16 leaf, and the bf16 conversions and rounded fp32 operations every kernel uses. |
+| `mma_leaf.h`, `device_math.h` | The 16x16x16 leaves (gfx11 WMMA, RDNA2 dot products, NVIDIA scalar) and the bf16 conversions and rounded fp32 operations every kernel uses. |
 | `runtime.h` | `mi::hip`: device listing and choice, device and pinned host buffers, streams, events, error checks. |
 | `safetensors.h`, `npy.h`, `half.h` | Host-only: the safetensors reader (one file or a sharded directory), the `.npy` reader and writer of the checks, fp16/bf16 conversions. |
 | `vae.h`, `vae.cpp` | The FLUX.2 VAE decoder at the engine's reference precision: the final latents [128, h, w] to RGB8 [16h, 16w, 3]. `workspace_bytes(h, w)` is its device memory (1.50 GiB at 1024x1024, 3.04 GiB at 1456x1456, 6.02 GiB at 2048x2048, plus 113 MB of weights); `decode()` refuses a size the device cannot hold, or past the kernels' limits, before it runs. |

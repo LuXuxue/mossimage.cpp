@@ -53,10 +53,19 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b,
     case 2:  // qk norm + rope (in place on qkv)
       qk_norm_rope(b.qkv, kQkv, tokens, kHeads, w.q_norm, w.k_norm, b.rope, kHead, stream);
       break;
-    case 3:  // attention: int8 QK + int8 PV, comfy-kitchen's gfx1103 SageAttention path
-      int8_attn_quantize(b.qkv, kQkv, ib.attn, static_cast<int>(tokens), stream);
-      int8_attn_run(ib.attn, b.attn, kDim, b.max_seqlen,
-                    static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHead))), stream);
+    case 3:  // attention: int8 QK + int8 PV on gfx11; bf16 attention on RDNA2 (no WMMA for the int8 SageAttention)
+      if (device_is_rdna2()) {
+        // b.qkv holds [tokens, 3*kDim] bf16: q at 0, k at kDim, v at 2*kDim, heads kHead apart. The shared bf16
+        // attention walks it with the same cu_seqlens and writes the same compact [tokens, kDim] output.
+        attention({b.qkv, b.qkv + kDim, b.qkv + 2 * kDim, b.attn, kQkv, kQkv, kQkv, kDim,
+                   kHead, kHead, kHead, kHead, b.cu_seqlens, b.cu_seqlens, b.batch, b.max_seqlen,
+                   kHeads, static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHead)))},
+                  stream);
+      } else {
+        int8_attn_quantize(b.qkv, kQkv, ib.attn, static_cast<int>(tokens), stream);
+        int8_attn_run(ib.attn, b.attn, kDim, b.max_seqlen,
+                      static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHead))), stream);
+      }
       break;
     case 4:  // x += int8_gemm(rotate_quantize(attn)) * gate_msa
       rotate_quantize(b.attn, kDim, tokens, kDim, ib.i8_y, kDim, ib.scale, stream);
