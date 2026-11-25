@@ -79,15 +79,9 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
   if (r.decode) {
     vae.emplace(device, component(r.vae_file, "vae/diffusion_pytorch_model.safetensors"));
     vae->set_profile(std::getenv("MI_HIP_VAE_PROFILE") != nullptr);
-    vae->require_fits(lh, lw);  // also refuses a size past the decoder's limits
-    if (const std::uint64_t need = vae->weight_bytes() + vae->workspace_bytes(lh, lw); r.vram_budget != 0 && need > r.vram_budget) {
-      char msg[256];
-      std::snprintf(msg, sizeof msg,
-                    "the VAE decode of a %ux%u image needs %.2f GiB of device memory with its weights, more than a VRAM "
-                    "budget of %.2f GiB",
-                    r.width, r.height, gib(need), gib(r.vram_budget));
-      throw std::runtime_error(msg);
-    }
+    // Validate the size and remember the full-decode footprint. A device that cannot hold it is not refused here:
+    // decode() falls back to the ComfyUI-style tiled decode (the text encoder and DiT have already been freed).
+    (void)vae->workspace_bytes(lh, lw);
   }
 
   // The DiT's plan for the prompts' lengths: what it holds beside its weights, the steps' activations, the refiner's
@@ -266,7 +260,20 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
   if (r.decode) {
     const double t0 = now_s();
     report("vae", 0, 1);
-    const auto vst = vae->decode(out.latents.data(), lh, lw, out.rgb);
+    VaeDecodeStats vst;
+    const bool force_tiled = std::getenv("MI_HIP_VAE_TILED") != nullptr;
+    try {
+      if (force_tiled) throw std::runtime_error("tiled decode requested");
+      vst = vae->decode(out.latents.data(), lh, lw, out.rgb);
+    } catch (const std::runtime_error& e) {
+      std::fprintf(stderr, "moss-infer-hip: full VAE decode (%s); decoding in tiles\n", e.what());
+      int tile_px = 512, overlap_px = 128;
+      if (const char* tp = std::getenv("MI_HIP_VAE_TILE_PX")) tile_px = std::atoi(tp);
+      if (const char* opx = std::getenv("MI_HIP_VAE_OVERLAP_PX")) overlap_px = std::atoi(opx);
+      vst = vae->decode_tiled(out.latents.data(), lh, lw, out.rgb, nullptr,
+                              static_cast<std::uint32_t>(std::max(tile_px, 32)),
+                              static_cast<std::uint32_t>(std::max(overlap_px, 0)));
+    }
     if (!vst.profile.empty()) {
       std::fprintf(stderr, "[vae-op]");
       for (const auto& [name, ms] : vst.profile) std::fprintf(stderr, " %s=%.0fms", name.c_str(), ms);

@@ -499,6 +499,8 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
     scratch(i8_k_scale_, padded / 16 * hip_block::kHeads * sizeof(float));
     scratch(i8_v_scale_, h * sizeof(float));
     scratch(i8_part_, ((static_cast<std::size_t>(total) + 255) / 256) * h * sizeof(float));
+    if (device_is_rdna2())
+      scratch(i8_v_fp16_, int8_attn_fp16_v_bytes(static_cast<int>(total), static_cast<int>(rows.size())));
   }
   if (options_.lora != nullptr && options_.lora->loaded()) {
     scratch(lora_t32_, total * options_.lora->max_rank() * kBf16);
@@ -596,6 +598,7 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
         ib.attn.k_scale = i8_k_scale_.as<float>();
         ib.attn.v_scale = i8_v_scale_.as<float>();
         ib.attn.part = i8_part_.as<float>();
+        ib.attn.v_fp16 = i8_v_fp16_.as<std::uint16_t>();
         ib.attn.cu = cu.as<std::int32_t>() + run.cu_at;
         ib.attn.batch = b.batch;
         ib.attn.padded = static_cast<int>(int8_attn_padded(static_cast<int>(total),

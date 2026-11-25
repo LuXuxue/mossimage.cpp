@@ -7,10 +7,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "int8_attn.h"
 #include "runtime.h"
+#include "sage_attn_gfx103x.h"
 
 using namespace mi::hip;
 using bf16 = i8attn_bf16;
@@ -66,7 +68,17 @@ int main(int argc, char** argv) {
   ds.upload(cu, sizeof(cu), reinterpret_cast<std::uint8_t*>(const_cast<std::int32_t*>(b.cu)) -
                                 reinterpret_cast<std::uint8_t*>(ds.data()));
   int8_attn_quantize(dq.as<bf16>(), 3 * dim, b, T, st);
-  int8_attn_run(b, dout.as<bf16>(), dim, T, static_cast<float>(1.0 / std::sqrt(double(D))), st);
+  const bool gfx103x = std::getenv("MI_I8ATTN_BACKEND") != nullptr &&
+                       std::string(std::getenv("MI_I8ATTN_BACKEND")) == "gfx103x";
+  if (gfx103x) {
+    DeviceBuffer dv_fp16(int8_attn_fp16_v_bytes(T, 1));
+    gfx103x_v_to_fp16(dq.as<bf16>(), 3 * dim, b.cu, dv_fp16.as<std::uint16_t>(), T, 1, st);
+    gfx103x_attn({b.q, b.k, dv_fp16.as<std::uint16_t>(), dout.as<bf16>(), b.q_scale, b.k_scale,
+                  static_cast<std::int64_t>(heads) * D, heads, heads, dim, b.cu, 1, T, heads,
+                  static_cast<float>(1.0 / std::sqrt(double(D)) * 1.4426950408889634)}, st);
+  } else {
+    int8_attn_run(b, dout.as<bf16>(), dim, T, static_cast<float>(1.0 / std::sqrt(double(D))), st);
+  }
   if (std::getenv("MI_I8ATTN_BENCH")) {
     hipDeviceSynchronize();
     const int iters = 20;

@@ -70,9 +70,9 @@ list(APPEND MI_HIP_WARN -ffp-contract=off)
 # Kernel sources. block_kernels.hip is the DiT block (tools/hip_block checks it against the engine); dit_kernels.hip the
 # DiT's other ops; te_kernels.hip the text encoder's; vae_kernels.hip the VAE decoder's.
 set(MI_HIP_KERNELS block_kernels.hip dit_kernels.hip te_kernels.hip te_dequant.hip vae_kernels.hip int8_gemm.hip rotate_quantize.hip
-                    int8_block.hip int8_attn.hip bf16_gemm.hip lora.hip)
+                    int8_block.hip int8_attn.hip bf16_gemm.hip lora.hip sage_attn_gfx103x.hip)
 set(MI_HIP_KERNEL_HEADERS device_math.h dit_kernels.h gemm_tile.h hip_block.h mma_leaf.h te_kernels.h vae_kernels.h
-                           int8_leaf.h int8_block.h int8_gemm.h int8_attn.h bf16_gemm.h lora.h)
+                           int8_leaf.h int8_block.h int8_gemm.h int8_attn.h bf16_gemm.h lora.h sage_attn_gfx103x.h)
 set(MI_HIP_HOST runtime.cpp safetensors.cpp dit.cpp text_encoder.cpp vae.cpp generate.cpp lora.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../src/weights/quant/quant_codec.cpp)
 
@@ -119,6 +119,15 @@ else()
     set_property(SOURCE ${_src} PROPERTY COMPILE_OPTIONS
       -I${CMAKE_CURRENT_SOURCE_DIR}/compat -x hip -std=c++17 ${MI_HIP_FLAGS} ${MI_HIP_WARN})
   endforeach()
+  # The RDNA2 attention is tuned with comfy-kitchen's exact flag set: no -ffp-contract=off and a few LLVM knobs.
+  # Per-source options replace the warnings list, so keep everything else from MI_HIP_FLAGS.
+  set_property(SOURCE sage_attn_gfx103x.hip PROPERTY COMPILE_OPTIONS
+    -I${CMAKE_CURRENT_SOURCE_DIR}/compat -x hip -std=c++17 ${MI_HIP_FLAGS}
+    -ffast-math -fgpu-flush-denormals-to-zero -fno-offload-uniform-block
+    -mllvm=--lsr-drop-solution=1 -mllvm=-enable-post-misched=1
+    -mllvm=-amdgpu-early-inline-all=true -mllvm=-amdgpu-function-calls=false
+    -mllvm=-amdgpu-max-memory-clause=32 -mllvm=-amdgpu-vgpr-index-mode=1
+    -Wall -Wextra -Wno-sign-conversion)
   set_property(SOURCE ${MI_HIP_HOST} PROPERTY COMPILE_OPTIONS ${MI_HIP_WARN})
 
   add_library(mossinfer_hip STATIC ${MI_HIP_KERNELS} ${MI_HIP_HOST})

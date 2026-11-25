@@ -522,4 +522,78 @@ VaeDecodeStats VaeDecoder::decode(const float* latents, std::uint32_t h, std::ui
   return st;
 }
 
+VaeDecodeStats VaeDecoder::decode_tiled(const float* latents, std::uint32_t h, std::uint32_t w,
+                                        std::vector<std::uint8_t>& rgb, std::vector<float>* image,
+                                        std::uint32_t tile_px, std::uint32_t overlap_px) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const int H = static_cast<int>(16 * h), W = static_cast<int>(16 * w);
+  const int tl = std::max(4, static_cast<int>(tile_px / 16));
+  const int ol = std::max(0, std::min(tl / 4, static_cast<int>(overlap_px / 16)));
+  const int step = tl - ol;
+  const int channels = 128;
+  rgb.assign(static_cast<std::size_t>(H) * W * 3, 0);
+  std::vector<float> weight(static_cast<std::size_t>(H) * W, 0.0f), tile_image;
+  std::vector<float> acc_rgb(static_cast<std::size_t>(H) * W * 3, 0.0f);
+  if (image != nullptr) image->assign(static_cast<std::size_t>(H) * W * 3, 0.0f);
+  std::vector<std::uint8_t> tile_rgb;
+  std::vector<float> crop(static_cast<std::size_t>(channels) * tl * tl);
+  VaeDecodeStats st;
+
+  constexpr double kPi = 3.14159265358979323846;
+  const auto ramp = [ol, kPi](int pos, int size, int tile_start, int tile_len) -> float {
+    // 1 inside the tile, a half-cosine rise/fall over the overlap on interior edges.
+    const int t = pos - tile_start;
+    const int feather = ol * 16;
+    if (feather == 0) return 1.0;
+    double v = 1.0;
+    // A half-weight at the tile edge so the neighbouring tile's edge sums to one there, rising to one over the feather.
+    if (tile_start > 0 && t < feather) v = std::min(v, 0.5f + 0.5f * std::sin(kPi * t / (2.0 * feather)));
+    if (tile_start + tile_len * 16 < size && t >= tile_len * 16 - feather)
+      v = std::min(v, 0.5f + 0.5f * std::sin(kPi * (tile_len * 16 - 1 - t) / (2.0 * feather)));
+    return static_cast<float>(v);
+  };
+
+  for (int y0 = 0; y0 < static_cast<int>(h); y0 += step) {
+    const int th = std::min(tl, static_cast<int>(h) - y0);
+    for (int x0 = 0; x0 < static_cast<int>(w); x0 += step) {
+      const int tw = std::min(tl, static_cast<int>(w) - x0);
+      // NCHW crop of the latent tile.
+      for (int c = 0; c < channels; ++c) {
+        const float* src = latents + static_cast<std::size_t>(c) * h * w;
+        float* dst = crop.data() + static_cast<std::size_t>(c) * th * tw;
+        for (int y = 0; y < th; ++y)
+          std::memcpy(dst + static_cast<std::size_t>(y) * tw, src + static_cast<std::size_t>(y0 + y) * w + x0,
+                      static_cast<std::size_t>(tw) * sizeof(float));
+      }
+      const auto ts = decode(crop.data(), static_cast<std::uint32_t>(th), static_cast<std::uint32_t>(tw), tile_rgb,
+                             image != nullptr ? &tile_image : nullptr);
+      st.seconds += ts.seconds;
+      if (ts.device_bytes > st.device_bytes) st.device_bytes = ts.device_bytes;
+      for (int y = 0; y < th * 16; ++y) {
+        const float wy = ramp(y, H, y0 * 16, th);
+        for (int x = 0; x < tw * 16; ++x) {
+          const float wgt = wy * ramp(x, W, x0 * 16, tw);
+          const std::size_t p = static_cast<std::size_t>(y0 * 16 + y) * W + x0 * 16 + x;
+          const std::size_t tp = static_cast<std::size_t>(y) * tw * 16 + x;
+          weight[p] += wgt;
+          for (int k = 0; k < 3; ++k) {
+            acc_rgb[p * 3 + k] += tile_rgb[tp * 3 + k] * wgt;
+            if (image != nullptr) (*image)[p * 3 + k] += tile_image[tp * 3 + k] * wgt;
+          }
+        }
+      }
+    }
+  }
+  for (std::size_t p = 0; p < weight.size(); ++p) {
+    const float inv = weight[p] > 1.0e-6f ? 1.0f / weight[p] : 1.0f;
+    for (int k = 0; k < 3; ++k) {
+      rgb[p * 3 + k] = static_cast<std::uint8_t>(std::max(0.0f, std::min(255.0f, acc_rgb[p * 3 + k] * inv)));
+      if (image != nullptr) (*image)[p * 3 + k] *= inv;
+    }
+  }
+  st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  if (profile_) st.profile = {};
+  return st;
+}
+
 }  // namespace mi::hip

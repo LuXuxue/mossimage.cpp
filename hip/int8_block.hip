@@ -18,6 +18,7 @@
 #include "runtime.h"
 #include "int8_attn.h"
 #include "int8_gemm.h"
+#include "sage_attn_gfx103x.h"
 #include "rotate_quantize.hip"
 
 namespace mi::hip {
@@ -55,12 +56,14 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b,
       break;
     case 3:  // attention: int8 QK + int8 PV on gfx11; bf16 attention on RDNA2 (no WMMA for the int8 SageAttention)
       if (device_is_rdna2()) {
-        // b.qkv holds [tokens, 3*kDim] bf16: q at 0, k at kDim, v at 2*kDim, heads kHead apart. The shared bf16
-        // attention walks it with the same cu_seqlens and writes the same compact [tokens, kDim] output.
-        attention({b.qkv, b.qkv + kDim, b.qkv + 2 * kDim, b.attn, kQkv, kQkv, kQkv, kDim,
-                   kHead, kHead, kHead, kHead, b.cu_seqlens, b.cu_seqlens, b.batch, b.max_seqlen,
-                   kHeads, static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHead)))},
-                  stream);
+        // The comfy-kitchen gfx103x int8 attention: Q/K come from the same quantized buffers as the gfx11 path,
+        // V is copied to fp16, and cu_seqlens is read on device so each sequence keeps its own padded columns.
+        int8_attn_quantize(b.qkv, kQkv, ib.attn, static_cast<int>(tokens), stream);
+        gfx103x_v_to_fp16(b.qkv, kQkv, b.cu_seqlens, ib.attn.v_fp16, static_cast<int>(tokens), b.batch, stream);
+        gfx103x_attn({ib.attn.q, ib.attn.k, ib.attn.v_fp16, b.attn, ib.attn.q_scale, ib.attn.k_scale,
+                      kHeads * kHead, kHeads, kHeads, kDim, b.cu_seqlens, b.batch, b.max_seqlen, kHeads,
+                      static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHead)) * 1.4426950408889634)},
+                     stream);
       } else {
         int8_attn_quantize(b.qkv, kQkv, ib.attn, static_cast<int>(tokens), stream);
         int8_attn_run(ib.attn, b.attn, kDim, b.max_seqlen,

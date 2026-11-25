@@ -60,6 +60,12 @@ class VaeDecoder {
   // decoder's fp32 output [16h, 16w, 3] before the clamp. Runs on its own stream and returns when the RGB is on the host.
   VaeDecodeStats decode(const float* latents, std::uint32_t h, std::uint32_t w, std::vector<std::uint8_t>& rgb,
                         std::vector<float>* image = nullptr);
+  // ComfyUI-style overlap-and-blend fallback for a device that cannot hold the full decode. Each tile is decoded on
+  // its own (so GroupNorm and the mid attention see only the tile) and the RGB tiles are feathered with a cosine ramp.
+  // tile_px and overlap_px are pixel (not latent) sizes, rounded down to multiples of 16.
+  VaeDecodeStats decode_tiled(const float* latents, std::uint32_t h, std::uint32_t w,
+                              std::vector<std::uint8_t>& rgb, std::vector<float>* image = nullptr,
+                              std::uint32_t tile_px = 512, std::uint32_t overlap_px = 128);
 
   struct Weights;
 

@@ -119,7 +119,7 @@ class Dit {
   DeviceBuffer x_, y_, qkv_, attn_, ffn_, rope_, tokens_, proj_, up_gate_, embeds_, pack_, pack_attn_, cu_;
   DeviceBuffer mod_, head_, t_in_, hidden_, time_;
   DeviceBuffer i8_y_, i8_ffn_, i8_scale_, i8_ug_;  // the INT8 block's scratch
-  DeviceBuffer i8_q_, i8_k_, i8_v_, i8_q_scale_, i8_k_scale_, i8_v_scale_, i8_part_;
+  DeviceBuffer i8_q_, i8_k_, i8_v_, i8_q_scale_, i8_k_scale_, i8_v_scale_, i8_part_, i8_v_fp16_;
   DeviceBuffer lora_t32_, lora_delta_;  // the LoRA side branch: x · Aᵀ and (x · Aᵀ) · Bᵀ
 
   std::vector<std::unique_ptr<Event>> events_;  // time_ops

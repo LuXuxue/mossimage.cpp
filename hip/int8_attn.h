@@ -30,6 +30,7 @@ struct Int8AttnBuffers {
   float* k_scale = nullptr;       // [padded / 16, kHeads]
   float* v_scale = nullptr;       // [kHeads * kHeadDim]
   float* part = nullptr;          // [ceil(tokens / 256), kHeads * kHeadDim] partial V amax
+  std::uint16_t* v_fp16 = nullptr; // RDNA2: fp16 V, [padded, kHeads * kHeadDim], same row stride as q/k
   const std::int32_t* cu = nullptr;  // [batch + 1] cu_seqlens of this run (already on the device)
   int batch = 0;
   int padded = 0;
@@ -39,6 +40,11 @@ struct Int8AttnBuffers {
 inline std::size_t int8_attn_padded(int tokens, int batch) {
   const std::size_t t = static_cast<std::size_t>(tokens);
   return ((t + 63u) / 64u) * 64u + 64u * static_cast<std::size_t>(batch);
+}
+
+// Extra scratch for the RDNA2 attention's fp16 V copy.
+inline std::size_t int8_attn_fp16_v_bytes(int tokens, int batch) {
+  return int8_attn_padded(tokens, batch) * static_cast<std::size_t>(hip_block::kHeads) * hip_block::kHeadDim * 2u;
 }
 
 inline std::size_t int8_attn_bytes(int tokens, int batch) {
