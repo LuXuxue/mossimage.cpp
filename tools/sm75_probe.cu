@@ -8,6 +8,8 @@
 //   alu   raw dependent-chain throughput: fp32 FMA, fp16x2 FMA, INT32 DP4A, INT32 MAD
 //   gemm  cuBLASLt fp32 / fp16 / bf16 and the engine's bf16->fp16 GEMM, plus CUTLASS INT8 ConvRot GEMM
 //   dp4a  hand-written tiled DP4A INT8 GEMM (native instruction) vs the CUTLASS m8n8k16 (emulated MMA) path
+//   gemmepi  CUTLASS fused INT8 epilogues vs DP4A plain GEMM + SIMT epilogue (bit-exactness and timing)
+//   q8bench  q8 attention QK: emulated m8n8k16 MMA vs native DP4A
 //   attn  the sm_75 exact attention kernel at engine shapes
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -29,6 +31,7 @@
 #include "kernels/attention/flash_attention.h"
 #include "kernels/attention_q8/attention_q8.h"
 #include "kernels/basic/gemm.h"
+#include "kernels/basic/elementwise.h"
 #include "kernels/quant/quant.h"
 #include "kernels/sm75/sm75.h"
 
@@ -728,6 +731,84 @@ void q8_bench(int len, int heads, int kv, int iters) {
               flops / (ms * 1e-3) / 1e12);
 }
 
+
+// The fused INT8 epilogues still go through CUTLASS m8n8k16 (emulated MMA on TU117). Compare them with the same
+// epilogue done as a native-DP4A plain GEMM plus the existing SIMT elementwise kernel (the LoRA side-branch path).
+void gemm_epi() {
+  constexpr int M = 256, N = 1536, K = 3072, F = N / 2;
+  std::vector<std::int8_t> xv(static_cast<std::size_t>(M) * K), wv(static_cast<std::size_t>(N) * K);
+  std::vector<float> xs(M), ws(N);
+  std::uint64_t seed = 131;
+  auto next = [&seed]() {
+    seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+    return static_cast<std::uint32_t>(seed >> 33);
+  };
+  for (auto& v : xv) v = static_cast<std::int8_t>(static_cast<int>(next() % 255) - 127);
+  for (auto& v : wv) v = static_cast<std::int8_t>(static_cast<int>(next() % 255) - 127);
+  for (auto& v : xs) v = 0.001f + static_cast<float>(next() % 1000) * 1e-5f;
+  for (auto& v : ws) v = 0.0005f + static_cast<float>(next() % 1000) * 1e-5f;
+  const auto bias_f = normal(N, 132, 0.05f), gate_f = normal(N, 133, 0.7f), res_f = normal(M * N, 134, 1.f);
+  std::vector<std::uint16_t> bb(N), gb(N), rb(M * N);
+  for (int i = 0; i < N; ++i) {
+    bb[i] = float_to_bf16_bits(bias_f[i]);
+    gb[i] = float_to_bf16_bits(gate_f[i]);
+  }
+  for (std::size_t i = 0; i < rb.size(); ++i) rb[i] = float_to_bf16_bits(res_f[i]);
+
+  DevBuf dx(xv.size()), dw(wv.size()), dxs(xs.size() * 4), dws(ws.size() * 4), db(bb.size() * 2),
+      dg(gb.size() * 2), dr(rb.size() * 2), dr2(rb.size() * 2), dtmp(static_cast<std::size_t>(M) * N * 2),
+      dtmp2(static_cast<std::size_t>(M) * N * 2), dsitu1(static_cast<std::size_t>(M) * F * 2),
+      dsitu2(static_cast<std::size_t>(M) * F * 2);
+  dx.upload(xv); dw.upload(wv); dxs.upload(xs); dws.upload(ws);
+  db.upload(bb); dg.upload(gb); dr.upload(rb); dr2.upload(rb);
+  mi::kernels::quant::Int8Operands op;
+  op.x_q = static_cast<const std::int8_t*>(dx.get()); op.ldx = K;
+  op.x_scale = static_cast<const float*>(dxs.get());
+  op.w = static_cast<const std::int8_t*>(dw.get()); op.w_scale = static_cast<const float*>(dws.get());
+  op.m = M; op.n = N; op.k = K;
+  auto t = [](void* p, DType dt, std::initializer_list<std::int64_t> sh) {
+    return Tensor::view(p, dt, Device::kCUDA, sh);
+  };
+  const Tensor gate = t(dg.get(), DType::kBF16, {N});
+  const Tensor res = t(dr.get(), DType::kBF16, {M, N});
+  const Tensor res2 = t(dr2.get(), DType::kBF16, {M, N});
+  const Tensor tmp = t(dtmp.get(), DType::kBF16, {M, N});
+  const Tensor tmp2 = t(dtmp2.get(), DType::kBF16, {M, N});
+  const auto bias = static_cast<const __nv_bfloat16*>(db.get());
+  const auto gptr = static_cast<const __nv_bfloat16*>(dg.get());
+  const auto fused_res = [&] {
+    mi::kernels::quant::int8_gemm_gated_residual(op, bias, gptr, static_cast<__nv_bfloat16*>(dr.get()), N, nullptr);
+  };
+  const auto split_res = [&] {
+    mi::kernels::quant::int8_gemm(op, bias, static_cast<__nv_bfloat16*>(dtmp.get()), N, nullptr);
+    mi::kernels::gated_residual(res2, tmp, gate, res2, nullptr);
+  };
+  fused_res(); split_res();
+  MI_CUDA_CHECK(cudaDeviceSynchronize());
+  const auto a = dr.download<std::uint16_t>(M * N), b = dr2.download<std::uint16_t>(M * N);
+  int bad = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) bad += a[i] != b[i];
+  const double fused_ms = bench(fused_res, 10, 3), split_ms = bench(split_res, 10, 3);
+  std::printf("gated_residual M%d N%d K%d: CUTLASS %7.3f ms  DP4A+SIMT %7.3f ms  %5.2fx  diffs %d\n", M, N, K,
+              fused_ms, split_ms, fused_ms / split_ms, bad);
+
+  const auto fused_situ = [&] {
+    mi::kernels::quant::int8_gemm_situ_glu(op, static_cast<__nv_bfloat16*>(dsitu1.get()), F, nullptr);
+  };
+  const auto split_situ = [&] {
+    mi::kernels::quant::int8_gemm(op, nullptr, static_cast<__nv_bfloat16*>(dtmp2.get()), N, nullptr);
+    mi::kernels::situ_glu(tmp2, t(dsitu2.get(), DType::kBF16, {M, F}), nullptr);
+  };
+  fused_situ(); split_situ();
+  MI_CUDA_CHECK(cudaDeviceSynchronize());
+  const auto c = dsitu1.download<std::uint16_t>(M * F), d = dsitu2.download<std::uint16_t>(M * F);
+  int bad2 = 0;
+  for (std::size_t i = 0; i < c.size(); ++i) bad2 += c[i] != d[i];
+  const double fs = bench(fused_situ, 10, 3), ss = bench(split_situ, 10, 3);
+  std::printf("situ_glu      M%d N%d K%d: CUTLASS %7.3f ms  DP4A+SIMT %7.3f ms  %5.2fx  diffs %d\n", M, N, K,
+              fs, ss, fs / ss, bad2);
+}
+
 void attention() {
   const auto run = [](int len, int heads, int kv, int dim, bool causal, int iters) {
     const auto q = normal(static_cast<std::size_t>(len) * heads * dim, 71, 1.f);
@@ -906,7 +987,11 @@ int main(int argc, char** argv) {
         dp4a_shape(1024, 3072, 8192, false);
       }
     }
-    if (what == "q8bench") {
+    if (what == "gemmepi") {
+    gemm_epi();
+    return 0;
+  }
+  if (what == "q8bench") {
     q8_bench(4113, 24, 24, 5);
     q8_bench(266, 24, 24, 30);
     return 0;

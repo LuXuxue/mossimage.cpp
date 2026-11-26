@@ -6,7 +6,10 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
+#include "core/tensor.h"
+#include "kernels/basic/elementwise.h"
 #include "kernels/quant/int8_gemm_impl.cuh"
 
 namespace mi::kernels::sm75 {
@@ -140,35 +143,56 @@ void plain(const qd::Problem& p, const quant::Int8Operands& a, const __nv_bfloat
   MI_CUDA_CHECK_LAUNCH();
 }
 
+// The same approach as the runtime-LoRA side branch: run the GEMM with native DP4A into a temporary bf16 matrix,
+// then apply the bit-exact SIMT epilogue. The probe (sm75_probe gemmepi) shows 1.4-1.55x over the emulated-MMA
+// CUTLASS epilogues with bit-identical output. One scratch buffer per stream: a stream's calls are ordered, and
+// separate streams never share a buffer. sm_75 does not capture these blocks into CUDA graphs.
+void* scratch(cudaStream_t stream, std::size_t bytes) {
+  static std::mutex mutex;
+  static std::unordered_map<cudaStream_t, std::pair<void*, std::size_t>> buffers;
+  std::lock_guard<std::mutex> lock(mutex);
+  auto& b = buffers[stream];
+  if (b.second < bytes) {
+    if (b.first != nullptr) MI_CUDA_CHECK(cudaFree(b.first));
+    b.first = nullptr;
+    MI_CUDA_CHECK(cudaMalloc(&b.first, bytes));
+    b.second = bytes;
+  }
+  return b.first;
+}
+
+Tensor bf16_view(void* p, std::int64_t rows, std::int64_t cols, std::int64_t ld) {
+  Tensor t;
+  t.data = p;
+  t.dtype = DType::kBF16;
+  t.device = Device::kCUDA;
+  t.rank = 2;
+  t.shape[0] = rows;
+  t.shape[1] = cols;
+  t.stride[0] = ld;
+  t.stride[1] = 1;
+  return t;
+}
+
 void gated_residual(const qd::Problem& p, const quant::Int8Operands& a, const __nv_bfloat16* bias,
                     const __nv_bfloat16* gate, __nv_bfloat16* residual, std::int64_t ldr, cudaStream_t stream) {
-  using N = qd::Nodes<Sm75Tile>;
-  using Gemm = Sm75Kernel<typename N::GatedResidual>;
-  using namespace cute;
-  auto* r = reinterpret_cast<qd::bf16*>(residual);
-  const typename N::GatedResidual::Arguments cb{
-      {{},
-       {const_cast<float*>(a.x_scale), 0.f, {_1{}, _0{}, p.m}},
-       {a.w_scale, 0.f, {_0{}, _1{}, p.n}},
-       {reinterpret_cast<const qd::bf16*>(bias), qd::bf16(0), {_0{}, _1{}, p.n}},
-       {reinterpret_cast<const qd::bf16*>(gate), qd::bf16(0), {_0{}, _1{}, p.n}},
-       {r, qd::bf16(0), {ldr, _1{}, ldr * p.m}},
-       {}},
-      {r, {ldr, _1{}, ldr * p.m}}};
-  qd::launch<Gemm>("sm75::int8_gemm_gated_residual", p, a, cb, stream);
+  if (p.m == 0) return;
+  auto* tmp = static_cast<__nv_bfloat16*>(scratch(stream, static_cast<std::size_t>(p.m) * p.n * 2));
+  plain(p, a, bias, tmp, p.n, stream);
+  const Tensor t = bf16_view(tmp, p.m, p.n, p.n);
+  const Tensor g = bf16_view(const_cast<__nv_bfloat16*>(gate), 1, p.n, p.n);
+  const Tensor r = bf16_view(residual, p.m, p.n, ldr);
+  kernels::gated_residual(r, t, g, r, stream);
 }
 
 void situ_glu(const qd::Problem& p, const quant::Int8Operands& a, __nv_bfloat16* out, std::int64_t ldo,
               cudaStream_t stream) {
-  using N = qd::Nodes<Sm75Tile>;
-  using Gemm = Sm75Kernel<typename N::SituGlu, qd::UpGatePermuteB>;
-  using namespace cute;
-  auto* d = reinterpret_cast<std::uint8_t*>(out);
-  const std::int64_t ldd = 2 * ldo;
-  const typename N::SituGlu::Arguments cb{
-      {{}, {const_cast<float*>(a.x_scale), 0.f, {_1{}, _0{}, p.m}}, {a.w_scale}, situ_tables(stream)},
-      {d, {ldd, _1{}, ldd * p.m}}};
-  qd::launch<Gemm>("sm75::int8_gemm_situ_glu", p, a, cb, stream);
+  if (p.m == 0) return;
+  auto* tmp = static_cast<__nv_bfloat16*>(scratch(stream, static_cast<std::size_t>(p.m) * p.n * 2));
+  plain(p, a, nullptr, tmp, p.n, stream);
+  const Tensor t = bf16_view(tmp, p.m, p.n, p.n);
+  const Tensor o = bf16_view(out, p.m, p.n / 2, ldo);
+  kernels::situ_glu(t, o, stream);
 }
 
 }  // namespace

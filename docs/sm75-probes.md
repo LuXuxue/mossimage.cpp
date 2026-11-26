@@ -110,4 +110,34 @@ query tile in shared memory and each thread sums all 128 K dims of its two query
 The 256² 4-step SFT generation produces **bit-identical latents** to the MMA path and the expected correct image.
 An earlier attempt produced a corrupted image: its row/key indexing happened to match the MMA accumulator layout
 (`q8map` confirmed `row=group`, `key=2*tig+e`) but its operand staging did not follow the PTX fragment layout, so
-scores only matched on iid-random data. The `q8cmp` probe records that mismatch for reference.
+scores only matched on iid-random data. The `q8cmp` probe records that mismatch for reference. Because q8 now works
+on GTX 16xx, an unset attention resolves to `q8_fp16` there, as on other architectures.
+
+## Implemented: DP4A for the fused INT8 epilogues too
+
+`sm75_probe gemmepi` compares each CUTLASS epilogue (`m8n8k16` emulated MMA) with a DP4A plain GEMM into a temporary
+bf16 matrix followed by the existing SIMT `gated_residual` / `situ_glu` kernel, at M=256, N=1536, K=3072:
+
+| Epilogue | CUTLASS | DP4A + SIMT | Speedup | Output differences |
+|---|---:|---:|---:|---:|
+| gated_residual | 2.690 ms | 1.917 ms | 1.40x | 0 |
+| situ_glu | 2.667 ms | 1.718 ms | 1.55x | 0 |
+
+`kernels/sm75/int8_gemm_sm75.cu` now uses that split path for both epilogues (one scratch buffer per stream).
+A no-LoRA 256² 1-step run with pinned host weights went from 2.30 to 1.87 s/step, with a **bit-identical latent**.
+The runtime-LoRA side branch already used the same split path.
+
+## End-to-end speedups beyond the kernels
+
+At 256², 4 steps, seed 42, the same prompt and a warm embedding cache:
+
+| Configuration | s/step | Note |
+|---|---:|---|
+| original (page cache, merged LoRA, exact) | 3.54 | before this branch |
+| q8 default, `balanced` (page cache) | 2.51 | bit-identical PNG to explicit q8 |
+| q8 default, `max_speed` (pinned host) | 2.07 | bit-identical PNG to `balanced` |
+
+`--mode max_speed` keeps 5 of 42 DiT blocks resident in VRAM and copies the rest from a pinned host copy; the
+one-time load grows (39 s vs 9 s) and host RAM rises to ~7 GiB, so it pays off only for repeated generations.
+The fused DiT-block route is unavailable on sm_75 (its bf16 CUTLASS GEMMs need sm_80+ tensor cores) and falls back
+to `op_by_op`; there is no further speedup from that knob.
