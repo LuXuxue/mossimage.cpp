@@ -978,10 +978,18 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
           "runtime LoRAs cannot run on the turbo tier on sm_7x: its INT4 ConvRot weights have no sm_75 side-branch "
           "path and no merge path; use tier high (INT8 ConvRot) or tier reference");
     }
-    r.tier = planner::resolve_tier(m.options.tier, m.options.attention, src.precision, supported,
+    // sm_75's q8 pre-pass stages q/k/v for every token: at 6144 tokens (1536x1024) that is ~90 MiB more than the
+    // chunked exact attention and pushes the plan over a 4 GiB card's arena cap. Keep q8 as the default up to 1024²,
+    // and use exact for larger latents when the caller did not choose an attention explicitly.
+    const std::int64_t latent_tokens = (req.height / 16) * (static_cast<std::int64_t>(req.width) / 16);
+    const bool q8_too_big = kernels::sm75::turing() && !m.options.attention.has_value() && latent_tokens > 5000;
+    const std::optional<planner::AttentionMode> attention_choice =
+        q8_too_big ? std::optional<planner::AttentionMode>(planner::AttentionMode::kExact) : m.options.attention;
+    r.tier = planner::resolve_tier(m.options.tier, attention_choice, src.precision, supported,
                                    tes.precision != qwen35_text::Precision::kBF16,
                                    src.precision == planner::Precision::kNvfp4 && kernels::nvfp4::available(),
                                    no_default_q8);
+    if (q8_too_big) r.tier.reason += "; q8 workspace does not fit this resolution, using exact";
     if (lora_requested) r.tier.reason += "; runtime LoRAs active";
     if (req.accel.step_cache_on()) {
       // An unset threshold takes the model's default (0.02 on the base model, told apart by its DiT's input embedder:

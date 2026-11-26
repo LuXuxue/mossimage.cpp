@@ -143,6 +143,11 @@ At 1024² (1 step, with the SFT LoRA) `max_speed` gives
 34.93 s/step versus 40.82 s/step for the earlier balanced q8-DP4A run (~17 %); the 11.7 s tiled fp32 VAE decode is
 now the largest single stage.
 
+On a 4 GiB card the q8 pre-pass does **not** fit above ~5000 latent tokens: at 1536x1024 (6144 tokens) its plan needs
+a 1.77 GiB arena against 1.74 GiB available, while the chunked exact attention needs 1.68 GiB. An unset attention
+therefore falls back to `exact` there (verified: 1536x1024 completes in 71 s/step with exact, versus 71 s/step when
+`exact` was requested explicitly); the QK DP4A path is still the default at 1024² and below.
+
 ## Explored but not kept
 
 - **DP4A for q8 attention's P·V.** `sm75_probe pvbench` times the core P[64,32]·V[32,128] matmul: 0.024 ms for the
