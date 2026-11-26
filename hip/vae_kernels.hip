@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -113,7 +114,8 @@ struct ConvKernelArgs {
   const float* residual;
   float* out;
   std::int64_t ldo;
-  std::int64_t m;         // output pixels
+  std::int64_t m;         // output pixels, the global end row (used to mask the tail)
+  std::int64_t m0;        // first output row of this chunk
   std::int64_t w_stride;  // elements per weight piece
   int h, wd, c, n, k;
   int n_tiles;
@@ -173,7 +175,7 @@ __global__ __launch_bounds__(kWave) void conv_kernel(const ConvKernelArgs a) {
   alignas(16) __shared__ float epi[kFrag * kFrag];
   const int t = thread_id();
   const std::int64_t tile = blockIdx.x;
-  const std::int64_t m_base = tile / a.n_tiles * kTileM;
+  const std::int64_t m_base = a.m0 + tile / a.n_tiles * kTileM;
   const int n_tile = static_cast<int>(tile % a.n_tiles);
   const std::int64_t m = m_base + t;  // the row of A this thread stages
   const bool row_ok = m < a.m;
@@ -693,24 +695,39 @@ void conv(const ConvArgs& a, Products products, hipStream_t stream) {
   require(products != Products::kFp32 || a.taps == 1, "conv", "fp32 products are for 1x1 convolutions (linears)");
   require(aligned16(a.x) && aligned16(a.w) && aligned16(a.out) && aligned16(a.residual), "conv", "pointers must be 16-byte aligned");
   const int k = a.taps * a.c;
-  const ConvKernelArgs ka{a.x, a.w, a.bias, a.residual, a.out, a.ldo, static_cast<std::int64_t>(a.h) * a.w_out,
+  // A single launch of the largest convolutions takes several seconds on a small APU, which can trip the OS's GPU
+  // watchdog. Split the output rows into bounded chunks: every output row still belongs to exactly one workgroup, so
+  // the results are bit-identical, but no kernel runs long enough to reset the driver. MI_HIP_VAE_CONV_CHUNK overrides
+  // the row budget.
+  std::int64_t chunk = 8192;
+  if (const char* s = std::getenv("MI_HIP_VAE_CONV_CHUNK")) {
+    const long long v = std::atoll(s);
+    if (v >= kTileM) chunk = (v / kTileM) * kTileM;
+  }
+  const ConvKernelArgs ka{a.x, a.w, a.bias, a.residual, a.out, a.ldo, static_cast<std::int64_t>(a.h) * a.w_out, 0,
                           round_up(a.n, kConvTileN) * k, a.h, a.w_out, a.c, a.n, k,
                           static_cast<int>(round_up(a.n, kConvTileN) / kConvTileN)};
-  const dim3 grid(grid_of((ka.m + kTileM - 1) / kTileM * ka.n_tiles, 1, "conv")), block(kWave);
+  const dim3 block(kWave);
   const bool tf32_all = products == Products::kTf32;
-  if (products == Products::kFp32) {
-    conv_kernel<1, false, 9><<<grid, block, 0, stream>>>(ka);
-  } else if (a.taps == 1) {
-    if (tf32_all) conv_kernel<1, false, 4><<<grid, block, 0, stream>>>(ka);
-    else conv_kernel<1, false, 3><<<grid, block, 0, stream>>>(ka);
-  } else if (a.upsample) {
-    if (tf32_all) conv_kernel<9, true, 4><<<grid, block, 0, stream>>>(ka);
-    else conv_kernel<9, true, 3><<<grid, block, 0, stream>>>(ka);
-  } else {
-    if (tf32_all) conv_kernel<9, false, 4><<<grid, block, 0, stream>>>(ka);
-    else conv_kernel<9, false, 3><<<grid, block, 0, stream>>>(ka);
+  for (std::int64_t m0 = 0; m0 < ka.m; m0 += chunk) {
+    const std::int64_t rows = std::min(chunk, ka.m - m0);
+    ConvKernelArgs cka = ka;
+    cka.m0 = m0;
+    const dim3 grid(grid_of((rows + kTileM - 1) / kTileM * cka.n_tiles, 1, "conv"));
+    if (products == Products::kFp32) {
+      conv_kernel<1, false, 9><<<grid, block, 0, stream>>>(cka);
+    } else if (a.taps == 1) {
+      if (tf32_all) conv_kernel<1, false, 4><<<grid, block, 0, stream>>>(cka);
+      else conv_kernel<1, false, 3><<<grid, block, 0, stream>>>(cka);
+    } else if (a.upsample) {
+      if (tf32_all) conv_kernel<9, true, 4><<<grid, block, 0, stream>>>(cka);
+      else conv_kernel<9, true, 3><<<grid, block, 0, stream>>>(cka);
+    } else {
+      if (tf32_all) conv_kernel<9, false, 4><<<grid, block, 0, stream>>>(cka);
+      else conv_kernel<9, false, 3><<<grid, block, 0, stream>>>(cka);
+    }
+    check_launch("conv");
   }
-  check_launch("conv");
 }
 
 void conv_narrow(const float* x, const float* w_tf32, const float* bias, float* out, int h, int w, int c, int n,

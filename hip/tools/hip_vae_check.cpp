@@ -978,6 +978,43 @@ void run_kat(hipStream_t stream) {
   check_exact(stream);
 }
 
+// A kernel-only reproduction of the upsample convolution that hangs at 256x256 output on gfx1035. No VAE decode, no
+// attention, no host replay: just the one launch and a sync, with flushed markers so a hang identifies itself.
+void stress_upsample(hipStream_t stream, Products products, int h, int w, int c, int n) {
+  auto x = random_f32(99, static_cast<std::size_t>(h / 2) * (w / 2) * c, -1.0f, 1.0f);
+  auto wt = random_f32(100, static_cast<std::size_t>(n) * c * 9, -0.1f, 0.1f);
+  const std::vector<float> bias(n, 0.0f);
+  const Products pack_as = products == Products::kFp32 ? Products::kTf32 : products;
+  std::vector<std::uint16_t> packed(hip_vae::packed_weight_elems(n, c * 9, pack_as));
+  hip_vae::pack_weight(wt.data(), n, c * 9, pack_as, packed.data());
+  DeviceBuffer dx = upload(x), dw = upload(packed), db = upload(bias), dout(static_cast<std::size_t>(h) * w * n * 4);
+  hip_vae::ConvArgs a;
+  a.x = dx.as<float>();
+  a.w = dw.as<std::uint16_t>();
+  a.bias = db.as<float>();
+  a.residual = nullptr;
+  a.out = dout.as<float>();
+  a.ldo = n;
+  a.h = h;
+  a.w_out = w;
+  a.c = c;
+  a.n = n;
+  a.taps = 9;
+  a.upsample = true;
+  std::printf("stress: upsample %dx%d c=%d n=%d %s\n", h, w, c, n, hip_vae::products_name(products));
+  std::fflush(stdout);
+  const auto t0 = std::chrono::steady_clock::now();
+  hip_vae::conv(a, products, stream);
+  const hipError_t launch_err = hipGetLastError();
+  std::printf("stress: launch error %d\n", static_cast<int>(launch_err));
+  std::fflush(stdout);
+  check(hipStreamSynchronize(stream), "stress sync");
+  std::printf("stress: synced in %.2f s, last error %d\n",
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+              static_cast<int>(hipGetLastError()));
+  std::fflush(stdout);
+}
+
 // ---- The decode -------------------------------------------------------------------------------------------------------
 
 // ---- A host replay of the whole decoder ------------------------------------------------------------------------------
@@ -1220,7 +1257,7 @@ struct Options {
   fs::path out_dir;
   int iters = 1;
   Products conv_products = Products::kTf32;
-  bool tiled_check = false;
+  bool tiled_check = false, conv_stress = false;
 };
 
 void run_decode(Device& device, VaeDecoder& decoder, const Options& o, const std::string& name) {
@@ -1474,6 +1511,8 @@ int main(int argc, char** argv) {
         o.conv_products = v == "4" ? Products::kTf32 : Products::kTf32Drop;
       } else if (arg == "--tiled-check") {
         o.tiled_check = true;
+      } else if (arg == "--conv-stress") {
+        o.conv_stress = true;
       } else {
         throw std::invalid_argument("unknown argument " + arg);
       }
@@ -1495,6 +1534,12 @@ int main(int argc, char** argv) {
     Device device(o.device);
     std::printf("device %d: %s (%s), build %s, %.2f GiB free\n", device.info().index, device.info().name.c_str(),
                 device.info().arch.c_str(), build_target(), static_cast<double>(device.free_memory()) / (1u << 30));
+    if (o.conv_stress) {
+      Stream stream;
+      const int shapes[][4] = {{128, 128, 384, 384}, {256, 128, 384, 384}, {256, 256, 384, 384},
+                               {256, 256, 192, 192}, {512, 512, 192, 192}};
+      for (const auto& s : shapes) stress_upsample(stream.get(), Products::kTf32, s[0], s[1], s[2], s[3]);
+    }
     if (o.kat) {
       Stream stream;
       run_kat(stream.get());
