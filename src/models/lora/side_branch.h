@@ -107,6 +107,7 @@ class SideBranches {
 
   const LoraStack* stack_ = nullptr;
   std::size_t adapters_ = 0;
+  DType factor_dtype_ = DType::kBF16;  // fp16 on sm_75 (cuBLASLt's GEMM there takes fp16 weights)
   int blocks_ = 0;
   std::int64_t max_rank_ = 0;
   std::vector<Entry> entries_;  // [block * kSites + site]

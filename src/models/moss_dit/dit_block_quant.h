@@ -102,7 +102,16 @@ struct QuantBlockBuffers {
   Tensor nvfp4_delta;
   void* nvfp4_scratch = nullptr;
   std::size_t nvfp4_scratch_bytes = 0;
+  // Turing without tensor cores: runtime LoRA is a side branch computed by cuBLASLt, then added to the plain INT8
+  // GEMM's bf16 output with a SIMT epilogue. `sm75_base` holds the plain GEMM output before gate/SiTU;
+  // `sm75_delta` and `sm75_scratch` are lora::compute_delta's output and scratch. All are [kSm75LoraChunk, cols].
+  Tensor sm75_base, sm75_delta;
+  void* sm75_scratch = nullptr;
+  std::size_t sm75_scratch_bytes = 0;
 };
+
+// Rows per chunk of the sm75 side-branch epilogue (bounds the scratch buffers' VRAM).
+inline constexpr std::int64_t kSm75LoraChunk = 256;
 
 // Whether INT4 tensor-core MMA (mma.sync .s4, the kernels/quant4 GEMMs) runs natively: compute capability 8.x (Ampere,
 // Ada). Hopper (sm_90) and Blackwell (sm_100, sm_120) have no INT4 tensor-core path and ptxas emulates it (sm_120,

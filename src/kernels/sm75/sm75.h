@@ -80,6 +80,9 @@ void vae_conv2d_down(const Tensor& x, const Tensor& w, const Tensor& bias, const
 
 void vae_attention_fp32(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& o, float scale,
                         cudaStream_t stream);
+
+// Runtime LoRA side branch: out = bf16(bf16(out) + bf16(delta)) on CUDA cores (no tensor core).
+void add_delta_bf16(const Tensor& out, const Tensor& delta, cudaStream_t stream);
 // torch conv weight [K,C,R,S] fp32 -> [K,R,S,C] in dst's dtype (kF32 or kBF16).
 void vae_weight_to_krsc(const Tensor& w_kcrs, const Tensor& w_krsc, cudaStream_t stream);
 

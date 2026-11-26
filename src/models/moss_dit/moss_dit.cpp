@@ -1051,6 +1051,13 @@ QuantBlockBuffers quant_buffers(StackPlan& plan, const ComputeConfig& config, st
       qa.nvfp4_scratch = plan.bytes(qa.nvfp4_scratch_bytes);
     }
   }
+  if (config.lora_rank > 0 && kernels::sm75::turing()) {
+    const std::int64_t cols = 2 * kFfnDim;  // the widest site (ffn_up_gate)
+    qa.sm75_base = plan.tensor(DType::kBF16, {kSm75LoraChunk, cols});
+    qa.sm75_delta = plan.tensor(DType::kBF16, {kSm75LoraChunk, cols});
+    qa.sm75_scratch_bytes = lora::delta_scratch_bytes(kSm75LoraChunk, config.lora_rank, cols);
+    qa.sm75_scratch = plan.bytes(qa.sm75_scratch_bytes);
+  }
   return qa;
 }
 }  // namespace

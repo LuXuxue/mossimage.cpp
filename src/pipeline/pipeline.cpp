@@ -1552,8 +1552,8 @@ void Pipeline::Impl::explain_control(const Request::Control& control, Result& r)
 // embedding, fused into the block GEMMs). The VAE encoder runs on Turing (fp32 SIMT), and runtime LoRAs are merged at
 // load (Pipeline::run sets the placement).
 void detail::force_lora_merge_on_sm7x(Request& req) {
-  // The load-time merge runs in bf16 and the fp16 conversion follows it, as for the bf16 bundle.
-  if (kernels::sm75::turing() && !req.loras.empty()) req.lora_placement = lora::Placement::kMerge;
+  // Turing runs the runtime LoRA side branch without tensor cores: the base INT8 GEMMs stay bit-exact and the low-rank
+  // Δ is computed by cuBLASLt and added in fp32, so no merge into (and requantization of) the INT8 weights is needed.
 }
 
 void detail::refuse_unsupported_on_sm7x(const Request& req) {

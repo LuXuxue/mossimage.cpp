@@ -1,5 +1,7 @@
 #include "models/lora/side_branch.h"
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -12,6 +14,7 @@
 #include <vector>
 
 #include "kernels/lora/lora_kernels.h"
+#include "kernels/sm75/sm75.h"
 #include "weights/quant/quant_codec.h"
 
 namespace mi::lora {
@@ -164,7 +167,11 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
   if (plan.bytes == 0) return;
   coef_bytes_ = plan.coef_bytes;
   buffer_ = DeviceBuffer(plan.bytes);
-  std::vector<std::uint16_t> host(plan.bytes / 2, 0);  // bf16 staging of every factor (coefficients written later)
+  // sm_75's cuBLASLt GEMMs take fp16 weights (the engine converts bf16 weights to fp16 there); the side-branch
+  // factors are small, so keep them as fp16 from upload on that device.
+  const bool fp16 = kernels::sm75::turing();
+  factor_dtype_ = fp16 ? DType::kF16 : DType::kBF16;
+  std::vector<std::uint16_t> host(plan.bytes / 2, 0);  // staging of every factor (coefficients written later)
   const auto at = [&](std::size_t offset) { return host.data() + offset / 2; };
   for (const SitePlan& sp : plan.sites) {
     if (!sp.slices.empty()) max_rank_ = std::max(max_rank_, sp.rank);
@@ -179,13 +186,15 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
     br.n = sp.n;
     br.k = sp.k;
     br.rank = sp.rank;
-    br.a = view_at(buffer_.get(), sp.a_offset, DType::kBF16, {sp.rank, sp.k});
+    br.a = view_at(buffer_.get(), sp.a_offset, factor_dtype_, {sp.rank, sp.k});
     br.coef = view_at(buffer_.get(), sp.coef_offset, DType::kF32, {sp.rank});
     const bool permute = static_cast<Site>(e % kSites) == Site::kUpGate;
     const auto put_a = [&](const Adapter& a, std::int64_t col0) {
       const std::vector<float> down = stack.read(a.parts[0]);  // [r, k]
       std::uint16_t* arow = at(sp.a_offset) + col0 * sp.k;
-      for (std::size_t i = 0; i < down.size(); ++i) arow[i] = quant::float_to_bf16(down[i]);
+      for (std::size_t i = 0; i < down.size(); ++i) {
+        arow[i] = fp16 ? __half_as_ushort(__float2half_rn(down[i])) : quant::float_to_bf16(down[i]);
+      }
     };
     for (std::size_t g = 0; g < sp.shared_first.size(); ++g) {
       const Adapter& a = stack.adapters()[sp.shared_first[g]];
@@ -206,7 +215,7 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
         out.col0 = sl.own_col0;
         out.cols = sl.own_cols;
       }
-      out.b = view_at(buffer_.get(), sl.b_offset, DType::kBF16, {sl.rows, cols});
+      out.b = view_at(buffer_.get(), sl.b_offset, factor_dtype_, {sl.rows, cols});
       br.slices.push_back(out);
       std::uint16_t* b = at(sl.b_offset);
       const auto put_b = [&](const Adapter& a, std::int64_t bcol) {
@@ -214,7 +223,8 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
         for (std::int64_t c = 0; c < sl.rows; ++c) {
           const std::int64_t src = permute ? kernels::lora::up_gate_gemm_row(c, sl.rows / 2) : c;
           for (std::int64_t j = 0; j < a.rank; ++j) {
-            b[c * cols + bcol + j] = quant::float_to_bf16(up[static_cast<std::size_t>(src * a.rank + j)]);
+            const float v = up[static_cast<std::size_t>(src * a.rank + j)];
+            b[c * cols + bcol + j] = fp16 ? __half_as_ushort(__float2half_rn(v)) : quant::float_to_bf16(v);
           }
         }
       };
@@ -364,7 +374,12 @@ void compute_t(const SiteBranch& site, const Tensor& x, const Tensor& t, void* w
   }
   if (m == 0) return;
   const Tensor t32 = Tensor::view(workspace, DType::kF32, Device::kCUDA, {m, r});
-  gemm.linear(t32, x, site.a, nullptr, gemm_ws, gemm_ws_bytes, stream);
+  Tensor a = site.a;
+  if (a.dtype == DType::kBF16 && kernels::sm75::turing()) {
+    // Should not happen (upload stores fp16 there), but keep the GEMM contract valid.
+    fail("compute_t: sm_75 needs fp16 LoRA factors");
+  }
+  gemm.linear(t32, x, a, nullptr, gemm_ws, gemm_ws_bytes, stream);
   kernels::lora::scale_columns_bf16(t32.ptr<const float>(), r, site.coef.ptr<const float>(),
                                     static_cast<__nv_bfloat16*>(t.data), t.stride[0], m, r, stream);
 }
@@ -436,6 +451,7 @@ void compute_delta(const SiteBranch& site, const Tensor& t, const Tensor& delta,
       x = Tensor::view(tcat, DType::kBF16, Device::kCUDA, {m, c});
     }
     Tensor b = s.b;
+    if (b.dtype == DType::kBF16 && kernels::sm75::turing()) fail("compute_delta: sm_75 needs fp16 LoRA factors");
     if (natural_order) {
       // GEMM column 8j + 4h + i (h: 0 hidden, 1 gate; i < 4) is weight row h * F + 4j + i (up_gate_gemm_row).
       if (s.row0 != 0 || s.rows != n || n % 8 != 0) fail("compute_delta: natural_order needs one slice over all columns");
@@ -445,7 +461,7 @@ void compute_delta(const SiteBranch& site, const Tensor& t, const Tensor& delta,
         MI_CUDA_CHECK(cudaMemcpy2DAsync(bnat + h * half, group, bp + h * group, 2 * group, group,
                                         static_cast<std::size_t>(n / 8), cudaMemcpyDeviceToDevice, stream));
       }
-      b = Tensor::view(bnat, DType::kBF16, Device::kCUDA, {n, c});
+      b = Tensor::view(bnat, s.b.dtype, Device::kCUDA, {n, c});
     }
     Tensor o = Tensor::view(out + s.row0 * kE, DType::kBF16, Device::kCUDA, {m, s.rows});
     o.stride[0] = delta.stride[0];
