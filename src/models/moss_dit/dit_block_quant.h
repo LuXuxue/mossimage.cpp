@@ -80,7 +80,7 @@ struct QuantBlockBuffers {
   void* attn_workspace = nullptr;  // 8-bit modes: attention_q8 workspace of q8_attention_workspace_bytes()
   std::size_t attn_workspace_bytes = 0;
   // Runtime LoRA side branches (models/lora/side_branch.h; nullptr: none): t bf16 [L, >= lora->max_rank()] and the
-  // t32 workspace (lora::t_workspace_bytes(L, max_rank)).
+  // t32 workspace (lora::t_workspace_bytes(L, widest site K, max_rank)).
   const lora::SideBranches* lora = nullptr;
   Tensor lora_t;
   void* lora_workspace = nullptr;

@@ -978,9 +978,9 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
           "runtime LoRAs cannot run on the turbo tier on sm_7x: its INT4 ConvRot weights have no sm_75 side-branch "
           "path and no merge path; use tier high (INT8 ConvRot) or tier reference");
     }
-    // sm_75's q8 pre-pass stages q/k/v for every token: at 6144 tokens (1536x1024) that is ~90 MiB more than the
-    // chunked exact attention and pushes the plan over a 4 GiB card's arena cap. Keep q8 as the default up to 1024²,
-    // and use exact for larger latents when the caller did not choose an attention explicitly.
+    // sm_75's q8 pre-pass stages q/k/v for every token, so at large latents its plan can exceed the dedicated-VRAM
+    // arena. In strict budget mode an unset attention then falls back to exact; with the default soft budget the plan
+    // is kept with a warning and the runtime spills into shared GPU memory instead.
     const std::int64_t latent_tokens = (req.height / 16) * (static_cast<std::int64_t>(req.width) / 16);
     const bool q8_too_big = kernels::sm75::turing() && !m.options.attention.has_value() && latent_tokens > 5000 &&
                             !planner::soft_vram_budget();

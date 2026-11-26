@@ -438,7 +438,7 @@ class DitInt4Block : public ::testing::Test {
       qa.attn_workspace_bytes = q8_bytes;
       if (lora != nullptr) {
         lora_t = std::make_unique<DevTensor>(DType::kBF16, std::initializer_list<std::int64_t>{l, lora->max_rank()});
-        lora_ws = mi::DeviceBuffer(mi::lora::t_workspace_bytes(l, lora->max_rank()));
+        lora_ws = mi::DeviceBuffer(mi::lora::t_workspace_bytes(l, md::kFfnDim, lora->max_rank()));
         qa.lora = lora;
         qa.lora_t = lora_t->t;
         qa.lora_workspace = lora_ws.get();

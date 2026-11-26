@@ -415,7 +415,7 @@ TEST(LoraSideBranch, LayoutTermsStrengthsGenerations) {
     const char* what = site_name(c.site);
     const U16 x = rand_bf16(static_cast<std::size_t>(m * s.k), 100 + c.block, 1.0f);
     Dev dx(x, mi::DType::kBF16, {m, s.k}), dt(U16{}, mi::DType::kBF16, {m, s.rank});
-    DeviceBuffer ws(t_workspace_bytes(m, s.rank));
+    DeviceBuffer ws(t_workspace_bytes(m, s.k, s.rank));
     compute_t(s, dx.t, dt.t, ws.get(), ws.size(), gemm, gws.get(), gws.size(), nullptr);
     // gemm_lora on a zero weight: out = bf16(0 + t · bᵀ).
     Dev zw(U16(static_cast<std::size_t>(s.n * s.k), 0), mi::DType::kBF16, {s.n, s.k}), out(U16{}, mi::DType::kBF16, {m, s.n});
@@ -549,7 +549,7 @@ TEST(LoraSideBranch, SharedFusedQkvEqualsSeparateAdapters) {
   Dev dx(x, mi::DType::kBF16, {m, kD}), dw(w, mi::DType::kBF16, {3 * kD, kD});
   const auto run = [&](const SiteBranch& s) {
     Dev dt(U16{}, mi::DType::kBF16, {m, s.rank}), out(U16{}, mi::DType::kBF16, {m, 3 * kD});
-    DeviceBuffer ws(t_workspace_bytes(m, s.rank));
+    DeviceBuffer ws(t_workspace_bytes(m, s.k, s.rank));
     compute_t(s, dx.t, dt.t, ws.get(), ws.size(), gemm, gws.get(), gws.size(), nullptr);
     kernels::lora::gemm_lora(out.t, dx.t, dw.t, lora_slices(s, dt.t), nullptr);
     MI_CUDA_CHECK(cudaDeviceSynchronize());

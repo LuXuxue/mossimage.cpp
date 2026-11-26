@@ -218,7 +218,7 @@ struct Acts {
     cu = Dev(mi::DType::kI32, {static_cast<std::int64_t>(cu_host.size())}, cu_host.data());
     for (std::size_t i = 1; i < cu_host.size(); ++i) max_seqlen = std::max(max_seqlen, cu_host[i] - cu_host[i - 1]);
     lse = Dev(mi::DType::kU8, {static_cast<std::int64_t>(attention::flash_fwd_workspace_bytes(rows, kHeads))});
-    tws = Dev(mi::DType::kU8, {static_cast<std::int64_t>(t_workspace_bytes(rows, r))});
+    tws = Dev(mi::DType::kU8, {static_cast<std::int64_t>(t_workspace_bytes(rows, kF, r))});
     tb = Dev(mi::DType::kBF16, {rows, r});
     q8 = Dev(mi::DType::kI8, {rows, kF});
     s8 = Dev(mi::DType::kF32, {rows});

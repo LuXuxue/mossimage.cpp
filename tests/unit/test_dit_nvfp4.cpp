@@ -407,7 +407,7 @@ struct BlockCall {
     qa.nvfp4_sf_bytes = sf.size();
     if (lora != nullptr) {
       lora_t = std::make_unique<DevTensor>(DType::kBF16, std::initializer_list<std::int64_t>{l, lora->max_rank()});
-      lora_ws = mi::DeviceBuffer(mi::lora::t_workspace_bytes(l, lora->max_rank()));
+      lora_ws = mi::DeviceBuffer(mi::lora::t_workspace_bytes(l, kF, lora->max_rank()));
       delta = std::make_unique<DevTensor>(DType::kBF16, std::initializer_list<std::int64_t>{l, 2 * kF});
       scratch = mi::DeviceBuffer(mi::lora::delta_scratch_bytes(l, lora->max_rank(), 2 * kF));
       qa.lora = lora;
@@ -475,7 +475,7 @@ struct HostLora {
 std::vector<float> engine_delta(const mi::lora::SiteBranch& site, const Tensor& in, bool natural, cudaStream_t s) {
   const std::int64_t l = in.dim(0);
   mi::kernels::Gemm gemm;
-  mi::DeviceBuffer gws(mi::kernels::Gemm::kWorkspaceBytes), tws(mi::lora::t_workspace_bytes(l, site.rank)),
+  mi::DeviceBuffer gws(mi::kernels::Gemm::kWorkspaceBytes), tws(mi::lora::t_workspace_bytes(l, site.k, site.rank)),
       scratch(mi::lora::delta_scratch_bytes(l, site.rank, site.n));
   DevTensor t(DType::kBF16, {l, site.rank}), d(DType::kBF16, {l, site.n});
   mi::lora::compute_t(site, in, t.t, tws.get(), tws.size(), gemm, gws.get(), gws.size(), s);
