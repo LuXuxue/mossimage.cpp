@@ -982,7 +982,8 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
     // chunked exact attention and pushes the plan over a 4 GiB card's arena cap. Keep q8 as the default up to 1024²,
     // and use exact for larger latents when the caller did not choose an attention explicitly.
     const std::int64_t latent_tokens = (req.height / 16) * (static_cast<std::int64_t>(req.width) / 16);
-    const bool q8_too_big = kernels::sm75::turing() && !m.options.attention.has_value() && latent_tokens > 5000;
+    const bool q8_too_big = kernels::sm75::turing() && !m.options.attention.has_value() && latent_tokens > 5000 &&
+                            !planner::soft_vram_budget();
     const std::optional<planner::AttentionMode> attention_choice =
         q8_too_big ? std::optional<planner::AttentionMode>(planner::AttentionMode::kExact) : m.options.attention;
     r.tier = planner::resolve_tier(m.options.tier, attention_choice, src.precision, supported,
@@ -1355,6 +1356,10 @@ Pipeline::Impl::Planned Pipeline::Impl::plan_call(const CallModels& models, cons
     in.request.vae_resident = needed_vae > 0;
     r.plan = planned();
     drop_resident = true;
+  }
+  if (planner::soft_vram_budget() &&
+      r.plan.explanation.find("WARNING (MI_SOFT_VRAM_BUDGET") != std::string::npos) {
+    r.tier.reason += "; WARNING: VRAM budget exceeded, running on shared GPU memory";
   }
   // A loaded DiT stays (in its held arena, with its residency) unless the request's own plan saves more than reloading
   // it costs: no reload churn when request sizes alternate or the free device memory moves a little.

@@ -155,6 +155,26 @@ a correct PNG**. The same crash occurs with `exact` at that reserve, so it is th
 kernel. Keeping the default 384 MiB reserve caps the peak at 2.83 GiB and exits cleanly. The planner's dedicated-VRAM
 cap and `--vram-reserve` are therefore deliberate: shared GPU memory is system RAM, not free VRAM.
 
+### Diagnostic soft-VRAM mode
+
+`MI_SOFT_VRAM_BUDGET=1` is an opt-in experiment: it disables the large-latent exact fallback and makes `planner::plan`
+return the leanest plan with a warning instead of throwing `BudgetError`. It is never the default. Measured at
+1536x1024, 1 step, seed 42, unset attention (resolves to `q8_fp16`), pinned/page-cache weights as chosen by the plan:
+
+| Reserve | Weight source | s/step | Device peak | Exit | Note |
+|---:|---|---:|---:|---:|---|
+| default 384 | page cache | 58.93 | 2.89 GiB | 0 | warning; 0.1 GB/s stream, 41 stalls (1.09 s); total 85.6 s |
+| 320 | pinned host | 58.23 | 2.91 GiB | 0 | q8 fits the 1.79 GiB cap, no warning |
+| 288 | pinned host | 58.30 | 2.94 GiB | 2 of 3 runs crash | `0xC0000005` at teardown after a correct PNG |
+| 256 | pinned host | 57.94 | 2.94 GiB | crash | same failure as the earlier explicit-q8 run |
+
+The safe exact fallback at this resolution is 71.4 s/step with a 2.83 GiB peak and exits cleanly, so the soft q8 path
+is **~18 % faster per step**. Step time is almost independent of the reserve; the spill boundary is a device peak of
+about 2.9 GiB, above which WDDM shared-memory teardown becomes flaky (2.94 GiB crashed in 2/3 runs, once exited 0).
+The 384 MiB default also changes the planner's choice to page-cache weights (5 s load vs 39 s for the pinned copy),
+making its end-to-end total the lowest of these runs despite the slow stream. The switch is for measurement only: it
+trades a small speedup for shared-memory stalls and a nondeterministic crash on exit.
+
 ## Explored but not kept
 
 - **DP4A for q8 attention's P·V.** `sm75_probe pvbench` times the core P[64,32]·V[32,128] matmul: 0.024 ms for the
