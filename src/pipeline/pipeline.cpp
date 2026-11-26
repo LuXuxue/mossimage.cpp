@@ -968,15 +968,9 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
     // device, not on the kernels' availability: an sm_80+ build without them (MOSSINFER_ONLY) still refuses, as before.
     const bool exact_when_no_q8 = kernels::sm75::turing();
     const bool attention_given = m.options.attention.has_value();
-    // A GTX 16xx has no tensor cores: its SM executes the Turing INT8 MMA of q8 attention on ordinary arithmetic
-    // units, which at 1024^2 takes minutes per step instead of the planner's fraction of a second. Refuse the
-    // explicit request with the reason instead of appearing to hang; tier high keeps its INT8 ConvRot GEMMs.
-    if (attention_given && planner::is_q8(*m.options.attention) && exact_when_no_q8 &&
-        kernels::sm75::no_tensor_cores()) {
-      throw std::invalid_argument(std::string("attention ") + planner::attention_name(*m.options.attention) +
-                                  " needs tensor cores, which this Turing GPU (GTX 16xx / TU116 / TU117) lacks; "
-                                  "use attention exact (tier high still runs INT8 ConvRot GEMMs)");
-    }
+    // sm_7x: the caller's unset attention resolves to exact instead of an 8-bit default. Turing's q8_fp16 runs
+    // when asked for, including on GTX 16xx (its INT8 MMA is emulated but still faster than the exact kernel there).
+    // It is never the default, since it is lossy.
     const auto supported = [&](planner::AttentionMode mode) {
       if (exact_when_no_q8 && !attention_given && planner::is_q8(mode)) return false;
       return moss_dit::attention_supported(dit_attention(mode));

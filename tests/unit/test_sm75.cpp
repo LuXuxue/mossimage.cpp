@@ -80,16 +80,15 @@ TEST(Sm75Build, KernelFamilyPresence) {
 
 // bf16 -> fp16 is lossless for in-range values and fp16 -> bf16 recovers the exact bf16 bits, which is what the sm_75
 // attention relies on when it converts q/k/v in place and restores them.
-// Cards without tensor cores execute Turing's INT8 MMA on ordinary CUDA cores; q8 attention then takes minutes
-// per step at 1024^2 instead of the exact kernel's fraction of a second, so it must be refused up front.
-TEST(Sm75NoTensorCores, Q8AttentionUnsupported) {
+// Cards without tensor cores run q8 attention through the emulated INT8 MMA; it is supported but not the default.
+TEST(Sm75NoTensorCores, Q8AttentionSupported) {
 #ifndef MOSSINFER_HAVE_SM75
   GTEST_SKIP() << "built without MOSSINFER_SM75";
 #else
   if (!mi::kernels::sm75::turing()) GTEST_SKIP() << "needs a Turing device";
   if (!mi::kernels::sm75::no_tensor_cores()) GTEST_SKIP() << "this Turing device has tensor cores";
-  EXPECT_FALSE(mi::attention_q8::supported(mi::attention_q8::Variant::kInt8Fp16));
-  EXPECT_FALSE(mi::attention_q8::supported(mi::attention_q8::Variant::kInt8Fp16F32Acc));
+  EXPECT_TRUE(mi::attention_q8::supported(mi::attention_q8::Variant::kInt8Fp16));
+  EXPECT_TRUE(mi::attention_q8::supported(mi::attention_q8::Variant::kInt8Fp16F32Acc));
 #endif
 }
 
