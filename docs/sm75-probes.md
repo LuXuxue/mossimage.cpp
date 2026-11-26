@@ -177,7 +177,13 @@ The 384 MiB default also changes the planner's choice to page-cache weights (5 s
 making its end-to-end total the lowest of these runs despite the slow stream. The default therefore trades a small
 speedup for shared-memory stalls and a nondeterministic crash on exit; strict mode (`MI_SOFT_VRAM_BUDGET=0`) is not
 immune either — one 2.83 GiB exact run also crashed at teardown, so the WDDM failure is flaky rather than tied to a
-sharp byte boundary.
+sharp byte boundary. The actual spill point is the dedicated free VRAM (~2.1 GiB here), not the 2.9 GiB device peak:
+every run above 2.1 GiB already used some shared memory.
+
+The CLI now calls `_exit(0)` after a successful `generate`/`check` once the PNG, latents and report are written. The
+fault was in `Pipeline` destruction (freeing the device arena after WDDM spill), after all output had been produced;
+skipping those destructors made 4/4 fresh-prompt 256² runs and a 1536² soft run exit 0 instead of `0xC0000005`. The C
+API/server are unaffected.
 
 ## Explored but not kept
 

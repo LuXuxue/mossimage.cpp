@@ -157,9 +157,9 @@ class Planner {
       }
       ExecutionPlan p = make_plan(*lean, all);
       p.explanation +=
-          "\nWARNING (MI_SOFT_VRAM_BUDGET=1): no configuration fits the dedicated-VRAM/host budget; running the "
-          "leanest plan anyway. CUDA will spill into shared GPU memory (system RAM): expect heavy stalls and possible "
-          "instability. This is a measurement switch, not a supported mode.";
+          "\nWARNING (soft VRAM budget): no configuration fits the dedicated-VRAM/host budget; running the leanest "
+          "plan anyway. CUDA will spill into shared GPU memory (system RAM): expect heavy stalls and possible "
+          "instability. Set MI_SOFT_VRAM_BUDGET=0 for the strict budget.";
       return p;
     }
     const Candidate* best = *std::min_element(feasible.begin(), feasible.end(),

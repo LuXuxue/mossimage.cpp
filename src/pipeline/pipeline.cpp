@@ -1358,7 +1358,7 @@ Pipeline::Impl::Planned Pipeline::Impl::plan_call(const CallModels& models, cons
     drop_resident = true;
   }
   if (planner::soft_vram_budget() &&
-      r.plan.explanation.find("WARNING (MI_SOFT_VRAM_BUDGET") != std::string::npos) {
+      r.plan.explanation.find("WARNING (soft VRAM budget)") != std::string::npos) {
     r.tier.reason += "; WARNING: VRAM budget exceeded, running on shared GPU memory";
   }
   // A loaded DiT stays (in its held arena, with its residency) unless the request's own plan saves more than reloading

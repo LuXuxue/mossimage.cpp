@@ -17,6 +17,11 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "api/progress_model.h"
 #include "models/moss_dit/distill.h"
@@ -681,7 +686,12 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
     std::cerr << "moss-infer generate: cancelled during a follow-up image\n";
     return 130;
   }
-  return 0;
+  // On WDDM, freeing the device arena during Pipeline destruction faults intermittently when the run spilled into
+  // shared GPU memory. The image, latents and report are all written by now, so leave the process without running
+  // those destructors; the OS tears the CUDA context down on exit.
+  std::cout.flush();
+  std::cerr.flush();
+  _exit(0);
 }
 
 }  // namespace
