@@ -77,3 +77,19 @@ recomputes 1.4–2.4× at large sizes.
 Fusions mostly save memory traffic; at 256² the run is dominated by a one-time weight load, and at 1536² by DP4A
 GEMM and VAE arithmetic. So the two changes with real end-to-end leverage remain **VAE convolution arithmetic** and
 **DiT GEMM tiling**, not more kernel fusion.
+
+## Attempts made on this branch (all A/B, same prompt/seed)
+
+| Attempt | Numerics | Result | Kept? |
+|---|---|---|---|
+| LoRA Δ add folded into the base DP4A GEMM epilogue (Δ is computed first) | bit-identical latent | 256² 4-step denoise 42.48 → 41.79 s | **yes** |
+| DP4A K tile 64 / 256 (`MI_DP4A_BK`) | bit-identical | 43.86 / 42.25 s vs 41.48 s for BK=128 | no, reverted |
+| VAE conv input-channel tile 16 (`MI_VAE_CONV_TC`) | bit-identical PNG | 1024² decode 13.46 s vs 11.65 s | no, reverted |
+| VAE conv 256-thread / 8-channel variant (earlier) | bit-identical when correct | 1024² decode 14.70 s vs 11.70 s | no, reverted |
+| q8 P·V with native DP4A | not bit-identical; per-head V quantization changes scores | 2.7× matmul ceiling only | no |
+| Exact attention as fp32 GEMMs + parallel softmax (earlier) | cosine ≥ 0.9999 | 352 → 211 ms @4113 tokens | **yes** |
+| Text-encoder fp32 GEMM attention (earlier) | reference precision | 502 → 390 ms | **yes** |
+
+Conclusion from the A/B runs: the existing 64×32×128 DP4A tile and the 8-channel VAE conv tile are already local
+optima for this GPU. Further gains require changing arithmetic (lossy fp16×2/Winograd for the VAE, per-head V
+quantisation for q8 P·V), not more tiling variants or kernel fusion.
