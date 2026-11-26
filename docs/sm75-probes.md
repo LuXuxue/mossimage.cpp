@@ -148,6 +148,13 @@ a 1.77 GiB arena against 1.74 GiB available, while the chunked exact attention n
 therefore falls back to `exact` there (verified: 1536x1024 completes in 71 s/step with exact, versus 71 s/step when
 `exact` was requested explicitly); the QK DP4A path is still the default at 1024² and below.
 
+Forcing it with `--vram-reserve 256` does let the q8 plan start, but the run then spills into WDDM shared GPU memory:
+the pinned-host copy rate collapses (the report showed 0.1 GB/s and 164 stalls even when the copy was nominally
+hidden), peak device memory reaches 2.94 GiB, and the process **crashes with 0xC0000005 during teardown after writing
+a correct PNG**. The same crash occurs with `exact` at that reserve, so it is the memory oversubscription, not the q8
+kernel. Keeping the default 384 MiB reserve caps the peak at 2.83 GiB and exits cleanly. The planner's dedicated-VRAM
+cap and `--vram-reserve` are therefore deliberate: shared GPU memory is system RAM, not free VRAM.
+
 ## Explored but not kept
 
 - **DP4A for q8 attention's P·V.** `sm75_probe pvbench` times the core P[64,32]·V[32,128] matmul: 0.024 ms for the
