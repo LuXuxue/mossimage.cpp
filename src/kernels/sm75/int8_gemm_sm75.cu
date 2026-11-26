@@ -83,10 +83,11 @@ using Sm75Kernel = typename qd::Int8Kernel<Sm75Tile, Callbacks, PermuteB, cutlas
 // (GTX 16xx has no tensor cores); four int8 MACs per dp4a instruction with a 64x32x128 tile and shared weight reuse
 // is faster than the emulated MMA. W stays in the engine's [N,K] layout: global loads run along K (coalesced) and
 // store into a transposed [K,N] shared tile. The int32 dot product and dequantisation order are unchanged.
-template <int BM, int BN, int BK>
+template <int BM, int BN, int BK, bool kAddDelta>
 __global__ void dp4a_plain_kernel(quant::Int8Operands op, const float* __restrict__ xs,
                                   const float* __restrict__ ws, const __nv_bfloat16* __restrict__ bias,
-                                  __nv_bfloat16* __restrict__ out, std::int64_t ldo) {
+                                  __nv_bfloat16* __restrict__ out, std::int64_t ldo,
+                                   const __nv_bfloat16* __restrict__ delta, std::int64_t ldd) {
   __shared__ std::int8_t As[BM][BK];
   __shared__ std::int8_t Bs[BK][BN];
   const int tx = threadIdx.x, ty = threadIdx.y;
@@ -131,7 +132,13 @@ __global__ void dp4a_plain_kernel(quant::Int8Operands op, const float* __restric
     if (r >= op.m || c >= op.n) continue;
     const float b = bias != nullptr ? static_cast<float>(bias[c]) : 0.f;
     const float v = qd::dequant(__int2float_rn(acc[i]), xs[r], ws[c], b);
-    out[r * ldo + c] = __float2bfloat16_rn(v);
+    __nv_bfloat16 bv = __float2bfloat16_rn(v);
+    if constexpr (kAddDelta) {
+      // Same order as add_delta_bf16: round the base to bf16, add the bf16 delta in fp32, round once.
+      const float sum = __bfloat162float(bv) + __bfloat162float(delta[r * ldd + c]);
+      bv = __float2bfloat16_rn(sum);
+    }
+    out[r * ldo + c] = bv;
   }
 }
 
@@ -139,7 +146,8 @@ void plain(const qd::Problem& p, const quant::Int8Operands& a, const __nv_bfloat
            std::int64_t ldo, cudaStream_t stream) {
   constexpr int BM = 64, BN = 32, BK = 128;
   const dim3 grid((p.n + BN - 1) / BN, (p.m + BM - 1) / BM);
-  dp4a_plain_kernel<BM, BN, BK><<<grid, dim3(32, 8), 0, stream>>>(a, a.x_scale, a.w_scale, bias, out, ldo);
+  dp4a_plain_kernel<BM, BN, BK, false><<<grid, dim3(32, 8), 0, stream>>>(a, a.x_scale, a.w_scale, bias, out, ldo,
+                                                                        nullptr, 0);
   MI_CUDA_CHECK_LAUNCH();
 }
 
@@ -174,6 +182,16 @@ Tensor bf16_view(void* p, std::int64_t rows, std::int64_t cols, std::int64_t ld)
   return t;
 }
 
+// Fused LoRA epilogue: the base DP4A GEMM adds the already-computed bf16 delta in its own epilogue, replacing a
+// separate elementwise pass with identical bf16 rounding order.
+void plain_add(const qd::Problem& p, const quant::Int8Operands& a, const __nv_bfloat16* delta, std::int64_t ldd,
+               __nv_bfloat16* out, std::int64_t ldo, cudaStream_t stream) {
+  constexpr int BM = 64, BN = 32, BK = 128;
+  const dim3 grid((p.n + BN - 1) / BN, (p.m + BM - 1) / BM);
+  dp4a_plain_kernel<BM, BN, BK, true><<<grid, dim3(32, 8), 0, stream>>>(a, a.x_scale, a.w_scale, nullptr, out, ldo,
+                                                                       delta, ldd);
+}
+
 void gated_residual(const qd::Problem& p, const quant::Int8Operands& a, const __nv_bfloat16* bias,
                     const __nv_bfloat16* gate, __nv_bfloat16* residual, std::int64_t ldr, cudaStream_t stream) {
   if (p.m == 0) return;
@@ -205,6 +223,16 @@ void int8_gemm(const quant::Int8Operands& op, const __nv_bfloat16* bias, __nv_bf
   qd::check_vector(name, "bias", bias, /*optional=*/true);
   if (p.m == 0) return;
   plain(p, op, bias, out, ldo, stream);
+}
+
+void int8_gemm_add_delta(const quant::Int8Operands& op, const __nv_bfloat16* delta, std::int64_t ldd,
+                         __nv_bfloat16* out, std::int64_t ldo, cudaStream_t stream) {
+  constexpr const char* name = "sm75::int8_gemm_add_delta";
+  const qd::Problem p = qd::check_operands(name, op);
+  qd::check_output(name, "out", out, ldo, p.n);
+  qd::check_vector(name, "delta", delta, /*optional=*/false);
+  if (p.m == 0) return;
+  plain_add(p, op, delta, ldd, out, ldo, stream);
 }
 
 void int8_gemm_gated_residual(const quant::Int8Operands& op, const __nv_bfloat16* bias, const __nv_bfloat16* gate,

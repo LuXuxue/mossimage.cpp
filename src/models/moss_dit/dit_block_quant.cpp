@@ -10,6 +10,7 @@
 #include "kernels/attention/flash_attention.h"
 #include "kernels/attention_q8/attention_q8.h"
 #include "kernels/sm75/sm75.h"
+#include "kernels/sm75/int8_sm75.h"
 #include "models/lora/side_branch.h"
 #include "kernels/basic/elementwise.h"
 #include "kernels/basic/norm.h"
@@ -82,13 +83,14 @@ Tensor sm75_lora_base(const QuantBlockBuffers& qa, const QkvGemm& qg, const lora
   const std::int64_t n = s.n, cols = qa.sm75_delta.dim(1);
   Tensor base = Tensor::view(qa.sm75_base.data, DType::kBF16, Device::kCUDA, {rows, n});
   base.stride[0] = cols;
-  kq::int8_gemm(op, nullptr, bf_mut(base), cols, stream);
   Tensor delta = Tensor::view(qa.sm75_delta.data, DType::kBF16, Device::kCUDA, {rows, n});
   delta.stride[0] = cols;
   const Tensor tc = t.slice0(r0, r0 + rows);
+  // Δ does not depend on the base GEMM: compute it first and let the DP4A GEMM add it in its epilogue, removing a
+  // separate elementwise pass without changing the bf16 rounding order.
   lora::compute_delta(s, tc, delta, natural_order, qa.sm75_scratch, qa.sm75_scratch_bytes, *qg.gemm, qg.workspace,
                       qg.workspace_bytes, stream);
-  kernels::sm75::add_delta_bf16(base, delta, stream);
+  kernels::sm75::int8_gemm_add_delta(op, bf(delta), cols, bf_mut(base), cols, stream);
   return base;
 }
 

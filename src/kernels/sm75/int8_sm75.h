@@ -18,6 +18,9 @@ namespace mi::kernels::sm75 {
 // output layout and numerics); the host-side dispatcher in those translation units routes compute capability 7.x here.
 void int8_gemm(const quant::Int8Operands& op, const __nv_bfloat16* bias, __nv_bfloat16* out, std::int64_t ldo,
                cudaStream_t stream);
+// Same as int8_gemm, but adds a bf16 delta in the GEMM epilogue (the runtime LoRA side branch).
+void int8_gemm_add_delta(const quant::Int8Operands& op, const __nv_bfloat16* delta, std::int64_t ldd,
+                         __nv_bfloat16* out, std::int64_t ldo, cudaStream_t stream);
 void int8_gemm_gated_residual(const quant::Int8Operands& op, const __nv_bfloat16* bias, const __nv_bfloat16* gate,
                               __nv_bfloat16* residual, std::int64_t ldr, cudaStream_t stream);
 void int8_gemm_situ_glu(const quant::Int8Operands& op, __nv_bfloat16* out, std::int64_t ldo, cudaStream_t stream);
