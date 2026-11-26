@@ -962,31 +962,26 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
     // Quality tier from what is loaded, before anything heavy (its refusals throw std::invalid_argument here, ahead of
     // the LoRA files too). The lossy accelerators are an explicit speed opt-in: the tier is resolved without them.
     const std::filesystem::path te_file = tes.model ? tes.path : std::filesystem::path();
-    // sm_7x: the caller's unset attention resolves to exact instead of an 8-bit default. Volta has no 8-bit attention
-    // kernel; Turing's q8_fp16 (kernels/sm75/attention_q8_sm75.cu) runs when asked for, but is no faster than exact
-    // there (Turing's INT8 MMA does the fp16 MMA's MACs per instruction), so it is never the default. Keyed on the
-    // device, not on the kernels' availability: an sm_80+ build without them (MOSSINFER_ONLY) still refuses, as before.
-    const bool exact_when_no_q8 = kernels::sm75::turing();
-    const bool attention_given = m.options.attention.has_value();
-    // sm_7x: the caller's unset attention resolves to exact instead of an 8-bit default. Turing's q8_fp16 runs
-    // when asked for, including on GTX 16xx (its INT8 MMA is emulated but still faster than the exact kernel there).
-    // It is never the default, since it is lossy.
+    // Like every other architecture, an unset attention resolves to the tier's 8-bit default. Turing's q8 path now
+    // uses native DP4A for QK (kernels/sm75/attention_q8_sm75.cu), so q8_fp16 is both supported and the default there;
+    // Volta has no 8-bit kernel and keeps its explicit exact fallback. Keyed on the kernels' availability: an sm_80+
+    // build without them (MOSSINFER_ONLY) still refuses, as before.
     const auto supported = [&](planner::AttentionMode mode) {
-      if (exact_when_no_q8 && !attention_given && planner::is_q8(mode)) return false;
       return moss_dit::attention_supported(dit_attention(mode));
     };
-    // sm_75 has no LoRA side-branch kernels, so run() forces every adapter to merge (Pipeline::run, above); INT4
-    // ConvRot weights have no merge path (merges need bf16 or INT8 ConvRot), and the tier's own advice ("use
-    // lora_placement side_branch") does not exist on Turing: refuse here with what does work.
-    if (lora_requested && exact_when_no_q8 && src.precision == planner::Precision::kInt4) {
+    const bool no_default_q8 =
+        !supported(planner::AttentionMode::kQ8Fp8) && !supported(planner::AttentionMode::kQ8Fp16);
+    // Turing's LoRA side branch only handles INT8 ConvRot weights; INT4 ConvRot blocks have no sm_75 side-branch
+    // path (and no merge path), so the turbo tier stays refused with LoRAs. Independent of the attention default.
+    if (lora_requested && kernels::sm75::turing() && src.precision == planner::Precision::kInt4) {
       throw std::invalid_argument(
-          "runtime LoRAs cannot run on the turbo tier on sm_7x: its INT4 ConvRot weights have no merge path and Turing "
-          "has no LoRA side-branch kernels; use tier high (INT8 ConvRot) or tier reference");
+          "runtime LoRAs cannot run on the turbo tier on sm_7x: its INT4 ConvRot weights have no sm_75 side-branch "
+          "path and no merge path; use tier high (INT8 ConvRot) or tier reference");
     }
     r.tier = planner::resolve_tier(m.options.tier, m.options.attention, src.precision, supported,
                                    tes.precision != qwen35_text::Precision::kBF16,
                                    src.precision == planner::Precision::kNvfp4 && kernels::nvfp4::available(),
-                                   exact_when_no_q8);
+                                   no_default_q8);
     if (lora_requested) r.tier.reason += "; runtime LoRAs active";
     if (req.accel.step_cache_on()) {
       // An unset threshold takes the model's default (0.02 on the base model, told apart by its DiT's input embedder:
