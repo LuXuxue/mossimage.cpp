@@ -123,8 +123,7 @@ __global__ void rotate_quantize_kernel(RotateArgs a, int row0) {
     const int g = 2 * (warp + i * warps) + half;
     if (g >= groups) continue;
     const bf16* src = base + static_cast<std::int64_t>(g) * kConvRotGroup + 16 * h;
-    // Two 16-byte loads instead of sixteen 2-byte ones: the scaler is the bottleneck on RDNA2 (comfy-kitchen
-    // measures 76 GB/s with vector loads on this GPU vs scalar loads well below that).
+    // Two 16-byte loads instead of sixteen 2-byte ones: this scaler is memory-bound on RDNA2.
     const uint4 lo = *reinterpret_cast<const uint4*>(src);
     const uint4 hi = *reinterpret_cast<const uint4*>(src + 8);
     const std::uint32_t w[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};

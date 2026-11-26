@@ -225,6 +225,8 @@ __global__ __attribute__((amdgpu_waves_per_eu(2))) __launch_bounds__(kBlockM, 1)
 
 #else
 
+// The dual-arch binary compiles this file for every AMD target. The launcher is host code shared by all of them and
+// cannot test __GFX10__, so a non-RDNA2 code object still needs the symbol; callers must gate on device_is_rdna2().
 __global__ void attn_kernel(const Gfx103xAttnArgs) {}
 
 #endif  // __GFX10__

@@ -10,7 +10,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -213,29 +212,16 @@ int attn_pieces() {
 // Records each op between two timing events when profiling.
 class Ops {
  public:
-  Ops(hipStream_t stream, bool profile)
-      : stream_(stream), profile_(profile), mem_trace_(std::getenv("MI_HIP_VAE_MEM_TRACE") != nullptr) {}
+  Ops(hipStream_t stream, bool profile) : stream_(stream), profile_(profile) {}
   template <class F>
   void run(const std::string& name, F&& op) {
-    if (!profile_ && !mem_trace_) {
+    if (!profile_) {
       op();
       return;
-    }
-    if (mem_trace_) {
-      hipDeviceSynchronize();
-      std::size_t free = 0, total = 0;
-      hipMemGetInfo(&free, &total);
-      std::fprintf(stderr, "[vae-mem] before %s: %.3f GiB free\n", name.c_str(), gib(free));
     }
     auto start = std::make_unique<Event>(true), stop = std::make_unique<Event>(true);
     start->record(stream_);
     op();
-    if (mem_trace_) {
-      hipDeviceSynchronize();
-      std::size_t free = 0, total = 0;
-      hipMemGetInfo(&free, &total);
-      std::fprintf(stderr, "[vae-mem] after  %s: %.3f GiB free\n", name.c_str(), gib(free));
-    }
     stop->record(stream_);
     timed_.push_back({name, std::move(start), std::move(stop)});
   }
@@ -260,7 +246,7 @@ class Ops {
     std::unique_ptr<Event> start, stop;
   };
   hipStream_t stream_;
-  bool profile_, mem_trace_;
+  bool profile_;
   std::vector<Timed> timed_;
 };
 
@@ -575,13 +561,14 @@ VaeDecodeStats VaeDecoder::decode_tiled(const float* latents, std::uint32_t h, s
   VaeDecodeStats st;
 
   constexpr double kPi = 3.14159265358979323846;
+  // `pos` and `tile_start` are both global image pixels. Interior tiles overlap, so their half-cosine ramps are
+  // averaged and normalised by `weight` below; the image-border edges stay at full weight.
   const auto ramp = [ol, kPi](int pos, int size, int tile_start, int tile_len) -> float {
-    // 1 inside the tile, a half-cosine rise/fall over the overlap on interior edges.
     const int t = pos - tile_start;
     const int feather = ol * 16;
     if (feather == 0) return 1.0;
     double v = 1.0;
-    // A half-weight at the tile edge so the neighbouring tile's edge sums to one there, rising to one over the feather.
+    // Half weight at an interior tile edge, rising to one over the feather.
     if (tile_start > 0 && t < feather) v = std::min(v, 0.5f + 0.5f * std::sin(kPi * t / (2.0 * feather)));
     if (tile_start + tile_len * 16 < size && t >= tile_len * 16 - feather)
       v = std::min(v, 0.5f + 0.5f * std::sin(kPi * (tile_len * 16 - 1 - t) / (2.0 * feather)));
@@ -605,9 +592,9 @@ VaeDecodeStats VaeDecoder::decode_tiled(const float* latents, std::uint32_t h, s
       st.seconds += ts.seconds;
       if (ts.device_bytes > st.device_bytes) st.device_bytes = ts.device_bytes;
       for (int y = 0; y < th * 16; ++y) {
-        const float wy = ramp(y, H, y0 * 16, th);
+        const float wy = ramp(y0 * 16 + y, H, y0 * 16, th);
         for (int x = 0; x < tw * 16; ++x) {
-          const float wgt = wy * ramp(x, W, x0 * 16, tw);
+          const float wgt = wy * ramp(x0 * 16 + x, W, x0 * 16, tw);
           const std::size_t p = static_cast<std::size_t>(y0 * 16 + y) * W + x0 * 16 + x;
           const std::size_t tp = static_cast<std::size_t>(y) * tw * 16 + x;
           weight[p] += wgt;
@@ -640,7 +627,7 @@ using hip_vae::kGroups;
 constexpr int kTailUnits = 17;         // units of the tail, see VaeTilePlan
 constexpr int kMaxSegmentUnits = 6;    // longer segments only add recomputation
 constexpr int kStatsSlots = 2 * kTailUnits;
-constexpr double kWorkPerByte = 29.0;  // TF32 convs ~10 TMAC/s vs ~350 GB/s for the elementwise kernels
+constexpr double kWorkPerByte = 29.0;  // relative cost of an elementwise byte read versus one convolution MAC, for ranking plans
 
 enum class UnitKind : std::uint8_t { kResnet, kUpsample, kOut };
 struct UnitShape {
@@ -1039,33 +1026,6 @@ std::string VaeTilePlan::describe() const {
   return s;
 }
 
-std::optional<VaeTilePlan> VaeDecoder::plan_tiled(int base_channels, std::uint32_t h, std::uint32_t w,
-                                                  std::uint64_t budget_bytes, int tile) {
-  require(base_channels > 0 && base_channels % 32 == 0, "decoder widths must be multiples of 32");
-  if (tile != 0) check_tile(tile);
-  const Planner p(base_channels, h, w);
-  const std::uint64_t fixed = p.fixed().total();
-  const std::uint64_t head_x = p.fixed().head_x;
-  std::optional<VaeTilePlan> best;
-  for (const int t : tile ? std::vector<int>{tile} : p.tiles()) {
-    const std::vector<PlanSeg> opts = p.options(t);
-    const std::vector<std::uint64_t> caps = block_caps(opts, p.geometry(), p.infos());
-    for (const std::uint64_t cap : caps) {
-      if (cap + fixed >= budget_bytes) break;
-      const std::uint64_t work_cap = budget_bytes - fixed - cap;
-      if (head_x > cap) continue;  // the head's output lives in the checkpoint block
-      const auto path = Planner::best_path(opts, cap, work_cap, p.geometry(), p.infos());
-      if (path.empty()) continue;
-      std::vector<PlanSeg> segs;
-      for (const PlanSeg* o : path) segs.push_back(*o);
-      VaeTilePlan plan = p.finish(t, segs);
-      if (!best || plan.relative_cost < best->relative_cost ||
-          (plan.relative_cost == best->relative_cost && plan.workspace_bytes < best->workspace_bytes))
-        best = std::move(plan);
-    }
-  }
-  return best;
-}
 
 VaeTilePlan VaeDecoder::plan_tiled_min_memory(int base_channels, std::uint32_t h, std::uint32_t w, int tile) {
   require(base_channels > 0 && base_channels % 32 == 0, "decoder widths must be multiples of 32");
@@ -1114,9 +1074,6 @@ VaeTilePlan VaeDecoder::plan_tiled_uniform(int base_channels, std::uint32_t h, s
   return p.finish(tile, segs);
 }
 
-std::uint64_t VaeDecoder::tiled_workspace_bytes(int base_channels, std::uint32_t h, std::uint32_t w, int tile) {
-  return plan_tiled_min_memory(base_channels, h, w, tile).workspace_bytes;
-}
 
 // ---- Exact band-tiled decode: executor ----------------------------------------------------------------------------------
 

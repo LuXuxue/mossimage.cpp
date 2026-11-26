@@ -64,8 +64,6 @@ __global__ __launch_bounds__(256) void gemm_tiled(const Bf16GemmArgs a) {
       const int rows = is_a ? BM : BN;
       const bf16* src = is_a ? a.a : a.b;
       const std::int64_t ld = is_a ? a.lda : a.ldb;
-      const bool in_n = is_a ? (m0 < a.m) : (n0 < a.n);
-      (void)in_n;
       __half* dst = is_a ? &As[buf][0] : &Bs[buf][0];
       for (int i = tid; i < rows * (BK / kVec); i += THREADS) {
         const int r = i / (BK / kVec), c = i % (BK / kVec), gk = k0 + c * kVec;
@@ -82,7 +80,8 @@ __global__ __launch_bounds__(256) void gemm_tiled(const Bf16GemmArgs a) {
         }
       }
     }
-  };  float acc[TM][TN] = {};
+  };
+  float acc[TM][TN] = {};
   load_tile(0, 0);
   if (BK < a.k) load_tile(1, BK);
   __syncthreads();
@@ -284,6 +283,7 @@ void bf16_gemm_tiled(bf16* c, std::int64_t ldc, const bf16* a, std::int64_t lda,
   // The same template instantiation is launched on both architectures so the mangled kernel name exists in every
   // object of the fat binary. Only the grid and the thread count differ: RDNA2's body uses a 64x64 tile / 256 threads.
   const bool rdna2 = device_is_rdna2();
+  if (rdna2 && k % 8 != 0) throw std::runtime_error("hip bf16 gemm: RDNA2 requires k to be a multiple of 8");
   const int tile = rdna2 ? 64 : 128;
   const int gx = (m + tile - 1) / tile, gy = (n + tile - 1) / tile;
   for (int x0 = 0; x0 < gx; x0 += kChunk) {

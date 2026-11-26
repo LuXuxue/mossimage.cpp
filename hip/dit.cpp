@@ -345,7 +345,6 @@ std::uint64_t Dit::activation_bytes(std::uint64_t tokens, std::uint64_t rows, st
     bytes += padded * 3u * h + padded * hip_block::kHeads * sizeof(float) +
              padded / 16u * hip_block::kHeads * sizeof(float) + tokens * sizeof(std::int32_t) +
              ((tokens + 255u) / 256u) * h * sizeof(float);
-             ((tokens + 255u) / 256u) * h * sizeof(float);
     // RDNA2's gfx103x attention needs a fp16 copy of V; charge it even on builds without RDNA2 so the budget is the
     // same across the dual-architecture binary.
     bytes += padded * h * 2u;

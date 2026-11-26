@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -695,22 +694,17 @@ void conv(const ConvArgs& a, Products products, hipStream_t stream) {
   require(products != Products::kFp32 || a.taps == 1, "conv", "fp32 products are for 1x1 convolutions (linears)");
   require(aligned16(a.x) && aligned16(a.w) && aligned16(a.out) && aligned16(a.residual), "conv", "pointers must be 16-byte aligned");
   const int k = a.taps * a.c;
-  // A single launch of the largest convolutions takes several seconds on a small APU, which can trip the OS's GPU
-  // watchdog. Split the output rows into bounded chunks: every output row still belongs to exactly one workgroup, so
-  // the results are bit-identical, but no kernel runs long enough to reset the driver. MI_HIP_VAE_CONV_CHUNK overrides
-  // the row budget.
-  std::int64_t chunk = 8192;
-  if (const char* s = std::getenv("MI_HIP_VAE_CONV_CHUNK")) {
-    const long long v = std::atoll(s);
-    if (v >= kTileM) chunk = (v / kTileM) * kTileM;
-  }
+  // A single launch of the largest convolutions can take long enough to trip the OS's GPU watchdog. Split the output
+  // rows into bounded chunks: each output row still belongs to exactly one workgroup, so the result is identical, but
+  // no kernel runs for long.
+  constexpr std::int64_t kChunkRows = 8192;
   const ConvKernelArgs ka{a.x, a.w, a.bias, a.residual, a.out, a.ldo, static_cast<std::int64_t>(a.h) * a.w_out, 0,
                           round_up(a.n, kConvTileN) * k, a.h, a.w_out, a.c, a.n, k,
                           static_cast<int>(round_up(a.n, kConvTileN) / kConvTileN)};
   const dim3 block(kWave);
   const bool tf32_all = products == Products::kTf32;
-  for (std::int64_t m0 = 0; m0 < ka.m; m0 += chunk) {
-    const std::int64_t rows = std::min(chunk, ka.m - m0);
+  for (std::int64_t m0 = 0; m0 < ka.m; m0 += kChunkRows) {
+    const std::int64_t rows = std::min(kChunkRows, ka.m - m0);
     ConvKernelArgs cka = ka;
     cka.m0 = m0;
     const dim3 grid(grid_of((rows + kTileM - 1) / kTileM * cka.n_tiles, 1, "conv"));

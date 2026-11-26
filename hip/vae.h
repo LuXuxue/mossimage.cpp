@@ -17,7 +17,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -79,8 +78,7 @@ class VaeDecoder {
 
   // latents: fp32 NCHW [128, h, w], the pipeline's final latents. rgb: resized to 16h x 16w x 3. image: when not null, the
   // decoder's fp32 output [16h, 16w, 3] before the clamp. Runs on its own stream and returns when the RGB is on the host.
-  // Setting MI_HIP_VAE_BAND_TILE=1 (optionally MI_HIP_VAE_BAND_TILE_PX=<multiple of 8>) inside decode() selects the
-  // byte-identical band-tiled path, so generate.cpp needs no changes to exercise it.
+  // A full decode is retried in tiles by the caller if it fails.
   VaeDecodeStats decode(const float* latents, std::uint32_t h, std::uint32_t w, std::vector<std::uint8_t>& rgb,
                         std::vector<float>* image = nullptr);
   // ComfyUI-style overlap-and-blend fallback for a device that cannot hold the full decode. Each tile is decoded on
@@ -91,17 +89,12 @@ class VaeDecoder {
                               std::uint32_t tile_px = 512, std::uint32_t overlap_px = 128);
 
   // ---- Exact band-tiled decode (fp32/TF32 only) ----
-  // Fastest schedule (least estimated recomputation) whose workspace fits budget_bytes; tile = 0 searches the band
-  // height, otherwise it is fixed (image pixels, a multiple of 8). nullopt when nothing fits.
-  static std::optional<VaeTilePlan> plan_tiled(int base_channels, std::uint32_t h, std::uint32_t w,
-                                               std::uint64_t budget_bytes, int tile = 0);
-  // The schedule with the smallest workspace for this band height, and among those the fastest.
+  // The schedule with the smallest workspace for this band height, and among those the fastest. tile is in image
+  // pixels, a multiple of 8.
   static VaeTilePlan plan_tiled_min_memory(int base_channels, std::uint32_t h, std::uint32_t w, int tile);
   // A fixed schedule: segments of at most six units, each banded at `tile` (or one band when that covers the
   // segment). Useful for testing every band grid, including a partial final band.
   static VaeTilePlan plan_tiled_uniform(int base_channels, std::uint32_t h, std::uint32_t w, int tile);
-  // plan_tiled_min_memory(...).workspace_bytes.
-  static std::uint64_t tiled_workspace_bytes(int base_channels, std::uint32_t h, std::uint32_t w, int tile);
 
   // Byte-identical to decode() in the same mode (fp32 activations, TF32 convolutions, exact integer-sum GroupNorms).
   // Requires a plan for this latent grid and decoder width. set_profile() works as in decode(). The optional

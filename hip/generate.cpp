@@ -29,12 +29,6 @@ double now_s() {
 
 double gib(std::uint64_t bytes) { return static_cast<double>(bytes) / static_cast<double>(1ull << 30); }
 
-// MI_HIP_MEM_TRACE=1 prints the device memory at the points where the text encoder and the DiT are loaded and freed.
-void trace_mem(const char* where, const Device& device) {
-  static const bool enabled = std::getenv("MI_HIP_MEM_TRACE") != nullptr;
-  if (enabled) std::fprintf(stderr, "[mem] %s: %.3f GiB free\n", where, gib(device.free_memory()));
-}
-
 // What the host can give to a pinned allocation: MemAvailable of /proc/meminfo on Linux (the page cache it would drop
 // included), the physical memory the processes can use on Windows.
 std::uint64_t host_available_bytes() {
@@ -79,19 +73,12 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     return file.empty() ? r.model_dir / sub : file;
   };
 
-  // The VAE first (about 0.1 GiB of weights, kept through the run), so a decode the device cannot hold fails before the
-  // text encoder and the steps run rather than after them.
+  // The VAE first (about 0.1 GiB of weights, kept through the run). A full decode that fails is retried in tiles
+  // after the text encoder and DiT have been freed.
   std::optional<VaeDecoder> vae;
-  std::uint64_t vae_ws = 0;
   if (r.decode) {
     vae.emplace(device, component(r.vae_file, "vae/diffusion_pytorch_model.safetensors"));
     vae->set_profile(std::getenv("MI_HIP_VAE_PROFILE") != nullptr);
-    // Validate the size and remember the full-decode footprint. A device that cannot hold it is not refused here:
-    // decode() falls back to the ComfyUI-style tiled decode (the text encoder and DiT have already been freed).
-    vae_ws = vae->workspace_bytes(lh, lw);
-    if (std::getenv("MI_HIP_VAE_MEM_TRACE"))
-      std::fprintf(stderr, "[vae-mem] image %ux%u: full workspace %.3f GiB, device reports %.3f GiB free, host %.3f GiB available\n",
-                   r.width, r.height, gib(vae_ws), gib(device.free_memory()), gib(host_available_bytes()));
   }
 
   // The DiT's plan for the prompts' lengths: what it holds beside its weights, the steps' activations, the refiner's
@@ -106,11 +93,10 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
   // hipMalloc rounds an allocation up to 2 MiB at worst: the weights' (the globals, the two refiner blocks, each block
   // on the device, the two slots) and the activations' (about 20 buffers).
   constexpr std::uint64_t kWeightRounding = (kDiTLayers + 5) * 2 * kMiB, kActivationMargin = 64 * kMiB;
-  // On gfx1035/gfx1103 APUs and dGPUs with a large BAR, hipMalloc can back allocations from system shared memory after
-  // hipMemGetInfo has already reported zero free (measured here: 0 reported at 7 GiB, allocation still succeeds to 15 GiB).
-  // With the automatic budget we therefore let the allocator decide instead of refusing on the report; an explicit
-  // --vram-budget remains a hard limit.
-  constexpr std::uint64_t kSharedMemoryAssumption = 16ull << 30;
+  // On APUs and dGPUs with a large BAR, hipMalloc can back allocations from system shared memory after hipMemGetInfo
+  // has reported little or no free memory. With the automatic budget we therefore let the allocator decide instead of
+  // refusing on that report; an explicit --vram-budget remains a hard limit.
+  constexpr std::uint64_t kAllocatorSlack = 16ull << 30;
   const std::uint64_t hw = std::uint64_t{lh} * lw;
   const std::uint64_t vae_bytes = vae ? vae->weight_bytes() : 0;
   char budget[64];
@@ -134,7 +120,7 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
                                       text_rows * kDiTDim * kBf16;
     const std::uint64_t need = activations + kReserve;
     char msg[512];
-    if (need > free && r.vram_budget == 0) free = need + kSharedMemoryAssumption;
+    if (need > free && r.vram_budget == 0) free = need + kAllocatorSlack;
     if (need > free) {
       std::snprintf(msg, sizeof msg,
                     "the DiT at %ux%u needs %.2f GiB of device memory beside its weights (activations %.2f GiB, reserve "
@@ -197,7 +183,6 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     te_options.tiled_gemm = pg == nullptr || std::strcmp(pg, "0") == 0;
     const char* dd = std::getenv("MI_HIP_TE_DEVICE_DEQUANT");
     te_options.device_dequant = dd == nullptr || std::strcmp(dd, "0") != 0;
-    trace_mem("before text encoder", device);
     std::optional<TextEncoder> encoder;
     encoder.emplace(device, component(r.te_file, "text_encoder"), te_options);
     const double load_s = now_s() - t0;
@@ -213,7 +198,6 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     out.text_encoder_load_s = load_s;
     encoder.reset();
     device.synchronize();
-    trace_mem("after text encoder", device);
   }
 
   // DiT: resident, the text refiner once per prompt, then the steps.
@@ -233,7 +217,6 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     out.dit_resident_blocks = dit.resident_blocks();
     // What is left must hold the activations; the reserve absorbs the runtime's own allocations and the rounding.
     out.dit_free_bytes = device.free_memory();
-    trace_mem("after DiT load", device);
     if (out.dit_free_bytes < p.activations + kActivationMargin) {
       char msg[512];
       std::snprintf(msg, sizeof msg,
@@ -281,7 +264,6 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     out.latents = std::move(latents);
   }
   device.synchronize();
-  trace_mem("after DiT", device);
 
   // VAE decode, after handing the final latents to the caller (a failed decode keeps them).
   if (r.on_latents) r.on_latents(out.latents);
@@ -290,8 +272,7 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     report("vae", 0, 1);
     VaeDecodeStats vst;
     // --vae-tiled is the only way to request tiling up front. Environment variables choose the mode and geometry.
-    // A full decode that actually fails (bad allocation, memory check, kernel error) falls back to the same path; this
-    // is deliberately not a memory-prediction heuristic -- the old ones were unreliable on shared-memory APUs.
+    // A full decode that throws is retried on the same tiled path: this is an error fallback, not a memory prediction.
     const auto tiled = [&]() -> VaeDecodeStats {
       const bool band = std::getenv("MI_HIP_VAE_BAND_TILE") != nullptr || std::getenv("MI_HIP_VAE_EXACT") != nullptr;
       if (band) {

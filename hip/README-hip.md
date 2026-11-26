@@ -6,16 +6,16 @@ architectures in a single executable, e.g. `gfx1103;gfx1035`. It is the AMD coun
 and Vulkan backends.
 
 RDNA2 (gfx1035) has neither matrix cores nor bf16 instructions. There the bf16 GEMMs convert their
-operands to fp16 and use `V_DOT2_F32_F16`, the INT8 GEMM uses `V_DOT4_I32_I8` in comfy-kitchen's
-gfx1035 VALU tile, and the DiT attention uses the shared bf16 attention kernel rather than the
-WMMA-only int8 SageAttention. The gfx1103 (and other matrix-core) paths are unchanged.
+operands to fp16 and use `V_DOT2_F32_F16`, the INT8 GEMM uses `V_DOT4_I32_I8` in a VALU tile, and
+the DiT attention uses `sage_attn_gfx103x.hip` (int8 Q/K, fp16 V) rather than the WMMA-only int8
+SageAttention. The gfx1103 (and other matrix-core) paths are unchanged.
 
 ## Features
 
 - `--tier high`: INT8 ConvRot DiT with native gfx11 WMMA intrinsics (RDNA3/4) or RDNA2 dot-product kernels
 - Runtime LoRA on all four DiT GEMMs; the delta is fused into the base GEMM's
   fp32 accumulator before bf16 rounding
-- INT8 SageAttention-style attention (QK and PV, u8 probabilities)
+- INT8 SageAttention-style attention: u8 probabilities on matrix-core devices, int8 Q/K with fp16 V on RDNA2
 - Accepts the `moss-infer generate` flag set, UTF-8 prompts, single-file
   `--dit`/`--te`/`--vae` overrides, varlen batches and high-resolution support.
   Flags that need CUDA-only machinery are accepted but print a no-effect notice.
@@ -29,8 +29,9 @@ hip\build-win.bat
 The script loads the MSVC environment (via the VS installer), discovers the SDK through
 `rocm-sdk path --root` (or `ROCM_PATH`), configures CMake with Ninja, and copies the
 executable plus the runtime DLLs into `hip\dist\`. No machine-specific SDK path is
-stored. `HIP_TARGET` defaults to the development GPU's single architecture and can be
-overridden for a release build. Intermediate files stay in the git-ignored `hip\build-win\`.
+stored. `HIP_TARGET` defaults to `gfx1103;gfx1035`, so one executable runs on both
+architectures; override it to build for a different set. Intermediate files stay in
+the git-ignored `hip\build-win\`.
 
 Relevant CMake inputs: the TheRock `clang-cl.exe`, `HIP_TARGET`, `ROCM_PATH` pointing at
 the SDK's devel root, and `--rocm-device-lib-path=<ROCM_PATH>\lib\llvm\amdgcn\bitcode`.
@@ -50,13 +51,33 @@ moss-infer-hip generate --model <bundle> --dit <file> --te <file> --vae <file> ^
 an explicit notice instead of being silently ignored. Launcher scripts are kept
 outside the repository.
 
+### VAE tiling
+
+The decoder runs a full-frame decode by default. If that fails, the run retries
+in tiles automatically. `--vae-tiled` requests tiling up front. Tiling mode and
+geometry come from the environment, only on the tiled path:
+
+| Variable | Effect |
+|---|---|
+| `MI_HIP_VAE_TILE_PX` | tile side in image pixels (default 512) |
+| `MI_HIP_VAE_OVERLAP_PX` | overlap in image pixels (default 128) |
+| `MI_HIP_VAE_BAND_TILE` or `MI_HIP_VAE_EXACT` | use the exact band-tiled decoder instead of overlap-and-blend |
+| `MI_HIP_VAE_BAND_TILE_PX` | band height in image pixels for the exact path |
+
+The overlap-and-blend path is faster than the exact band path but is not
+byte-identical to the full decode. The VAE decoder's other switches are
+`MI_HIP_VAE_ATTN_PIECES=3` (exact 3-piece attention) and `MI_HIP_VAE_PROFILE`
+(per-op timings).
+
 ## Implementation notes
 
 - `int8_leaf.h` uses raw `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32`
   intrinsics, not rocWMMA: each lane holds a whole 16-byte K-step, and
   accumulator element `e` is row `2*e + lane/16`, column `lane % 16`.
-- The INT8 and bf16 GEMMs share an LDS-staged, software-pipelined 128x128 tile;
-  shallow K uses a 512-thread 2x2 fragment grid, deep K a 128-thread 4x4 grid.
+- On matrix-core devices the INT8 and bf16 GEMMs share an LDS-staged,
+  software-pipelined 128x128 tile; shallow K uses a 512-thread 2x2 fragment grid,
+  deep K a 128-thread 4x4 grid. On RDNA2 the bf16 GEMM uses a 64x64 / 256-thread
+  tile and the INT8 GEMM a 128x128 / 256-thread VALU tile.
 - Attention evaluates `Sᵀ = K·Qᵀ` and `Oᵀ = Vᵀ·Pᵀ` in 128-query / 64-key tiles,
   keeping u8 probabilities in registers so the online softmax is scalar per
   lane. Q/K/V quantizers derive all varlen offsets from `cu_seqlens` on device.
@@ -98,7 +119,6 @@ them off. On a build with them enabled:
 - `hip_int8_gemm_check`, `hip_bf16_gemm_check`, `hip_int8_attn_probe`,
   `hip_attn_probe` — compare kernels against host references
 - `hip_int8_gemm_bench`, `hip_bf16_gemm_bench`, `hip_rotate_quantize_bench`,
-  `hip_lora_info`, `hip_te_profile`, `hip_dequant_fast_check`,
-  `hip_bf16_small_bench` — report kernel throughput, LoRA branch shapes and
-  text-encoder timing/accuracy
+  `hip_lora_info`, `hip_te_profile`, `hip_dequant_fast_check` — report kernel
+  throughput, LoRA branch shapes and text-encoder timing/accuracy
 - `MI_HIP_OP_TIME` (any value) prints a per-op DiT timing breakdown

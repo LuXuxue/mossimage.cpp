@@ -31,6 +31,8 @@ int main() {
     device.synchronize();
     std::vector<bf16> got(static_cast<std::size_t>(m) * n);
     dc.download(got.data(), got.size() * 2);
+    // Different K-step and fragment orders are valid as long as the result is within bf16 rounding distance of the
+    // fp32 reference.
     std::size_t bad = 0;
     for (int r = 0; r < m; ++r) {
       for (int col = 0; col < n; ++col) {
@@ -40,24 +42,11 @@ int main() {
           const float bv = mi::hip::bf16_to_float(bh[static_cast<std::size_t>(col) * k + t]);
           acc += av * bv;
         }
-        if (got[static_cast<std::size_t>(r) * n + col] != rbf(acc)) ++bad;
+        const float got_v = mi::hip::bf16_to_float(got[static_cast<std::size_t>(r) * n + col]);
+        if (std::fabs(got_v - acc) > 0.01f * (1.0f + std::fabs(acc))) ++bad;
       }
     }
-    // Compare against the original small-tile GEMM on the same operands.
-    DeviceBuffer dold(static_cast<std::size_t>(m) * n * 2);
-    hip_block::gemm(dold.as<bf16>(), n, da.as<bf16>(), k, db.as<bf16>(), k, m, n, k, 0);
-    device.synchronize();
-    std::vector<bf16> old(static_cast<std::size_t>(m) * n);
-    dold.download(old.data(), old.size() * 2);
-    std::size_t diff = 0, big = 0;
-    for (std::size_t i = 0; i < got.size(); ++i) {
-      if (got[i] == old[i]) continue;
-      ++diff;
-      const float a = mi::hip::bf16_to_float(got[i]), b = mi::hip::bf16_to_float(old[i]);
-      if (std::fabs(a - b) > 0.01f * (1.0f + std::fabs(b))) ++big;
-    }
-    std::printf("%4dx%4dx%4d: %s (%zu of %d) vs-old diff=%zu big=%zu\n", m, n, k, bad ? "FAILED" : "ok", bad,
-                m * n, diff, big);
+    std::printf("%4dx%4dx%4d: %s (%zu of %d)\n", m, n, k, bad ? "FAILED" : "ok", bad, m * n);
     ok &= bad == 0;
   }
   return ok ? 0 : 1;

@@ -59,10 +59,8 @@ void run_int8_block_op(int op, const Int8BlockWeights& w, const BlockBuffers& b,
       if (device_is_rdna2()) {
         // The comfy-kitchen gfx103x int8 attention: Q/K come from the same quantized buffers as the gfx11 path,
         // V is copied to fp16, and cu_seqlens is read on device so each sequence keeps its own padded columns.
-        // The gfx103x kernel reads Q/K in int8 and V in fp16, so the int8 V quantizer's three kernels are dead work.
-        // MI_I8ATTN_QUANT_V=1 restores them for A/B measurements.
-        const bool quant_v = std::getenv("MI_I8ATTN_QUANT_V") == nullptr;
-        int8_attn_quantize(b.qkv, kQkv, ib.attn, static_cast<int>(tokens), stream, quant_v);
+        // The gfx103x kernel reads Q/K in int8 and V in fp16, so skip the int8 V quantizer's three kernels.
+        int8_attn_quantize(b.qkv, kQkv, ib.attn, static_cast<int>(tokens), stream, false);
         gfx103x_v_to_fp16(b.qkv, kQkv, b.cu_seqlens, ib.attn.v_fp16, static_cast<int>(tokens), b.batch, stream);
         gfx103x_attn({ib.attn.q, ib.attn.k, ib.attn.v_fp16, b.attn, ib.attn.q_scale, ib.attn.k_scale,
                       kHeads * kHead, kHeads, kHeads, kDim, b.cu_seqlens, b.batch, b.max_seqlen, kHeads,

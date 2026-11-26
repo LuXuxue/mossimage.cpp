@@ -1,5 +1,5 @@
 #!/bin/sh
-# Static check of an AMD device build of one kernel source (block_kernels.hip, dit_kernels.hip, te_kernels.hip,
+# Static check of an AMD device build of a WMMA kernel source (block_kernels.hip, dit_kernels.hip, te_kernels.hip,
 # vae_kernels.hip), from its assembly and linked code object:
 #   check_device.sh <llvm bin dir> <arch> <file.s> <code object>
 # Prints each kernel's v_wmma_f32_16x16x16_bf16 count and resources, and the code object's undefined symbols. Fails if

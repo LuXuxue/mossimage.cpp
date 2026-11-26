@@ -157,8 +157,12 @@ else()
   # matrix-core architectures only; the same sources were still compiled for every HIP_TARGET in the library above.
   set(_check_archs ${HIP_TARGET})
   list(FILTER _check_archs EXCLUDE REGEX "^gfx103")
+  # check_device.sh knows the WMMA counts for these four sources. The dot-product and quantizer kernels have no WMMA
+  # to count and are verified by their dedicated checks instead.
+  set(_check_sources ${MI_HIP_KERNELS})
+  list(FILTER _check_sources INCLUDE REGEX "^(block_kernels|dit_kernels|te_kernels|vae_kernels)\\.hip$")
   foreach(_arch IN LISTS _check_archs)
-    foreach(_src IN LISTS MI_HIP_KERNELS)
+    foreach(_src IN LISTS _check_sources)
       get_filename_component(_name ${_src} NAME_WE)
       set(_out ${_name}.${_arch})
       add_custom_command(OUTPUT ${_out}.s DEPENDS ${_src} ${_deps}
@@ -297,11 +301,6 @@ target_link_libraries(hip_rotate_quantize_bench PRIVATE mossinfer_hip)
 add_executable(hip_fused_quant_check tools/hip_fused_quant_check.cpp)
 target_compile_options(hip_fused_quant_check PRIVATE ${MI_HIP_WARN})
 target_link_libraries(hip_fused_quant_check PRIVATE mossinfer_hip)
-
-# Compare the small rocWMMA GEMM with the tiled GEMM on text-encoder shapes.
-add_executable(hip_bf16_small_bench tools/hip_bf16_small_bench.cpp)
-target_compile_options(hip_bf16_small_bench PRIVATE ${MI_HIP_WARN})
-target_link_libraries(hip_bf16_small_bench PRIVATE mossinfer_hip)
 
 # LoRA GEMM shape throughput.
 add_executable(hip_bf16_gemm_bench tools/hip_bf16_gemm_bench.cpp)

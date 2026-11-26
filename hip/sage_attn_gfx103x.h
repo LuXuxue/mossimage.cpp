@@ -28,7 +28,8 @@ struct Gfx103xAttnArgs {
   float sm_scale_log2e;         // (1 / sqrt(head_dim)) * log2(e)
 };
 
-// Run one sequence's attention on the current RDNA2 device. Throws on other architectures.
+// Run one sequence's attention on the current RDNA2 device. The caller must select this path only on RDNA2
+// (device_is_rdna2()); non-AMD builds throw, but a non-RDNA2 AMD code object has no kernel for it.
 void gfx103x_attn(const Gfx103xAttnArgs& a, hipStream_t stream);
 
 // Convert the bf16 V rows of b.qkv + 2*kDim to fp16 bits in the layout above. cu is cu_seqlens on the device.

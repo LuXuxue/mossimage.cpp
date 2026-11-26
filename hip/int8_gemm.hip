@@ -103,8 +103,8 @@ __global__ __launch_bounds__(256) void int8_gemm_valu(const Int8GemmArgs a, int 
     if (next < a.k) load_tile((buf + PREFETCH) % NBUFFERS, next);
     const std::int8_t* ac = &As[buf][0];
     const std::int8_t* bc = &Bs[buf][0];
-// Keep only one 16-byte K chunk's operands live at a time. Unrolling all four chunks keeps four times the v4i
-    // operands in VGPRs, which costs an entire wave/SIMD (comfy-kitchen gemm_gfx10.h measured 5.97 vs 3.97 TOPS).
+    // Keep only one 16-byte K chunk's operands live at a time. Unrolling all four chunks keeps four times the v4i
+    // operands in VGPRs, which costs an entire wave/SIMD.
 #pragma unroll 1
     for (int c = 0; c < VPR; ++c) {
       v4i av[TM], bv[TN];
