@@ -54,22 +54,35 @@ __global__ __launch_bounds__(256) void gemm_tiled(const Bf16GemmArgs a) {
   const int orow = trow * TM, ocol = tcol * TN;
   const int m0 = static_cast<int>(blockIdx.y) * BM, n0 = static_cast<int>(blockIdx.x) * BN;
 
+  // Eight bf16 per lane: one 16-byte global load and one 16-byte LDS write per row chunk instead of eight scalar
+  // pairs. The LoRA delta GEMMs that use this kernel on RDNA2 are memory-staging bound.
+  constexpr int kVec = 8;
   auto load_tile = [&](int buf, int k0) {
-    for (int i = tid; i < BM * BK; i += THREADS) {
-      const int r = i / BK, k = i % BK, gk = k0 + k;
-      As[buf][r * STRIDE + k] = (m0 + r < a.m && gk < a.k)
-                                    ? bf16_to_half(a.a[static_cast<std::int64_t>(m0 + r) * a.lda + gk])
-                                    : __float2half_rn(0.0f);
+#pragma unroll
+    for (int side = 0; side < 2; ++side) {
+      const bool is_a = side == 0;
+      const int rows = is_a ? BM : BN;
+      const bf16* src = is_a ? a.a : a.b;
+      const std::int64_t ld = is_a ? a.lda : a.ldb;
+      const bool in_n = is_a ? (m0 < a.m) : (n0 < a.n);
+      (void)in_n;
+      __half* dst = is_a ? &As[buf][0] : &Bs[buf][0];
+      for (int i = tid; i < rows * (BK / kVec); i += THREADS) {
+        const int r = i / (BK / kVec), c = i % (BK / kVec), gk = k0 + c * kVec;
+        uint4 val = make_uint4(0, 0, 0, 0);
+        if ((is_a ? m0 + r < a.m : n0 + r < a.n) && gk < a.k)
+          val = *reinterpret_cast<const uint4*>(src + static_cast<std::int64_t>((is_a ? m0 : n0) + r) * ld + gk);
+        const std::uint32_t w[4] = {val.x, val.y, val.z, val.w};
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const std::uint32_t word = w[q];
+          const std::uint16_t lo = static_cast<std::uint16_t>(word), hi = static_cast<std::uint16_t>(word >> 16);
+          dst[r * STRIDE + c * kVec + 2 * q] = gk < a.k ? bf16_to_half(lo) : __float2half_rn(0.0f);
+          dst[r * STRIDE + c * kVec + 2 * q + 1] = gk < a.k ? bf16_to_half(hi) : __float2half_rn(0.0f);
+        }
+      }
     }
-    for (int i = tid; i < BN * BK; i += THREADS) {
-      const int r = i / BK, k = i % BK, gk = k0 + k;
-      Bs[buf][r * STRIDE + k] = (n0 + r < a.n && gk < a.k)
-                                    ? bf16_to_half(a.b[static_cast<std::int64_t>(n0 + r) * a.ldb + gk])
-                                    : __float2half_rn(0.0f);
-    }
-  };
-
-  float acc[TM][TN] = {};
+  };  float acc[TM][TN] = {};
   load_tile(0, 0);
   if (BK < a.k) load_tile(1, BK);
   __syncthreads();

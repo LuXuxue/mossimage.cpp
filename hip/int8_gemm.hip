@@ -146,6 +146,7 @@ __global__ __launch_bounds__(256) void int8_gemm_valu(const Int8GemmArgs a, int 
     if (row >= a.m) continue;
     const float xs = a.x_scale[row];
     const bf16_bits* ldrow = a.lora_delta != nullptr ? a.lora_delta + static_cast<std::int64_t>(row) * a.ldl : nullptr;
+    bf16_bits out[TN] = {};
 #pragma unroll
     for (int j = 0; j < TN; ++j) {
       if (!valid[j]) continue;
@@ -153,14 +154,26 @@ __global__ __launch_bounds__(256) void int8_gemm_valu(const Int8GemmArgs a, int 
       float v = static_cast<float>(acc[i][j]) * xs * wsc[j] + bi[j];
       if (ldrow != nullptr) v += f(ldrow[col]);
       const bf16_bits g = bf(v);
-      const std::size_t at = static_cast<std::size_t>(row) * a.ldy + col;
       if (a.gate != nullptr) {
         const float prod = f(g) * f(gt[j]);
         const float res = a.residual != nullptr ? f(a.residual[static_cast<std::int64_t>(row) * a.ldr + col]) : 0.0f;
-        a.y[at] = bf(add(res, prod));
+        out[j] = bf(add(res, prod));
       } else {
-        a.y[at] = g;
+        out[j] = g;
       }
+    }
+    // The thread tile covers four consecutive columns: two 32-bit stores instead of four 16-bit ones. A pair that
+    // straddles the last column must stay scalar, otherwise its padding half would overwrite the next row (ldy = n).
+    const std::size_t at = static_cast<std::size_t>(row) * a.ldy + n0 + ocol;
+#pragma unroll
+    for (int j = 0; j < TN; j += 2) {
+      if (valid[j] && valid[j + 1])
+        *reinterpret_cast<std::uint32_t*>(&a.y[at + j]) = static_cast<std::uint32_t>(out[j]) |
+                                                          (static_cast<std::uint32_t>(out[j + 1]) << 16);
+      else if (valid[j])
+        a.y[at + j] = out[j];
+      else if (valid[j + 1])
+        a.y[at + j + 1] = out[j + 1];
     }
   }
 }
