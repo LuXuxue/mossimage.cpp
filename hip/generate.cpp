@@ -82,12 +82,16 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
   // The VAE first (about 0.1 GiB of weights, kept through the run), so a decode the device cannot hold fails before the
   // text encoder and the steps run rather than after them.
   std::optional<VaeDecoder> vae;
+  std::uint64_t vae_ws = 0;
   if (r.decode) {
     vae.emplace(device, component(r.vae_file, "vae/diffusion_pytorch_model.safetensors"));
     vae->set_profile(std::getenv("MI_HIP_VAE_PROFILE") != nullptr);
     // Validate the size and remember the full-decode footprint. A device that cannot hold it is not refused here:
     // decode() falls back to the ComfyUI-style tiled decode (the text encoder and DiT have already been freed).
-    (void)vae->workspace_bytes(lh, lw);
+    vae_ws = vae->workspace_bytes(lh, lw);
+    if (std::getenv("MI_HIP_VAE_MEM_TRACE"))
+      std::fprintf(stderr, "[vae-mem] image %ux%u: full workspace %.3f GiB, device reports %.3f GiB free, host %.3f GiB available\n",
+                   r.width, r.height, gib(vae_ws), gib(device.free_memory()), gib(host_available_bytes()));
   }
 
   // The DiT's plan for the prompts' lengths: what it holds beside its weights, the steps' activations, the refiner's
@@ -102,6 +106,11 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
   // hipMalloc rounds an allocation up to 2 MiB at worst: the weights' (the globals, the two refiner blocks, each block
   // on the device, the two slots) and the activations' (about 20 buffers).
   constexpr std::uint64_t kWeightRounding = (kDiTLayers + 5) * 2 * kMiB, kActivationMargin = 64 * kMiB;
+  // On gfx1035/gfx1103 APUs and dGPUs with a large BAR, hipMalloc can back allocations from system shared memory after
+  // hipMemGetInfo has already reported zero free (measured here: 0 reported at 7 GiB, allocation still succeeds to 15 GiB).
+  // With the automatic budget we therefore let the allocator decide instead of refusing on the report; an explicit
+  // --vram-budget remains a hard limit.
+  constexpr std::uint64_t kSharedMemoryAssumption = 16ull << 30;
   const std::uint64_t hw = std::uint64_t{lh} * lw;
   const std::uint64_t vae_bytes = vae ? vae->weight_bytes() : 0;
   char budget[64];
@@ -125,6 +134,13 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
                                       text_rows * kDiTDim * kBf16;
     const std::uint64_t need = activations + kReserve;
     char msg[512];
+    if (need > free && r.vram_budget == 0) {
+      std::fprintf(stderr,
+                   "moss-infer-hip: hipMemGetInfo reports %.2f GiB free but %.2f GiB is needed beside the DiT's weights; "
+                   "assuming shared memory is available and letting hipMalloc decide\n",
+                   gib(free), gib(need));
+      free = need + kSharedMemoryAssumption;
+    }
     if (need > free) {
       std::snprintf(msg, sizeof msg,
                     "the DiT at %ux%u needs %.2f GiB of device memory beside its weights (activations %.2f GiB, reserve "
@@ -228,10 +244,13 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
       char msg[512];
       std::snprintf(msg, sizeof msg,
                     "the DiT's weights take %.2f GiB of device memory (%s); beside them its activations at %ux%u need "
-                    "%.2f GiB, %s has %.2f GiB free",
+                    "%.2f GiB, %s reports %.2f GiB free",
                     gib(dit.weight_bytes()), budget, r.width, r.height, gib(p.activations + kActivationMargin),
                     device.info().name.c_str(), gib(out.dit_free_bytes));
-      throw std::runtime_error(msg);
+      // With an explicit budget this is a real limit. With the automatic budget the report can be zero long before
+      // shared memory is exhausted, so continue and let an actual hipMalloc failure report the real limit.
+      if (r.vram_budget != 0) throw std::runtime_error(msg);
+      std::fprintf(stderr, "moss-infer-hip: %s; continuing on shared memory\n", msg);
     }
     std::vector<DeviceBuffer> texts;
     texts.reserve(embeds.size());  // the rows point into it
@@ -279,41 +298,58 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     VaeDecodeStats vst;
     const bool force_approx = std::getenv("MI_HIP_VAE_TILED") != nullptr;  // legacy ComfyUI-style switch
     const bool force_exact = std::getenv("MI_HIP_VAE_EXACT") != nullptr;
+    // Shared VRAM is system RAM: the carve-out is about half of physical memory, but that RAM must also hold the
+    // pinned host weights, the OS and this process. AMD's convolution solver additionally allocates workspace before a
+    // kernel runs, so a full decode can use several times its nominal workspace. Cap it conservatively; the exact
+    // band-tiled path recomputes rows but has a small, bounded workspace and is byte-identical.
+    // 1.5 GiB nominal workspace is the safe ceiling measured on this APU: beyond it the solver's transient allocations
+    // can exhaust shared RAM even while hipMemGetInfo still reports free memory. Raise with MI_HIP_VAE_FULL_MAX_GiB
+    // when the device has enough dedicated memory.
+    std::uint64_t full_cap = std::min(1536ull << 20, host_available_bytes() / 8);
+    if (const char* cap = std::getenv("MI_HIP_VAE_FULL_MAX_GiB")) {
+      const double g = std::atof(cap);
+      if (g > 0) full_cap = static_cast<std::uint64_t>(g * 1073741824.0);
+    }
+    const bool skip_full = !force_approx && (force_exact || vae_ws > full_cap);
+    if (skip_full && !force_exact)
+      std::fprintf(stderr,
+                   "moss-infer-hip: full VAE workspace %.2f GiB exceeds the %.2f GiB shared-memory cap; using exact "
+                   "band tiling instead\n", gib(vae_ws), gib(full_cap));
     bool decoded = false;
-    try {
-      if (force_approx || force_exact) throw std::runtime_error("tiled decode requested");
-      vst = vae->decode(out.latents.data(), lh, lw, out.rgb);
-      decoded = true;
-    } catch (const std::runtime_error& e) {
-      std::fprintf(stderr, "moss-infer-hip: full VAE decode (%s); decoding in tiles\n", e.what());
-      // Prefer the byte-identical band-tiled decode. It recomputes overlapped rows, so it is slower than the full
-      // decode but produces exactly the same pixels; the ComfyUI-style overlap-and-blend path is a last resort.
-      if (!force_approx) {
-        constexpr std::uint64_t kDecodeReserve = 64ull << 20;
-        const std::uint64_t free = device.free_memory();
-        const std::uint64_t budget = free > kDecodeReserve ? free - kDecodeReserve : 0;
-        int tile = 0;
-        if (const char* tp = std::getenv("MI_HIP_VAE_BAND_TILE_PX")) tile = std::atoi(tp);
-        std::optional<VaeTilePlan> plan = VaeDecoder::plan_tiled(vae->base_channels(), lh, lw, budget, tile);
-        if (!plan) {
-          const VaeTilePlan p = tile > 0 ? VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, tile)
-                                         : VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, 8);
-          if (p.workspace_bytes <= budget) plan = p;
-        }
-        if (plan) {
-          std::fprintf(stderr, "moss-infer-hip: exact band-tiled VAE: %s\n", plan->describe().c_str());
-          vst = vae->decode_tiled_exact(out.latents.data(), lh, lw, out.rgb, *plan);
-          decoded = true;
-        }
+    if (!skip_full) {
+      try {
+        vst = vae->decode(out.latents.data(), lh, lw, out.rgb);
+        decoded = true;
+      } catch (const std::runtime_error& e) {
+        std::fprintf(stderr, "moss-infer-hip: full VAE decode (%s); decoding in tiles\n", e.what());
       }
-      if (!decoded) {
-        int tile_px = 512, overlap_px = 128;
-        if (const char* tp = std::getenv("MI_HIP_VAE_TILE_PX")) tile_px = std::atoi(tp);
-        if (const char* opx = std::getenv("MI_HIP_VAE_OVERLAP_PX")) overlap_px = std::atoi(opx);
-        vst = vae->decode_tiled(out.latents.data(), lh, lw, out.rgb, nullptr,
-                                static_cast<std::uint32_t>(std::max(tile_px, 32)),
-                                static_cast<std::uint32_t>(std::max(overlap_px, 0)));
+    }
+    if (!decoded && !force_approx) {
+      // The solver's transient allocations can exhaust RAM even when hipMemGetInfo still reports free memory, so size
+      // the tiled budget from system RAM, not from the device report.
+      std::uint64_t budget = host_available_bytes() / 4;
+      if (r.vram_budget != 0 && r.vram_budget > vae_bytes) budget = std::min(budget, r.vram_budget - vae_bytes);
+      int tile = 0;
+      if (const char* tp = std::getenv("MI_HIP_VAE_BAND_TILE_PX")) tile = std::atoi(tp);
+      std::optional<VaeTilePlan> plan = VaeDecoder::plan_tiled(vae->base_channels(), lh, lw, budget, tile);
+      if (!plan) {
+        const VaeTilePlan p = tile > 0 ? VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, tile)
+                                       : VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, 8);
+        if (p.workspace_bytes <= budget) plan = p;
       }
+      if (plan) {
+        std::fprintf(stderr, "moss-infer-hip: exact band-tiled VAE: %s\n", plan->describe().c_str());
+        vst = vae->decode_tiled_exact(out.latents.data(), lh, lw, out.rgb, *plan);
+        decoded = true;
+      }
+    }
+    if (!decoded) {
+      int tile_px = 512, overlap_px = 128;
+      if (const char* tp = std::getenv("MI_HIP_VAE_TILE_PX")) tile_px = std::atoi(tp);
+      if (const char* opx = std::getenv("MI_HIP_VAE_OVERLAP_PX")) overlap_px = std::atoi(opx);
+      vst = vae->decode_tiled(out.latents.data(), lh, lw, out.rgb, nullptr,
+                              static_cast<std::uint32_t>(std::max(tile_px, 32)),
+                              static_cast<std::uint32_t>(std::max(overlap_px, 0)));
     }
     if (!vst.profile.empty()) {
       std::fprintf(stderr, "[vae-op]");

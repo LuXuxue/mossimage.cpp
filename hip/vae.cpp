@@ -213,16 +213,29 @@ int attn_pieces() {
 // Records each op between two timing events when profiling.
 class Ops {
  public:
-  Ops(hipStream_t stream, bool profile) : stream_(stream), profile_(profile) {}
+  Ops(hipStream_t stream, bool profile)
+      : stream_(stream), profile_(profile), mem_trace_(std::getenv("MI_HIP_VAE_MEM_TRACE") != nullptr) {}
   template <class F>
   void run(const std::string& name, F&& op) {
-    if (!profile_) {
+    if (!profile_ && !mem_trace_) {
       op();
       return;
+    }
+    if (mem_trace_) {
+      hipDeviceSynchronize();
+      std::size_t free = 0, total = 0;
+      hipMemGetInfo(&free, &total);
+      std::fprintf(stderr, "[vae-mem] before %s: %.3f GiB free\n", name.c_str(), gib(free));
     }
     auto start = std::make_unique<Event>(true), stop = std::make_unique<Event>(true);
     start->record(stream_);
     op();
+    if (mem_trace_) {
+      hipDeviceSynchronize();
+      std::size_t free = 0, total = 0;
+      hipMemGetInfo(&free, &total);
+      std::fprintf(stderr, "[vae-mem] after  %s: %.3f GiB free\n", name.c_str(), gib(free));
+    }
     stop->record(stream_);
     timed_.push_back({name, std::move(start), std::move(stop)});
   }
@@ -247,7 +260,7 @@ class Ops {
     std::unique_ptr<Event> start, stop;
   };
   hipStream_t stream_;
-  bool profile_;
+  bool profile_, mem_trace_;
   std::vector<Timed> timed_;
 };
 
