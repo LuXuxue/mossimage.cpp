@@ -27,6 +27,7 @@
 #include "core/cuda_check.h"
 #include "core/tensor.h"
 #include "kernels/attention/flash_attention.h"
+#include "kernels/attention_q8/attention_q8.h"
 #include "kernels/basic/gemm.h"
 #include "kernels/quant/quant.h"
 #include "kernels/sm75/sm75.h"
@@ -691,6 +692,42 @@ void dp4a_shape(int M, int N, int K, bool check) {
 }
 
 // ---------------------------------------------------------------- attention timing
+
+void q8_bench(int len, int heads, int kv, int iters) {
+  const std::size_t qn = static_cast<std::size_t>(len) * heads * 128, kn = static_cast<std::size_t>(len) * kv * 128;
+  const auto q = normal(qn, 71, 1.f), k = normal(kn, 72, 1.f), v = normal(kn, 73, 1.f);
+  std::vector<std::uint16_t> qb(qn), kb(kn), vb(kn);
+  for (std::size_t i = 0; i < qn; ++i) qb[i] = float_to_bf16_bits(q[i]);
+  for (std::size_t i = 0; i < kn; ++i) kb[i] = float_to_bf16_bits(k[i]);
+  for (std::size_t i = 0; i < kn; ++i) vb[i] = float_to_bf16_bits(v[i]);
+  DevBuf dq(qn * 2), dk(kn * 2), dv(kn * 2), do_(qn * 2), dcu(8);
+  dq.upload(qb); dk.upload(kb); dv.upload(vb);
+  const std::vector<int> cu{0, len};
+  dcu.upload(cu);
+  auto t = [](void* p, DType dt, std::initializer_list<std::int64_t> s) {
+    return Tensor::view(p, dt, Device::kCUDA, s);
+  };
+  const Tensor tq = t(dq.get(), DType::kBF16, {len, heads, 128});
+  const Tensor tk = t(dk.get(), DType::kBF16, {len, kv, 128});
+  const Tensor tv = t(dv.get(), DType::kBF16, {len, kv, 128});
+  const Tensor to = t(do_.get(), DType::kBF16, {len, heads, 128});
+  const Tensor tc = t(dcu.get(), DType::kI32, {2});
+  mi::attention_q8::Options opt;
+  opt.variant = mi::attention_q8::Variant::kInt8Fp16F32Acc;
+  const std::size_t ws = mi::attention_q8::attention_q8_workspace_bytes(opt, len, len, 1, len, heads, kv);
+  DevBuf dws(ws);
+  const float scale = 1.f / std::sqrt(128.f);
+  const auto call = [&] {
+    mi::attention_q8::attention_q8(opt, tq, tk, tv, to, tc, tc, len, scale, dws.get(), ws, nullptr, nullptr);
+  };
+  call();
+  MI_CUDA_CHECK(cudaDeviceSynchronize());
+  const double ms = bench(call, iters, 2);
+  const double flops = 2.0 * len * len * 128 * heads;
+  std::printf("q8 L %5d heads %2d kv %2d: %8.3f ms  %6.2f TFLOPS (both QK+PV)\n", len, heads, kv, ms,
+              flops / (ms * 1e-3) / 1e12);
+}
+
 void attention() {
   const auto run = [](int len, int heads, int kv, int dim, bool causal, int iters) {
     const auto q = normal(static_cast<std::size_t>(len) * heads * dim, 71, 1.f);
@@ -869,7 +906,12 @@ int main(int argc, char** argv) {
         dp4a_shape(1024, 3072, 8192, false);
       }
     }
-    if (what == "attn" || what == "all") attention();
+    if (what == "q8bench") {
+    q8_bench(4113, 24, 24, 5);
+    q8_bench(266, 24, 24, 30);
+    return 0;
+  }
+  if (what == "attn" || what == "all") attention();
   } catch (const std::exception& e) {
     std::printf("EXCEPTION: %s\n", e.what());
     return 2;

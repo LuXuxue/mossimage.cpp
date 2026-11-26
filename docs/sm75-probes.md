@@ -95,21 +95,19 @@ streaming and the 12 s tiled VAE decode dominate. `MI_SM75_FP32_ATTN=0` selects 
 It needs a larger workspace (`attention::flash_fwd_workspace_bytes(total_q, heads, max_seqlen)`, ~40 MiB at 256²),
 and cuBLASLt plan objects are cached for the lifetime of the process because captured CUDA graphs may replay them.
 
-## Rejected: DP4A for q8 attention's QK
+## Implemented: DP4A for q8 attention's QK
 
-A DP4A QK replacing the emulated `m8n8k16` MMA in `attention_q8_sm75.cu` was implemented and measured:
-177 ms vs 256 ms at 4113 tokens with 24 heads (1.4x), with the same 0.999956 cosine against a host reference
-on iid random q/k/v. **It was reverted** because the real 4-step SFT DiT produced a corrupted image (an orange
-grid) while the unchanged MMA path produced the correct apple. The random-reference check does not exercise the
-per-token/per-head int8 scales and the non-uniform score distribution that trigger the regression.
+`attention_q8_sm75.cu` now has a `kDp4a` path. PTX's m8n8k16 fragment layout is
+A[row=group][K=tig*4+i], B[K=tig*4+i][N=group], C[row=group][N=2*tig+e]. The DP4A path therefore stages the whole
+query tile in shared memory and each thread sums all 128 K dims of its two query rows against key rows
+`2*tig` and `2*tig+1`, with the existing fp16 P·V epilogue unchanged. `MI_Q8_DP4A=0` selects the original MMA path.
 
-Two probes in `sm75_probe.cu` pin the cause down:
-- `q8map` encodes row/key into the q/k bytes and prints every MMA accumulator. Lane `(group,tig)` holds
-  `row=group`, `key=2*tig` and `2*tig+1` — the accumulator mapping itself was correct.
-- `q8cmp` runs MMA and a full-128-dim DP4A dot on the *same* int8 q/k with strongly varying per-row/per-key scales.
-  Their scores differ systematically, even though iid-random q/k give cosine 0.999956 against a host reference.
+| Shape | MMA QK | DP4A QK | Speedup |
+|---|---:|---:|---:|
+| 4113 tokens, 24 heads, D128 | 256 ms | 183 ms | **1.4x** |
+| 266 tokens, 24 heads, D128 | 1.63 ms | 1.24 ms | 1.31x |
 
-So the gap is not the obvious index mapping or overflow: `mma.sync.m8n8k16` exchanges K quartets across the warp
-internally, and the four int8 bytes a lane loads are not the four bytes its accumulator actually consumes. A DP4A
-replacement has to reproduce that cross-lane fragment exchange, otherwise it only matches uniform-score data.
-q8 attention therefore stays refused on GTX 16xx.
+The 256² 4-step SFT generation produces **bit-identical latents** to the MMA path and the expected correct image.
+An earlier attempt produced a corrupted image: its row/key indexing happened to match the MMA accumulator layout
+(`q8map` confirmed `row=group`, `key=2*tig+e`) but its operand staging did not follow the PTX fragment layout, so
+scores only matched on iid-random data. The `q8cmp` probe records that mismatch for reference.
