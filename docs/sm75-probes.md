@@ -139,5 +139,27 @@ At 256², 4 steps, seed 42, the same prompt and a warm embedding cache:
 
 `--mode max_speed` keeps 5 of 42 DiT blocks resident in VRAM and copies the rest from a pinned host copy; the
 one-time load grows (39 s vs 9 s) and host RAM rises to ~7 GiB, so it pays off only for repeated generations.
-The fused DiT-block route is unavailable on sm_75 (its bf16 CUTLASS GEMMs need sm_80+ tensor cores) and falls back
-to `op_by_op`; there is no further speedup from that knob.
+At 1024² (1 step, with the SFT LoRA) `max_speed` gives
+34.93 s/step versus 40.82 s/step for the earlier balanced q8-DP4A run (~17 %); the 11.7 s tiled fp32 VAE decode is
+now the largest single stage.
+
+## Explored but not kept
+
+- **DP4A for q8 attention's P·V.** `sm75_probe pvbench` times the core P[64,32]·V[32,128] matmul: 0.024 ms for the
+  emulated fp16 `m16n8k8` MMA versus 0.009 ms for a native DP4A loop (**2.7x** on the matmul alone). Integrating it
+  needs V quantised to int8 with one scalar scale per head (the dequant product must stay a single multiply) plus a
+  cross-lane exchange of P quartets — the same fragment-layout trap that broke the first QK attempt — and the q8
+  scores would change. Since P·V is only part of the attention call and attention is a small share of end-to-end
+  time (2.7 s/step of 35 s at 1024², <0.1 s/step at 256²), the accuracy risk is not worth it. QK stays DP4A and P·V
+  stays fp16 MMA.
+- **Lower register pressure in the VAE convs.** A 256-thread variant of `conv2d_f32_sm75` (1 pixel × 16 channels per
+  thread instead of 2 × 16, so 64 accumulators instead of 128) was bit-exact once its tile mapping was fixed, but the
+  lost weight reuse made the 1024² tiled decode **slower**: 14.70 s vs 11.70 s. Reverted; the default 128-thread tile
+  stays. A 256-thread variant that assigned 8 channels per thread initially dropped the tile's upper 8 rows (black
+  image) — the new `vae_conv` check with a multi-block 8x16 tile in `sm75_check` would have caught it, but the
+  variant is not faster, so neither it nor the extra case is kept.
+- **Fused DiT blocks / CUDA graphs.** Unavailable on sm_75: the fused bf16 CUTLASS GEMMs need sm_80+ tensor cores, and
+  `--dit-blocks fused` / `fused_graphs` fall back to `op_by_op`.
+- **VAE fp16x2 convs.** The hardware ceiling is ~2x the fp32 rate, but rounding operands to fp16 changes many output
+  bytes. The current decoder is a reference-precision path; making it lossy needs a separate quality gate and is not
+  part of this branch.

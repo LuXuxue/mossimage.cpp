@@ -10,6 +10,7 @@
 //   dp4a  hand-written tiled DP4A INT8 GEMM (native instruction) vs the CUTLASS m8n8k16 (emulated MMA) path
 //   gemmepi  CUTLASS fused INT8 epilogues vs DP4A plain GEMM + SIMT epilogue (bit-exactness and timing)
 //   q8bench  q8 attention QK: emulated m8n8k16 MMA vs native DP4A
+//   pvbench  timing ceiling for q8 attention's P·V matmul: emulated m16n8k8 fp16 MMA vs native DP4A
 //   attn  the sm_75 exact attention kernel at engine shapes
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -40,6 +41,7 @@ namespace {
 using mi::DType;
 using mi::Device;
 using mi::Tensor;
+
 
 std::uint16_t float_to_bf16_bits(float f) {
   std::uint32_t u = 0;
@@ -734,6 +736,122 @@ void q8_bench(int len, int heads, int kv, int iters) {
 
 // The fused INT8 epilogues still go through CUTLASS m8n8k16 (emulated MMA on TU117). Compare them with the same
 // epilogue done as a native-DP4A plain GEMM plus the existing SIMT elementwise kernel (the LoRA side-branch path).
+
+__device__ __forceinline__ int dp4a_pv(int a, int b, int c) {
+  int d = 0;
+  asm volatile("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+  return d;
+}
+__device__ __forceinline__ void mma_m16n8k8_pv(float (&d)[4], unsigned a0, unsigned a1, unsigned b) {
+  asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+               : "r"(a0), "r"(a1), "r"(b));
+}
+__device__ __forceinline__ unsigned pack_half2_pv(float lo, float hi) {
+  union { __half2 h; unsigned u; } c;
+  c.h = __halves2half2(__float2half_rn(lo), __float2half_rn(hi));
+  return c.u;
+}
+
+// Standalone ceiling check for q8 attention's P·V matmul: P[64,32] x V[32,128] -> O[64,128]. The engine's kernel
+// uses emulated m16n8k8 fp16 MMA; this kernel shows what a native dp4a loop could reach on the same tile before the
+// extra P/V quantisation and dequantisation work is paid.
+constexpr int kPvM = 64, kPvK = 32, kPvD = 128;
+__global__ void pv_mma_kernel(const float* __restrict__ p, const float* __restrict__ v, float* __restrict__ o) {
+  __shared__ __half ps[kPvM][kPvK];
+  __shared__ __half vs[kPvD][kPvK];
+  const int tid = threadIdx.x;
+  for (int i = tid; i < kPvM * kPvK; i += 128) {
+    const int r = i / kPvK, k = i % kPvK;
+    ps[r][k] = __float2half_rn(p[r * kPvK + k]);
+  }
+  for (int i = tid; i < kPvD * kPvK; i += 128) {
+    const int d = i / kPvK, k = i % kPvK;
+    vs[d][k] = __float2half_rn(v[k * kPvD + d]);
+  }
+  __syncthreads();
+  const int warp = tid >> 5, lane = tid & 31, group = lane >> 2, tig = lane & 3;
+  const int r0 = warp * 16 + group, r1 = r0 + 8;
+#pragma unroll
+  for (int i = 0; i < kPvD / 8; ++i) {
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int t = 0; t < kPvK / 8; ++t) {
+      const int k0 = t * 8 + tig * 2;
+      const unsigned a0 = pack_half2_pv(__half2float(ps[r0][k0]), __half2float(ps[r1][k0]));
+      const unsigned a1 = pack_half2_pv(__half2float(ps[r0][k0 + 1]), __half2float(ps[r1][k0 + 1]));
+      const unsigned b = *reinterpret_cast<const unsigned*>(&vs[i * 8 + group][k0]);
+      mma_m16n8k8_pv(acc, a0, a1, b);
+    }
+    // m16n8k8 C layout: acc[0..1] = row r0, dims 8i+2*tig and +1; acc[2..3] = row r1, same dims.
+    const int d0 = i * 8 + 2 * tig;
+    o[r0 * kPvD + d0] = acc[0];
+    o[r1 * kPvD + d0] = acc[1];
+    o[r0 * kPvD + d0 + 1] = acc[2];
+    o[r1 * kPvD + d0 + 1] = acc[3];
+  }
+}
+
+__global__ void pv_dp4a_kernel(const signed char* __restrict__ p, const signed char* __restrict__ v,
+                              const float* __restrict__ ps, float vs, float* __restrict__ o) {
+  __shared__ unsigned ps4[kPvM][kPvK / 4];
+  __shared__ unsigned vs4[kPvD][kPvK / 4];
+  const int tid = threadIdx.x;
+  for (int i = tid; i < kPvM * (kPvK / 4); i += 128) {
+    const int r = i / (kPvK / 4), g = i % (kPvK / 4);
+    ps4[r][g] = *reinterpret_cast<const unsigned*>(p + r * kPvK + g * 4);
+  }
+  for (int i = tid; i < kPvD * (kPvK / 4); i += 128) {
+    const int d = i / (kPvK / 4), g = i % (kPvK / 4);
+    vs4[d][g] = *reinterpret_cast<const unsigned*>(v + d * kPvK + g * 4);
+  }
+  __syncthreads();
+  const int row = tid >> 1, d0 = (tid & 1) * 2;  // one thread per 2 dims of one row
+  const float scale = 1.f / (ps[row] * vs);
+  int acc0 = 0, acc1 = 0;
+#pragma unroll
+  for (int i = 0; i < kPvD / 4; ++i) {
+    const int d = i * 4 + d0;
+    int a = 0, b0 = 0, b1 = 0;
+#pragma unroll
+    for (int g = 0; g < kPvK / 4; ++g) {
+      const int pv = static_cast<int>(ps4[row][g]);
+      a = dp4a_pv(pv, static_cast<int>(vs4[d][g]), a);
+      b0 = dp4a_pv(pv, static_cast<int>(vs4[d + 1][g]), b0);
+    }
+    o[row * kPvD + d] = static_cast<float>(a) * scale;
+    o[row * kPvD + d + 1] = static_cast<float>(b0) * scale;
+  }
+}
+
+void pv_bench() {
+  const auto p = normal(kPvM * kPvK, 141, 0.05f), v = normal(kPvK * kPvD, 142, 0.05f);
+  auto pq = normal(kPvM, 143, 1.f), vq = normal(1, 144, 1.f);
+  for (auto& x : pq) x = 127.f / 0.25f;
+  vq[0] = 127.f / 0.5f;
+  std::vector<signed char> pi(kPvM * kPvK), vi(kPvK * kPvD);
+  for (int i = 0; i < kPvM * kPvK; ++i) pi[i] = static_cast<signed char>(std::max(-127.f, std::min(127.f, p[i] * pq[i / kPvK])));
+  for (int i = 0; i < kPvK * kPvD; ++i) vi[i] = static_cast<signed char>(std::max(-127.f, std::min(127.f, v[i] * vq[0])));
+  DevBuf dp(p.size() * 4), dv(v.size() * 4), dpi(pi.size()), dvi(vi.size()), dps(pq.size() * 4), dvs(vq.size() * 4),
+      domma(kPvM * kPvD * 4), ddp4a(kPvM * kPvD * 4);
+  dp.upload(p); dv.upload(v); dpi.upload(pi); dvi.upload(vi); dps.upload(pq); dvs.upload(vq);
+  const auto call_mma = [&] {
+    pv_mma_kernel<<<1, 128>>>(static_cast<const float*>(dp.get()), static_cast<const float*>(dv.get()),
+                              static_cast<float*>(domma.get()));
+  };
+  const auto call_dp4a = [&] {
+    pv_dp4a_kernel<<<1, 128>>>(static_cast<const signed char*>(dpi.get()), static_cast<const signed char*>(dvi.get()),
+                               static_cast<const float*>(dps.get()), vq[0], static_cast<float*>(ddp4a.get()));
+  };
+  call_mma(); call_dp4a();
+  MI_CUDA_CHECK(cudaDeviceSynchronize());
+  // Timing ceiling only: the two kernels use different operand layout/quantisation, so their outputs are not
+  // expected to match element by element. This bounds what replacing the emulated P·V MMA could buy.
+  const double t_mma = bench(call_mma, 100, 5), t_dp4a = bench(call_dp4a, 100, 5);
+  std::printf("pv M64 K32 D128: mma %7.4f ms  dp4a %7.4f ms  %5.2fx (matmul ceiling, not a numerics check)\n",
+              t_mma, t_dp4a, t_mma / t_dp4a);
+}
+
 void gemm_epi() {
   constexpr int M = 256, N = 1536, K = 3072, F = N / 2;
   std::vector<std::int8_t> xv(static_cast<std::size_t>(M) * K), wv(static_cast<std::size_t>(N) * K);
@@ -987,7 +1105,11 @@ int main(int argc, char** argv) {
         dp4a_shape(1024, 3072, 8192, false);
       }
     }
-    if (what == "gemmepi") {
+    if (what == "pvbench") {
+    pv_bench();
+    return 0;
+  }
+  if (what == "gemmepi") {
     gemm_epi();
     return 0;
   }
