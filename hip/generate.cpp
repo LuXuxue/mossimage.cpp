@@ -289,24 +289,33 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     const double t0 = now_s();
     report("vae", 0, 1);
     VaeDecodeStats vst;
-    if (!r.vae_tiled) {
-      vst = vae->decode(out.latents.data(), lh, lw, out.rgb);
-    } else {
-      // Tiling is enabled from the CLI only. Environment variables choose the mode and the tile geometry.
+    // --vae-tiled is the only way to request tiling up front. Environment variables choose the mode and geometry.
+    // A full decode that actually fails (bad allocation, memory check, kernel error) falls back to the same path; this
+    // is deliberately not a memory-prediction heuristic -- the old ones were unreliable on shared-memory APUs.
+    const auto tiled = [&]() -> VaeDecodeStats {
       const bool band = std::getenv("MI_HIP_VAE_BAND_TILE") != nullptr || std::getenv("MI_HIP_VAE_EXACT") != nullptr;
       if (band) {
         int tile = 8;
         if (const char* tp = std::getenv("MI_HIP_VAE_BAND_TILE_PX")) tile = std::atoi(tp);
         const VaeTilePlan plan = VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, tile);
         std::fprintf(stderr, "moss-infer-hip: exact band-tiled VAE: %s\n", plan.describe().c_str());
-        vst = vae->decode_tiled_exact(out.latents.data(), lh, lw, out.rgb, plan);
-      } else {
-        int tile_px = 512, overlap_px = 128;
-        if (const char* tp = std::getenv("MI_HIP_VAE_TILE_PX")) tile_px = std::atoi(tp);
-        if (const char* opx = std::getenv("MI_HIP_VAE_OVERLAP_PX")) overlap_px = std::atoi(opx);
-        vst = vae->decode_tiled(out.latents.data(), lh, lw, out.rgb, nullptr,
-                                static_cast<std::uint32_t>(std::max(tile_px, 32)),
-                                static_cast<std::uint32_t>(std::max(overlap_px, 0)));
+        return vae->decode_tiled_exact(out.latents.data(), lh, lw, out.rgb, plan);
+      }
+      int tile_px = 512, overlap_px = 128;
+      if (const char* tp = std::getenv("MI_HIP_VAE_TILE_PX")) tile_px = std::atoi(tp);
+      if (const char* opx = std::getenv("MI_HIP_VAE_OVERLAP_PX")) overlap_px = std::atoi(opx);
+      return vae->decode_tiled(out.latents.data(), lh, lw, out.rgb, nullptr,
+                               static_cast<std::uint32_t>(std::max(tile_px, 32)),
+                               static_cast<std::uint32_t>(std::max(overlap_px, 0)));
+    };
+    if (r.vae_tiled) {
+      vst = tiled();
+    } else {
+      try {
+        vst = vae->decode(out.latents.data(), lh, lw, out.rgb);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "moss-infer-hip: full VAE decode failed (%s); decoding in tiles\n", e.what());
+        vst = tiled();
       }
     }
     if (!vst.profile.empty()) {

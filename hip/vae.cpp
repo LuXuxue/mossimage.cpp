@@ -477,17 +477,6 @@ void VaeDecoder::set_conv_products(Products products) {
 
 VaeDecodeStats VaeDecoder::decode(const float* latents, std::uint32_t h, std::uint32_t w, std::vector<std::uint8_t>& rgb,
                                   std::vector<float>* image) {
-  // End-to-end switch for validating the exact tiled path without touching generate.cpp. MI_HIP_VAE_BAND_TILE_PX
-  // selects the band height in image pixels (default 64; a multiple of 8). The decoded bytes are identical to the
-  // untiled path. The public plan_tiled*/decode_tiled_exact API can be used directly for explicit control.
-  if (const char* s = std::getenv("MI_HIP_VAE_BAND_TILE"); s != nullptr && std::atoi(s) != 0) {
-    int tile = 64;
-    if (const char* t = std::getenv("MI_HIP_VAE_BAND_TILE_PX")) {
-      const int v = std::atoi(t);
-      if (v >= 8 && v % 8 == 0) tile = v;
-    }
-    return decode_tiled_exact(latents, h, w, rgb, plan_tiled_min_memory(base_, h, w, tile), image);
-  }
   const auto t0 = std::chrono::steady_clock::now();
   const int c = base_, mid = 4 * c;
   const Layout l = layout(c, h, w);  // validates h and w: the sizes below fit an int
