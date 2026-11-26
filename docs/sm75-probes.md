@@ -78,6 +78,14 @@ The fp16 cuBLASLt path being 2.8–4.7x slower than fp32 on this GPU is a librar
 numerical necessity: fp32 uses the full CUDA-core rate while the fp16 kernels here run at ~0.3 TFLOPS despite an
 fp16x2 ALU ceiling above 1.8 TFLOPS.
 
+## Implemented: fp32 exact attention on GTX 16xx
+
+`kernels/sm75/attention_f32_sm75.cu` replaces the emulated fp16 MMA attention with chunked cuBLASLt fp32 GEMMs
+(QKᵀ and P·V) and a SIMT softmax. Both matmuls run at 0.7–1.5 TFLOPS, and all `sm75_check` attention cases
+(attn128/attn256/big, including GQA, varlen and bottom-right causal) pass the cosine ≥ 0.9999 and LSE ≤ 2e-4 gates.
+It needs a larger workspace (`attention::flash_fwd_workspace_bytes(total_q, heads, max_seqlen)`, ~40 MiB at 256²),
+and cuBLASLt plan objects are cached for the lifetime of the process because captured CUDA graphs may replay them.
+
 ## Rejected: DP4A for q8 attention's QK
 
 A DP4A QK replacing the emulated `m8n8k16` MMA in `attention_q8_sm75.cu` was implemented and measured:

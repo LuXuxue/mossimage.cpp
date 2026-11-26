@@ -26,6 +26,7 @@
 #include "backend/cuda_libs.h"
 #include "core/cuda_check.h"
 #include "core/tensor.h"
+#include "kernels/attention/flash_attention.h"
 #include "kernels/basic/gemm.h"
 #include "kernels/quant/quant.h"
 #include "kernels/sm75/sm75.h"
@@ -366,6 +367,17 @@ void gemm_shape(int M, int N, int K, bool check) {
     g.run(dwf.get(), dxf.get(), d32.get(), ws.get(), nullptr);
     show("fp32 (cuBLASLt F32)", ms, check ? d32.download<float>(host.size()) : std::vector<float>{});
   }
+  // The engine's fp32 entry (used by Turing's fp32 attention path).
+  {
+    DevBuf dout32(static_cast<std::size_t>(M) * N * 4);
+    mi::kernels::Gemm g2;
+    const Tensor tx2 = Tensor::view(dxf.get(), DType::kF32, Device::kCUDA, {M, K});
+    const Tensor tw2 = Tensor::view(dwf.get(), DType::kF32, Device::kCUDA, {N, K});
+    const Tensor td2 = Tensor::view(dout32.get(), DType::kF32, Device::kCUDA, {M, N});
+    g2.linear_f32(td2, tx2, tw2, static_cast<std::byte*>(ws.get()) + 3328, ws_bytes, nullptr);
+    MI_CUDA_CHECK(cudaDeviceSynchronize());
+    if (check) show("engine linear_f32", 0.0, dout32.download<float>(host.size()));
+  }
   // fp16 in/out. On TU117 cuBLASLt has no tensor cores and must use ordinary arithmetic.
   DevBuf dh(static_cast<std::size_t>(M) * N * 2);
   std::printf("  [fp16] preparing\n");
@@ -694,7 +706,7 @@ void attention() {
     dv.upload(vb);
     const std::vector<int> cu{0, len};
     dcu.upload(cu);
-    const std::size_t ws = static_cast<std::size_t>(len) * heads * sizeof(float);
+    const std::size_t ws = mi::attention::flash_fwd_workspace_bytes(len, heads, len);
     DevBuf dl(ws);
     auto t = [](void* p, DType dt, std::initializer_list<std::int64_t> s) {
       return Tensor::view(p, dt, Device::kCUDA, s);
@@ -721,6 +733,7 @@ void attention() {
 
 }  // namespace
 
+
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const std::string what = argc > 1 ? argv[1] : "all";
@@ -734,6 +747,8 @@ int main(int argc, char** argv) {
       mi::kernels::Gemm warm;  // creates the cuBLASLt handle once, outside the timings
       (void)warm;
       if (shape == "check") {
+        gemm_shape(64, 64, 128, true);
+        gemm_shape(193, 193, 128, true);
         gemm_shape(128, 512, 1024, true);
       } else {
         gemm_shape(256, 3072, 3072, false);  // one DiT attention/MLP linear
