@@ -77,3 +77,13 @@ reproduces on NVIDIA's no-tensor-core Turing:
 The fp16 cuBLASLt path being 2.8–4.7x slower than fp32 on this GPU is a library/architecture mismatch, not a
 numerical necessity: fp32 uses the full CUDA-core rate while the fp16 kernels here run at ~0.3 TFLOPS despite an
 fp16x2 ALU ceiling above 1.8 TFLOPS.
+
+## Rejected: DP4A for q8 attention's QK
+
+A DP4A QK replacing the emulated `m8n8k16` MMA in `attention_q8_sm75.cu` was implemented and measured:
+177 ms vs 256 ms at 4113 tokens with 24 heads (1.4x), with the same 0.999956 cosine against a host reference
+on iid random q/k/v. **It was reverted** because the real 4-step SFT DiT produced a corrupted image (an orange
+grid) while the unchanged MMA path produced the correct apple. The random-reference check does not exercise the
+per-token/per-head int8 scales and the non-uniform score distribution that trigger the regression. The remaining
+correctness gap lives in the MMA fragment-to-score mapping (cross-lane K exchange), which a naive DP4A loop
+cannot reproduce without matching that layout exactly. q8 attention therefore stays refused on GTX 16xx.
