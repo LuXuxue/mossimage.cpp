@@ -77,7 +77,9 @@ struct Plan {
 // On Turing the A factors stay fp16 (the bf16-linear GEMM path), but B is uploaded as fp32 so delta uses cuBLASLt's
 // fast fp32 kernels; on other devices both factors are bf16.
 Plan make_plan(const LoraStack& stack) {
-  const int b_bytes = kernels::sm75::turing() ? 4 : 2;
+  const bool sm75 = kernels::sm75::turing();
+  const int a_bytes = sm75 ? 4 : 2;  // Turing: both LoRA GEMMs run fp32, so upload factors as fp32 directly
+  const int b_bytes = sm75 ? 4 : 2;
   const TargetModel& model = stack.model();
   Plan plan;
   plan.blocks = model.blocks;
@@ -135,7 +137,7 @@ Plan make_plan(const LoraStack& stack) {
   for (SitePlan& sp : plan.sites) {
     if (sp.slices.empty()) continue;
     sp.a_offset = off;
-    off = align_up(off + static_cast<std::size_t>(sp.rank * sp.k) * 2);
+    off = align_up(off + static_cast<std::size_t>(sp.rank * sp.k) * a_bytes);
     for (SlicePlan& sl : sp.slices) {
       sl.b_offset = off;
       off = align_up(off + static_cast<std::size_t>(sl.rows * (sp.shared_cols + sl.own_cols)) * b_bytes);
@@ -174,7 +176,7 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
   // sm_75's cuBLASLt GEMMs take fp16 weights (the engine converts bf16 weights to fp16 there); the side-branch
   // factors are small, so keep them as fp16 from upload on that device.
   const bool sm75 = kernels::sm75::turing();
-  factor_dtype_ = sm75 ? DType::kF16 : DType::kBF16;
+  factor_dtype_ = sm75 ? DType::kF32 : DType::kBF16;
   b_dtype_ = sm75 ? DType::kF32 : DType::kBF16;
   std::vector<std::byte> host(plan.bytes, std::byte{0});  // staging of every factor (coefficients written later)
   const auto at = [&](std::size_t offset) { return host.data() + offset; };
@@ -196,9 +198,12 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
     const bool permute = static_cast<Site>(e % kSites) == Site::kUpGate;
     const auto put_a = [&](const Adapter& a, std::int64_t col0) {
       const std::vector<float> down = stack.read(a.parts[0]);  // [r, k]
-      auto* arow = reinterpret_cast<std::uint16_t*>(at(sp.a_offset)) + col0 * sp.k;
-      for (std::size_t i = 0; i < down.size(); ++i) {
-        arow[i] = sm75 ? __half_as_ushort(__float2half_rn(down[i])) : quant::float_to_bf16(down[i]);
+      if (sm75) {
+        auto* arow = reinterpret_cast<float*>(at(sp.a_offset)) + col0 * sp.k;
+        for (std::size_t i = 0; i < down.size(); ++i) arow[i] = down[i];
+      } else {
+        auto* arow = reinterpret_cast<std::uint16_t*>(at(sp.a_offset)) + col0 * sp.k;
+        for (std::size_t i = 0; i < down.size(); ++i) arow[i] = quant::float_to_bf16(down[i]);
       }
     };
     for (std::size_t g = 0; g < sp.shared_first.size(); ++g) {
@@ -363,9 +368,14 @@ bool SideBranches::any_active() const {
   return std::any_of(entries_.begin(), entries_.end(), [](const Entry& e) { return e.active; });
 }
 
-std::size_t t_workspace_bytes(std::int64_t m, std::int64_t rank) {
-  if (m < 0 || rank < 0) fail("t_workspace_bytes: negative size");
-  return align_up(static_cast<std::size_t>(m) * static_cast<std::size_t>(rank) * 4);
+std::size_t t_workspace_bytes(std::int64_t m, std::int64_t k, std::int64_t rank) {
+  if (m < 0 || k < 0 || rank < 0) fail("t_workspace_bytes: negative size");
+  // Turing: x is converted bf16 -> fp32 in the front of the workspace, t32 follows. Other devices keep the fp16
+  // GEMM path and need only the fp32 t accumulator.
+  const std::size_t acc = align_up(static_cast<std::size_t>(m) * static_cast<std::size_t>(rank) * 4);
+  return kernels::sm75::turing()
+             ? align_up(static_cast<std::size_t>(m) * static_cast<std::size_t>(k) * 4) + acc
+             : acc;
 }
 
 void compute_t(const SiteBranch& site, const Tensor& x, const Tensor& t, void* workspace, std::size_t workspace_bytes,
@@ -381,16 +391,25 @@ void compute_t(const SiteBranch& site, const Tensor& x, const Tensor& t, void* w
     fail("compute_t: t must be CUDA " + std::string(sm75 ? "f32" : "bf16") + " [" + std::to_string(m) + ", " +
          std::to_string(r) + "] rows (16-byte aligned, stride a multiple of 8), got " + t.describe());
   }
-  if (workspace_bytes < t_workspace_bytes(m, r) || reinterpret_cast<std::uintptr_t>(workspace) % kAlign != 0) {
+  if (workspace_bytes < t_workspace_bytes(m, site.k, r) || reinterpret_cast<std::uintptr_t>(workspace) % kAlign != 0) {
     fail("compute_t: workspace too small or not 256-byte aligned");
   }
   if (m == 0) return;
-  const Tensor t32 = Tensor::view(workspace, DType::kF32, Device::kCUDA, {m, r});
+  auto* bytes = static_cast<std::byte*>(workspace);
+  const std::size_t x32_off = sm75 ? align_up(static_cast<std::size_t>(m) * static_cast<std::size_t>(site.k) * 4) : 0;
+  const Tensor t32 = Tensor::view(bytes + x32_off, DType::kF32, Device::kCUDA, {m, r});
   Tensor a = site.a;
-  if (a.dtype != (sm75 ? DType::kF16 : DType::kBF16)) {
+  if (a.dtype != (sm75 ? DType::kF32 : DType::kBF16)) {
     fail("compute_t: LoRA A factors have the wrong dtype");
   }
-  gemm.linear(t32, x, a, nullptr, gemm_ws, gemm_ws_bytes, stream);
+  if (sm75) {
+    // bf16 -> fp32 is exact; both GEMMs then use cuBLASLt's fast fp32 path (no fp16 intermediate).
+    const Tensor x32 = Tensor::view(bytes, DType::kF32, Device::kCUDA, {m, site.k});
+    kernels::cast(x, x32, stream);
+    gemm.linear_f32(t32, x32, a, gemm_ws, gemm_ws_bytes, stream);
+  } else {
+    gemm.linear(t32, x, a, nullptr, gemm_ws, gemm_ws_bytes, stream);
+  }
   if (sm75) {
     // Keep t in fp32: the small-K delta GEMM then runs cuBLASLt's fp32 kernels (~4.5x its fp16 kernels here).
     kernels::lora::scale_columns_f32(t32.ptr<const float>(), r, site.coef.ptr<const float>(), t.ptr<float>(),

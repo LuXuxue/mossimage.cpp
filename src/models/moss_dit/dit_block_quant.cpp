@@ -247,7 +247,7 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   const DType lora_t_dtype = kernels::sm75::turing() ? DType::kF32 : DType::kBF16;
   if (qa.lora != nullptr && qa.lora->any_active(block) &&
       (qa.lora_t.dtype != lora_t_dtype || qa.lora_t.rank != 2 || qa.lora_t.dim(0) < l ||
-       qa.lora_t.dim(1) < qa.lora->max_rank() || qa.lora_workspace_bytes < lora::t_workspace_bytes(l, qa.lora->max_rank()))) {
+       qa.lora_t.dim(1) < qa.lora->max_rank() || qa.lora_workspace_bytes < lora::t_workspace_bytes(l, kF, qa.lora->max_rank()))) {
     throw std::invalid_argument("mi::moss_dit::run_block_quant: LoRA buffers do not match the side branches");
   }
   // INT4 sites that run the INT8 GEMMs on unpacked operands: every INT4 site on a GPU without INT4 MMA

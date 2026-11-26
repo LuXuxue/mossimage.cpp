@@ -1034,7 +1034,7 @@ QuantBlockBuffers quant_buffers(StackPlan& plan, const ComputeConfig& config, st
   if (config.lora_rank > 0) {
     qa.lora = side_branches;
     qa.lora_t = plan.tensor(kernels::sm75::turing() ? DType::kF32 : DType::kBF16, {total, config.lora_rank});
-    qa.lora_workspace_bytes = lora::t_workspace_bytes(total, config.lora_rank);
+    qa.lora_workspace_bytes = lora::t_workspace_bytes(total, kFfnDim, config.lora_rank);
     qa.lora_workspace = plan.bytes(qa.lora_workspace_bytes);
   }
   qa.int4_via_int8 = config.int4_via_int8;

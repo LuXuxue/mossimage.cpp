@@ -107,7 +107,7 @@ class SideBranches {
 
   const LoraStack* stack_ = nullptr;
   std::size_t adapters_ = 0;
-  DType factor_dtype_ = DType::kBF16;  // A stays fp16 on sm_75 (cuBLASLt's bf16-linear path takes fp16 weights)
+  DType factor_dtype_ = DType::kBF16;  // fp32 on sm_75: both LoRA GEMMs run fp32 there
   DType b_dtype_ = DType::kBF16;       // B is fp32 on sm_75: the small-K delta GEMM runs cuBLASLt's fast fp32 path
   int blocks_ = 0;
   std::int64_t max_rank_ = 0;
@@ -121,7 +121,7 @@ class SideBranches {
 // t (bf16 [m, site.rank] rows with one row stride, 16-byte aligned, stride a multiple of 8) for the site's input x
 // (bf16 [m, site.k] rows). workspace: t_workspace_bytes(m, site.rank) bytes, 256-byte aligned (t32). gemm / gemm_ws:
 // the model's cuBLASLt handle and workspace. Launches only on `stream`; graph-capturable.
-std::size_t t_workspace_bytes(std::int64_t m, std::int64_t rank);
+std::size_t t_workspace_bytes(std::int64_t m, std::int64_t k, std::int64_t rank);
 void compute_t(const SiteBranch& site, const Tensor& x, const Tensor& t, void* workspace, std::size_t workspace_bytes,
                kernels::Gemm& gemm, void* gemm_ws, std::size_t gemm_ws_bytes, cudaStream_t stream);
 
