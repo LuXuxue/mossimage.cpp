@@ -244,8 +244,9 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
     throw std::invalid_argument("mi::moss_dit::run_block_quant: a LoRA on the QKV of a block whose q, k and v differ in "
                                 "precision is not supported");
   }
+  const DType lora_t_dtype = kernels::sm75::turing() ? DType::kF32 : DType::kBF16;
   if (qa.lora != nullptr && qa.lora->any_active(block) &&
-      (qa.lora_t.dtype != DType::kBF16 || qa.lora_t.rank != 2 || qa.lora_t.dim(0) < l ||
+      (qa.lora_t.dtype != lora_t_dtype || qa.lora_t.rank != 2 || qa.lora_t.dim(0) < l ||
        qa.lora_t.dim(1) < qa.lora->max_rank() || qa.lora_workspace_bytes < lora::t_workspace_bytes(l, qa.lora->max_rank()))) {
     throw std::invalid_argument("mi::moss_dit::run_block_quant: LoRA buffers do not match the side branches");
   }
@@ -264,7 +265,7 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   const bool sm75 = kernels::sm75::turing();
   // t of a site for its bf16 input `in` (rows of this run): the LoRA GEMM's operand.
   const auto prepare_t = [&](const lora::SiteBranch& sb, const Tensor& in) {
-    Tensor t = Tensor::view(qa.lora_t.data, DType::kBF16, Device::kCUDA, {m, sb.rank});
+    Tensor t = Tensor::view(qa.lora_t.data, lora_t_dtype, Device::kCUDA, {m, sb.rank});
     t.stride[0] = qa.lora_t.stride[0];
     lora::compute_t(sb, in, t, qa.lora_workspace, qa.lora_workspace_bytes, *qkv_gemm.gemm, qkv_gemm.workspace,
                     qkv_gemm.workspace_bytes, stream);
@@ -362,7 +363,7 @@ void run_block_quant(const BlockTensors& w, const QuantBlockBuffers& qa, const B
   // The E1L / E2L term of an NVFP4 site with a side branch, from its bf16 input `in` (rows of this run): t, then
   // Δ = t · Bᵀ stored in bf16 (natural: ffn_up_gate's stored column order).
   const auto nv_delta = [&](const lora::SiteBranch& sb, const Tensor& in, bool natural) {
-    Tensor t = Tensor::view(qa.lora_t.data, DType::kBF16, Device::kCUDA, {m, sb.rank});
+    Tensor t = Tensor::view(qa.lora_t.data, lora_t_dtype, Device::kCUDA, {m, sb.rank});
     t.stride[0] = qa.lora_t.stride[0];
     lora::compute_t(sb, in, t, qa.lora_workspace, qa.lora_workspace_bytes, *qkv_gemm.gemm, qkv_gemm.workspace,
                     qkv_gemm.workspace_bytes, stream);

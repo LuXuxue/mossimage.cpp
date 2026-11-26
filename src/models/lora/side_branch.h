@@ -107,7 +107,8 @@ class SideBranches {
 
   const LoraStack* stack_ = nullptr;
   std::size_t adapters_ = 0;
-  DType factor_dtype_ = DType::kBF16;  // fp16 on sm_75 (cuBLASLt's GEMM there takes fp16 weights)
+  DType factor_dtype_ = DType::kBF16;  // A stays fp16 on sm_75 (cuBLASLt's bf16-linear path takes fp16 weights)
+  DType b_dtype_ = DType::kBF16;       // B is fp32 on sm_75: the small-K delta GEMM runs cuBLASLt's fast fp32 path
   int blocks_ = 0;
   std::int64_t max_rank_ = 0;
   std::vector<Entry> entries_;  // [block * kSites + site]
@@ -134,7 +135,7 @@ kernels::lora::LoraSlices lora_slices(const SiteBranch& site, const Tensor& t);
 // stored [hidden | gate] order of the weight instead of the SiTU GEMMs' permuted order B is kept in (B's rows are
 // reordered in scratch: row up_gate_gemm_row(c, F) <- row c). scratch: delta_scratch_bytes(m, site.rank, site.n),
 // 256-byte aligned. Launches only on `stream` (copies, memsets and GEMMs; no allocation, no synchronization).
-std::size_t delta_scratch_bytes(std::int64_t m, std::int64_t rank, std::int64_t n);
+std::size_t delta_scratch_bytes(std::int64_t m, std::int64_t rank, std::int64_t n, bool f32_out = false);
 void compute_delta(const SiteBranch& site, const Tensor& t, const Tensor& delta, bool natural_order, void* scratch,
                    std::size_t scratch_bytes, kernels::Gemm& gemm, void* gemm_ws, std::size_t gemm_ws_bytes,
                    cudaStream_t stream);

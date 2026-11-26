@@ -1033,7 +1033,7 @@ QuantBlockBuffers quant_buffers(StackPlan& plan, const ComputeConfig& config, st
   if (q8_bytes > 0) qa.attn_workspace = plan.bytes(q8_bytes);
   if (config.lora_rank > 0) {
     qa.lora = side_branches;
-    qa.lora_t = plan.tensor(DType::kBF16, {total, config.lora_rank});
+    qa.lora_t = plan.tensor(kernels::sm75::turing() ? DType::kF32 : DType::kBF16, {total, config.lora_rank});
     qa.lora_workspace_bytes = lora::t_workspace_bytes(total, config.lora_rank);
     qa.lora_workspace = plan.bytes(qa.lora_workspace_bytes);
   }
@@ -1055,7 +1055,7 @@ QuantBlockBuffers quant_buffers(StackPlan& plan, const ComputeConfig& config, st
     const std::int64_t cols = 2 * kFfnDim;  // the widest site (ffn_up_gate)
     qa.sm75_base = plan.tensor(DType::kBF16, {kSm75LoraChunk, cols});
     qa.sm75_delta = plan.tensor(DType::kBF16, {kSm75LoraChunk, cols});
-    qa.sm75_scratch_bytes = lora::delta_scratch_bytes(kSm75LoraChunk, config.lora_rank, cols);
+    qa.sm75_scratch_bytes = lora::delta_scratch_bytes(kSm75LoraChunk, config.lora_rank, cols, /*f32_out=*/true);
     qa.sm75_scratch = plan.bytes(qa.sm75_scratch_bytes);
   }
   return qa;
