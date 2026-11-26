@@ -155,10 +155,12 @@ a correct PNG**. The same crash occurs with `exact` at that reserve, so it is th
 kernel. Keeping the default 384 MiB reserve caps the peak at 2.83 GiB and exits cleanly. The planner's dedicated-VRAM
 cap and `--vram-reserve` are therefore deliberate: shared GPU memory is system RAM, not free VRAM.
 
-### Diagnostic soft-VRAM mode
+### Soft-VRAM mode (default)
 
-`MI_SOFT_VRAM_BUDGET=1` is an opt-in experiment: it disables the large-latent exact fallback and makes `planner::plan`
-return the leanest plan with a warning instead of throwing `BudgetError`. It is never the default. Measured at
+Soft budgeting is now the default: `planner::plan` returns the leanest plan with a warning instead of throwing
+`BudgetError` when nothing fits dedicated VRAM, and the large-latent `auto → exact` fallback is disabled. The
+resulting shared-memory spills stall badly and can crash at teardown, so `MI_SOFT_VRAM_BUDGET=0` restores strict
+budgeting and the exact fallback; unit tests pin that behaviour with `set_soft_vram_budget(false)`. Measured at
 1536x1024, 1 step, seed 42, unset attention (resolves to `q8_fp16`), pinned/page-cache weights as chosen by the plan:
 
 | Reserve | Weight source | s/step | Device peak | Exit | Note |
@@ -172,8 +174,10 @@ The safe exact fallback at this resolution is 71.4 s/step with a 2.83 GiB peak a
 is **~18 % faster per step**. Step time is almost independent of the reserve; the spill boundary is a device peak of
 about 2.9 GiB, above which WDDM shared-memory teardown becomes flaky (2.94 GiB crashed in 2/3 runs, once exited 0).
 The 384 MiB default also changes the planner's choice to page-cache weights (5 s load vs 39 s for the pinned copy),
-making its end-to-end total the lowest of these runs despite the slow stream. The switch is for measurement only: it
-trades a small speedup for shared-memory stalls and a nondeterministic crash on exit.
+making its end-to-end total the lowest of these runs despite the slow stream. The default therefore trades a small
+speedup for shared-memory stalls and a nondeterministic crash on exit; strict mode (`MI_SOFT_VRAM_BUDGET=0`) is not
+immune either — one 2.83 GiB exact run also crashed at teardown, so the WDDM failure is flaky rather than tied to a
+sharp byte boundary.
 
 ## Explored but not kept
 

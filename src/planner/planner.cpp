@@ -801,16 +801,21 @@ void dit_shapes(const weights::ModelIndex& index, ModelShapes& s) {
 
 }  // namespace
 
-// Diagnostic opt-in: return the leanest plan even when nothing fits the dedicated-VRAM/host budgets, with a warning
-// instead of throwing. Used only to measure what WDDM shared GPU memory actually costs; it can stall or crash and is
-// never a production setting.
+// Return the leanest plan with a warning instead of throwing when nothing fits the dedicated-VRAM/host budgets. This
+// is the default so the total cost of WDDM shared GPU memory can be measured; MI_SOFT_VRAM_BUDGET=0 restores the
+// strict budget. Shared memory stalls badly and can crash on teardown, so strict mode remains the safe choice.
+namespace {
+std::optional<bool> g_soft_vram_override;
+}
 bool soft_vram_budget() {
+  if (g_soft_vram_override) return *g_soft_vram_override;
   static const bool enabled = [] {
     const char* e = std::getenv("MI_SOFT_VRAM_BUDGET");
-    return e != nullptr && e[0] != '\0' && e[0] != '0';
+    return e == nullptr || (e[0] != '\0' && e[0] != '0');
   }();
   return enabled;
 }
+void set_soft_vram_budget(bool enabled) { g_soft_vram_override = enabled; }
 
 const char* mode_name(Mode mode) {
   switch (mode) {

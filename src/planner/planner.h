@@ -419,11 +419,13 @@ struct PlanInputs {
 // explicit budget is set, else the first term (0 if negative).
 std::size_t arena_cap(const Budgets& budgets);
 
-// Throws BudgetError (no configuration fits) or std::invalid_argument (incomplete inputs). With
-// MI_SOFT_VRAM_BUDGET=1 it instead returns the leanest plan with a warning in plan.explanation, letting CUDA spill
-// into shared GPU memory; diagnostic only (heavy stalls / possible crashes), never a production setting.
+// Throws BudgetError (no configuration fits) or std::invalid_argument (incomplete inputs). By default it instead
+// returns the leanest plan with a warning in plan.explanation when nothing fits, letting CUDA spill into shared GPU
+// memory (heavy stalls, possible teardown crashes); MI_SOFT_VRAM_BUDGET=0 restores the strict budget. Tests use
+// set_soft_vram_budget(false) to keep their BudgetError assertions exact.
 ExecutionPlan plan(const PlanInputs& inputs);
 bool soft_vram_budget();
+void set_soft_vram_budget(bool enabled);
 
 // A pipeline's loaded DiT: the arena it lives in and its residency (residency; when streamed: resident_blocks,
 // buffers, source). Every non-streamed residency is "all blocks resident".
