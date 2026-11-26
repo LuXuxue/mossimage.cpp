@@ -101,6 +101,15 @@ A DP4A QK replacing the emulated `m8n8k16` MMA in `attention_q8_sm75.cu` was imp
 177 ms vs 256 ms at 4113 tokens with 24 heads (1.4x), with the same 0.999956 cosine against a host reference
 on iid random q/k/v. **It was reverted** because the real 4-step SFT DiT produced a corrupted image (an orange
 grid) while the unchanged MMA path produced the correct apple. The random-reference check does not exercise the
-per-token/per-head int8 scales and the non-uniform score distribution that trigger the regression. The remaining
-correctness gap lives in the MMA fragment-to-score mapping (cross-lane K exchange), which a naive DP4A loop
-cannot reproduce without matching that layout exactly. q8 attention therefore stays refused on GTX 16xx.
+per-token/per-head int8 scales and the non-uniform score distribution that trigger the regression.
+
+Two probes in `sm75_probe.cu` pin the cause down:
+- `q8map` encodes row/key into the q/k bytes and prints every MMA accumulator. Lane `(group,tig)` holds
+  `row=group`, `key=2*tig` and `2*tig+1` — the accumulator mapping itself was correct.
+- `q8cmp` runs MMA and a full-128-dim DP4A dot on the *same* int8 q/k with strongly varying per-row/per-key scales.
+  Their scores differ systematically, even though iid-random q/k give cosine 0.999956 against a host reference.
+
+So the gap is not the obvious index mapping or overflow: `mma.sync.m8n8k16` exchanges K quartets across the warp
+internally, and the four int8 bytes a lane loads are not the four bytes its accumulator actually consumes. A DP4A
+replacement has to reproduce that cross-lane fragment exchange, otherwise it only matches uniform-score data.
+q8 attention therefore stays refused on GTX 16xx.

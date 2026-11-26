@@ -741,13 +741,109 @@ void attention() {
 }  // namespace
 
 
+
+// Compare the q8 attention QK dot product computed by m8n8k16 MMA (the library path) and by four-lane __dp4a on
+// identical int8 q/k with strongly varying per-row/per-key scales (the case iid-random tests do not cover).
+__device__ __forceinline__ void mma_m8n8k16_cmp(int& d0, int& d1, unsigned a, unsigned b) {
+  asm volatile("mma.sync.aligned.m8n8k16.row.col.satfinite.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};\n"
+               : "+r"(d0), "+r"(d1)
+               : "r"(a), "r"(b));
+}
+__device__ __forceinline__ int dp4a_cmp(int a, int b, int c) {
+  int d = 0;
+  asm volatile("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+  return d;
+}
+
+__global__ void q8_compare_kernel(const std::int8_t* __restrict__ q, const std::int8_t* __restrict__ k,
+                                  int* __restrict__ mma, int* __restrict__ dp) {
+  __shared__ unsigned qs[16][32];
+  const int lane = threadIdx.x, group = lane >> 2, tig = lane & 3;
+  for (int idx = lane; idx < 16 * 32; idx += 32) {
+    const int r = idx / 32, w = idx % 32;
+    const unsigned* src = reinterpret_cast<const unsigned*>(q + r * 128);
+    qs[r][w] = src[w];
+  }
+  __syncthreads();
+  int a0 = 0, a1 = 0, b0 = 0, b1 = 0;
+  int m0 = 0, m1 = 0;
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    const int key = t * 8 + 2 * tig;
+    m0 = 0; m1 = 0;
+    // MMA: one 16-dim fragment from the lane's own row/key slice, cross-lane exchange inside the instruction.
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const unsigned qa = *reinterpret_cast<const unsigned*>(q + group * 128 + i * 16 + tig * 4);
+      const unsigned kb = *reinterpret_cast<const unsigned*>(k + (t * 8 + group) * 128 + i * 16 + tig * 4);
+      mma_m8n8k16_cmp(m0, m1, qa, kb);
+    }
+    mma[lane * 8 + t * 2] = m0;
+    mma[lane * 8 + t * 2 + 1] = m1;
+    // DP4A: all 128 dims of the lane's query row against the two key rows it owns.
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int wa = static_cast<int>(qs[group][i * 4 + j]);
+        const int wb = static_cast<int>(qs[group + 8][i * 4 + j]);
+        const int ka = static_cast<int>(*reinterpret_cast<const unsigned*>(k + key * 128 + i * 16 + j * 4));
+        const int kb = static_cast<int>(*reinterpret_cast<const unsigned*>(k + (key + 1) * 128 + i * 16 + j * 4));
+        a0 = dp4a_cmp(wa, ka, a0);
+        a1 = dp4a_cmp(wa, kb, a1);
+        b0 = dp4a_cmp(wb, ka, b0);
+        b1 = dp4a_cmp(wb, kb, b1);
+      }
+  }
+  dp[lane * 4] = a0;
+  dp[lane * 4 + 1] = a1;
+  dp[lane * 4 + 2] = b0;
+  dp[lane * 4 + 3] = b1;
+}
+
+void q8_compare() {
+  std::vector<std::int8_t> q(16 * 128), k(32 * 128);
+  const float scale[] = {0.01f, 0.2f, 0.8f, 0.05f, 1.0f, 0.3f, 0.02f, 0.6f};
+  const float kscale[] = {0.9f, 0.03f, 0.5f, 0.07f, 0.4f, 1.0f, 0.02f, 0.3f, 0.7f, 0.1f, 0.5f, 0.04f, 0.6f, 0.2f, 0.8f, 0.05f, 0.4f, 0.1f, 0.7f, 0.03f, 0.9f, 0.2f, 0.5f, 0.08f, 0.3f, 0.6f, 0.04f, 0.8f, 0.2f, 0.7f, 0.05f, 0.5f};
+  const auto x = normal(16 * 128, 91, 1.f);
+  const auto y = normal(32 * 128, 92, 1.f);
+  for (int r = 0; r < 16; ++r)
+    for (int d = 0; d < 128; ++d) q[r * 128 + d] = static_cast<std::int8_t>(std::max(-127.f, std::min(127.f, x[r * 128 + d] * scale[r % 8])));
+  for (int r = 0; r < 32; ++r)
+    for (int d = 0; d < 128; ++d) k[r * 128 + d] = static_cast<std::int8_t>(std::max(-127.f, std::min(127.f, y[r * 128 + d] * kscale[r])));
+  DevBuf dq(q.size()), dk(k.size()), dm(32 * 8 * sizeof(int)), dd(32 * 4 * sizeof(int));
+  dq.upload(q); dk.upload(k);
+  q8_compare_kernel<<<1, 32>>>(static_cast<const std::int8_t*>(dq.get()), static_cast<const std::int8_t*>(dk.get()),
+                               static_cast<int*>(dm.get()), static_cast<int*>(dd.get()));
+  MI_CUDA_CHECK(cudaDeviceSynchronize());
+  const auto m = dm.download<int>(32 * 8), d = dd.download<int>(32 * 4);
+  int bad = 0;
+  for (int lane = 0; lane < 32; ++lane) {
+    for (int j = 0; j < 8; ++j) {
+      const int mm = m[lane * 8 + j];
+      int ddv = 0;
+      if (j < 4) ddv = d[lane * 4 + j];
+      else ddv = d[lane * 4 + (j - 4) + 2];
+      if (mm != ddv && bad < 12) {
+        std::printf("lane %d j %d mma %d dp4a %d\n", lane, j, mm, ddv);
+        ++bad;
+      }
+    }
+  }
+  std::printf("q8_compare mismatches (first 12 of 256): %d\n", bad);
+}
+
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const std::string what = argc > 1 ? argv[1] : "all";
   const std::string shape = argc > 2 ? argv[2] : "";
   mi::backend::load_cublaslt();
   try {
-    if (what == "info" || what == "all") info();
+    if (what == "q8cmp") {
+    q8_compare();
+    return 0;
+  }
+  if (what == "info" || what == "all") info();
     if (what == "bw" || what == "all") bandwidth();
     if (what == "alu" || what == "all") alu();
     if (what == "gemm" || what == "all") {
