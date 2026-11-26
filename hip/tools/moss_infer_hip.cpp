@@ -60,7 +60,7 @@ constexpr const char* kUsage =
     "    [--eta X] [--s-noise X] [--dit <file>] [--te <file>] [--vae <file>]\n"
     "    [--lora <file> [--lora-scale S]]... [--lora-strict] [--lora-placement default|merge|side_branch]\n"
     "    [--tier reference|high] [--mode min_memory|balanced|max_speed] [--attention auto|exact|q8*]\n"
-    "    [--dit-blocks fused|fused_graphs|op_by_op] [--vram-budget GiB] [--vram-reserve MiB]\n"
+    "    [--dit-blocks fused|fused_graphs|op_by_op] [--vram-budget GiB] [--vram-reserve MiB] [--vae-tiled]\n"
     "    [--host-ram-budget GiB] [--cache-dir <dir>] [--te-host-pin auto|on|off]\n"
     "    [--direct-io | --buffered-io] [--then-prompt <text>]...\n"
     "    [--cfg-truncation X] [--step-cache off|fbcache] [--step-cache-threshold X]\n"
@@ -98,7 +98,7 @@ struct Args {
   int hires_steps = 0, vram_reserve = 0;
   double host_ram_budget = 0;
   std::string step_cache = "off";
-  bool direct_io = false, buffered_io = false;
+  bool direct_io = false, buffered_io = false, vae_tiled = false;
   bool have_prompt = false, metadata = true, quiet = false, list = false, help = false, version = false;
   int width = 1024, height = 1024, steps = 50, max_seq = 4096, device = -1;
   double cfg = 3.0, shift = 5.0;
@@ -313,6 +313,10 @@ Args parse(const std::vector<std::string>& argv) {
     if (f == "--version") {
       a.version = true;
       return a;
+    }
+    if (f == "--vae-tiled") {
+      a.vae_tiled = true;
+      continue;
     }
     if (i + 1 >= argv.size()) usage(f + " needs a value");
     const std::string& v = argv[++i];
@@ -551,6 +555,7 @@ int run(const Args& a) {
   for (const int l : a.skip) g.uncond_skip.set(static_cast<std::size_t>(l));
   g.vram_budget = a.vram_budget;
   g.int8_dit = (a.tier == "high");
+  g.vae_tiled = a.vae_tiled;
   g.decode = !a.out_png.empty();
   if (!a.out_latent.empty()) {
     g.on_latents = [&](const std::vector<float>& latents) {
