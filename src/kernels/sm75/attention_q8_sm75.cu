@@ -1,4 +1,4 @@
-// 8-bit attention on sm_75 (`q8_fp16` / `q8_fp16_f32acc`): INT8 QK^T with Turing's m8n8k16 MMA and fp16 P·V with the
+// 8-bit attention on sm_75 (`q8_fp16` / `q8_fp16_f32acc`): INT8 QK^T with native DP4A and fp16 P·V with the
 // existing m16n8k8 path. q and k are quantized per row (amax / 127) in a pre-pass; k is not mean-smoothed (the engine's
 // q8 is lossy by definition, and the smoothing only buys INT8 range). v becomes fp16. The tiling, online softmax and
 // P·V reuse the exact kernel's (attention_sm75.cu): 64 queries per CTA, 4 warps, 16 rows per warp, 32 keys per tile.
@@ -25,13 +25,6 @@ constexpr int kQ8Stride = kQ8D + 16;  // int8 K tile row stride (4-byte aligned,
 constexpr int kQ8Chunks = kQ8D / 16;     // m8n8k16 in-dimension chunks (QK^T)
 constexpr int kQ8PvChunks = kQ8D / 8;   // m16n8k8 in-dimension chunks (P·V)
 constexpr float kLog2e = 1.4426950408889634f;
-
-// m8n8k16 int8 -> int32 MMA (Turing). a = 4 int8 of one query row, b = 4 int8 of one key, d = 2 int32.
-__device__ __forceinline__ void mma_m8n8k16(int& d0, int& d1, std::uint32_t a, std::uint32_t b) {
-  asm volatile("mma.sync.aligned.m8n8k16.row.col.satfinite.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};\n"
-               : "+r"(d0), "+r"(d1)
-               : "r"(a), "r"(b));
-}
 
 // Native int8 dot product (four signed bytes per instruction) for cards without tensor cores.
 __device__ __forceinline__ int dp4a_i8(int a, int b, int c) {
@@ -128,7 +121,6 @@ struct Q8Params {
   float scale = 1.f;
 };
 
-template <bool kDp4a>
 __global__ void attention_q8_kernel(const Q8Params p) {
   __shared__ __align__(16) std::int8_t ks[kQ8BN * kQ8Stride];
   __shared__ __align__(16) __half vt[kQ8D * (kQ8BN + 8)];
@@ -185,36 +177,20 @@ __global__ void attention_q8_kernel(const Q8Params p) {
 #pragma unroll
     for (int t = 0; t < kSubtiles; ++t) {
       int a0 = 0, a1 = 0, b0 = 0, b1 = 0;
-      if constexpr (kDp4a) {
-        // PTX m8n8k16: C[row=group][col=2*tig+e]. Sum all 128 K dims with native dp4a.
-        const int key_a = t * 8 + 2 * tig, key_b = key_a + 1;
+      // QKᵀ: each thread owns two query rows and two adjacent key rows. Native dp4a performs four int8 MACs per
+      // instruction, so sum all 128 K dims (four words per chunk) into the four int32 accumulators.
+      const int key_a = t * 8 + 2 * tig, key_b = key_a + 1;
 #pragma unroll
-        for (int i = 0; i < kQ8Chunks; ++i) {
+      for (int i = 0; i < kQ8Chunks; ++i) {
 #pragma unroll
-          for (int j = 0; j < 4; ++j) {
-            const int wa = static_cast<int>(qs[r0][i * 4 + j]), wb = static_cast<int>(qs[r1][i * 4 + j]);
-            const int ka = static_cast<int>(load_u32(&ks[key_a * kQ8Stride + i * 16 + j * 4]));
-            const int kb = static_cast<int>(load_u32(&ks[key_b * kQ8Stride + i * 16 + j * 4]));
-            a0 = dp4a_i8(wa, ka, a0);
-            a1 = dp4a_i8(wa, kb, a1);
-            b0 = dp4a_i8(wb, ka, b0);
-            b1 = dp4a_i8(wb, kb, b1);
-          }
-        }
-      } else {
-        std::uint32_t qf[2][kQ8Chunks];
-#pragma unroll
-        for (int i = 0; i < kQ8Chunks; ++i) {
-          const int off = i * 16 + tig * 4;
-          qf[0][i] = r0 < rows ? load_u32(p.q + static_cast<std::int64_t>(q_start + row_base + r0) * p.q_row + q_head_off + off) : 0u;
-          qf[1][i] = r1 < rows ? load_u32(p.q + static_cast<std::int64_t>(q_start + row_base + r1) * p.q_row + q_head_off + off) : 0u;
-        }
-        const int key = t * 8 + group;
-#pragma unroll
-        for (int i = 0; i < kQ8Chunks; ++i) {
-          const std::uint32_t kb = load_u32(&ks[key * kQ8Stride + i * 16 + tig * 4]);
-          mma_m8n8k16(a0, a1, qf[0][i], kb);
-          mma_m8n8k16(b0, b1, qf[1][i], kb);
+        for (int j = 0; j < 4; ++j) {
+          const int wa = static_cast<int>(qs[r0][i * 4 + j]), wb = static_cast<int>(qs[r1][i * 4 + j]);
+          const int ka = static_cast<int>(load_u32(&ks[key_a * kQ8Stride + i * 16 + j * 4]));
+          const int kb = static_cast<int>(load_u32(&ks[key_b * kQ8Stride + i * 16 + j * 4]));
+          a0 = dp4a_i8(wa, ka, a0);
+          a1 = dp4a_i8(wa, kb, a1);
+          b0 = dp4a_i8(wb, ka, b0);
+          b1 = dp4a_i8(wb, kb, b1);
         }
       }
       const float sk0 = kscale[t * 8 + 2 * tig] * p.scale;
@@ -372,16 +348,7 @@ void q8_flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tenso
   p.scale = scale;
   const dim3 grid(static_cast<unsigned>((max_seqlen + kQ8BM - 1) / kQ8BM), static_cast<unsigned>(batch),
                   static_cast<unsigned>(heads));
-  // A/B switch: MI_Q8_DP4A=0 selects the original m8n8k16 MMA path (correct on every Turing card).
-  static const bool use_dp4a = [] {
-    const char* e = std::getenv("MI_Q8_DP4A");
-    return e == nullptr || (e[0] != '\0' && e[0] != '0');
-  }();
-  if (use_dp4a) {
-    attention_q8_kernel<true><<<grid, kQ8Warps * 32, 0, stream>>>(p);
-  } else {
-    attention_q8_kernel<false><<<grid, kQ8Warps * 32, 0, stream>>>(p);
-  }
+  attention_q8_kernel<<<grid, kQ8Warps * 32, 0, stream>>>(p);
   MI_CUDA_CHECK_LAUNCH();
 }
 

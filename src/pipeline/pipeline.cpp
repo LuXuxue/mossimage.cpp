@@ -1551,18 +1551,12 @@ void Pipeline::Impl::explain_control(const Request::Control& control, Result& r)
 
 // Features that still need sm_80+ kernels are refused on Turing before anything is planned, read or uploaded (by
 // Pipeline::run, and by a Session for its options and every run's spec): control adapters (a LoRA with a replacement
-// embedding, fused into the block GEMMs). The VAE encoder runs on Turing (fp32 SIMT), and runtime LoRAs are merged at
-// load (Pipeline::run sets the placement).
-void detail::force_lora_merge_on_sm7x(Request& req) {
-  // Turing runs the runtime LoRA side branch without tensor cores: the base INT8 GEMMs stay bit-exact and the low-rank
-  // Δ is computed by cuBLASLt and added in fp32, so no merge into (and requantization of) the INT8 weights is needed.
-}
-
+// embedding, fused into the block GEMMs). The VAE encoder runs on Turing (fp32 SIMT).
 void detail::refuse_unsupported_on_sm7x(const Request& req) {
   if (!kernels::sm75::turing()) return;
   // The VAE encoder runs on Turing (fp32 SIMT convs, the same kernels as the decoder), so img2img, inpainting,
-  // reference images and the hires fix all work. Runtime LoRAs are merged into the weights instead of the sm_80+ fused
-  // side branches (Pipeline::run sets the placement); control adapters still need the fused LoRA path.
+  // reference images and the hires fix all work. Runtime LoRAs use the sm_75 side branch; control adapters still need
+  // the fused LoRA path.
   if (req.control.enabled()) {
     throw NotSupportedError("control adapters are LoRAs and need sm_80+ GEMM kernels; this sm_7x build cannot run them");
   }
@@ -1571,7 +1565,6 @@ void detail::refuse_unsupported_on_sm7x(const Request& req) {
 Result Pipeline::run(const Request& request, const GenerateControl& control, bool preload) {
   Impl& m = *impl_;
   Request req = request;
-  force_lora_merge_on_sm7x(req);
   check_user_paths(m.options, req);
   validate(req);
   refuse_unsupported_on_sm7x(req);

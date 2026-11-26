@@ -75,9 +75,9 @@ Tensor vec(const Tensor& mod, std::int64_t i) {
 const __nv_bfloat16* bf(const Tensor& t) { return static_cast<const __nv_bfloat16*>(t.data); }
 __nv_bfloat16* bf_mut(const Tensor& t) { return static_cast<__nv_bfloat16*>(t.data); }
 
-// sm_75 runtime LoRA (no tensor cores): run the plain INT8 GEMM into `base`, add the low-rank Δ with a SIMT
-// epilogue, then apply the site's epilogue. `prepare` has already computed t for the whole run; `compute_delta`
-// writes only a chunk of rows into qa.sm75_delta. Returns the base view of this chunk (rows x n, stride cols).
+// sm_75 runtime LoRA (no tensor cores): `compute_delta` writes the low-rank Δ into qa.sm75_delta, and the DP4A GEMM
+// adds it in its epilogue. Returns the base view of this row chunk (rows x n, stride cols); the caller applies the
+// site's gated-residual / SiTU epilogue.
 Tensor sm75_lora_base(const QuantBlockBuffers& qa, const QkvGemm& qg, const lora::SiteBranch& s, const Tensor& t,
                       const kq::Int8Operands& op, bool natural_order, int64_t r0, int64_t rows, cudaStream_t stream) {
   const std::int64_t n = s.n, cols = qa.sm75_delta.dim(1);

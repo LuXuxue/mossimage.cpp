@@ -133,7 +133,6 @@ inline constexpr AttentionMode kTierAttention[] = {AttentionMode::kQ8Fp8, Attent
 // exact-attention configuration is a High-tier one). nvfp4_native: the NVFP4 GEMMs run here (Capabilities::nvfp4_native).
 // exact_when_no_q8: the device has no 8-bit attention kernel at all (e.g. Volta), so an unset `attention` resolves to
 // exact with a reason instead of refusing the tier (the default would otherwise be a silent, absent fallback).
-// with a reason instead of refusing the tier (the default would otherwise be a silent, absent fallback).
 TierDecision resolve_tier(Tier tier, std::optional<AttentionMode> attention, Precision dit_precision,
                           const AttentionSupported& supported, bool te_quantized = false, bool nvfp4_native = false,
                           bool exact_when_no_q8 = false);
@@ -419,9 +418,9 @@ struct PlanInputs {
 // explicit budget is set, else the first term (0 if negative).
 std::size_t arena_cap(const Budgets& budgets);
 
-// Throws BudgetError (no configuration fits) or std::invalid_argument (incomplete inputs). By default it instead
-// returns the leanest plan with a warning in plan.explanation when nothing fits, letting CUDA spill into shared GPU
-// memory (heavy stalls, possible teardown crashes); MI_SOFT_VRAM_BUDGET=0 restores the strict budget. Tests use
+// Throws BudgetError (no configuration fits) or std::invalid_argument (incomplete inputs). By default, when nothing
+// fits the dedicated-VRAM/host budgets, it returns the leanest plan with a warning in plan.explanation and lets CUDA
+// spill into shared GPU memory (heavy stalls); MI_SOFT_VRAM_BUDGET=0 restores the strict budget. Tests use
 // set_soft_vram_budget(false) to keep their BudgetError assertions exact.
 ExecutionPlan plan(const PlanInputs& inputs);
 bool soft_vram_budget();

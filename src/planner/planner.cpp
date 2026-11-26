@@ -801,9 +801,8 @@ void dit_shapes(const weights::ModelIndex& index, ModelShapes& s) {
 
 }  // namespace
 
-// Return the leanest plan with a warning instead of throwing when nothing fits the dedicated-VRAM/host budgets. This
-// is the default so the total cost of WDDM shared GPU memory can be measured; MI_SOFT_VRAM_BUDGET=0 restores the
-// strict budget. Shared memory stalls badly and can crash on teardown, so strict mode remains the safe choice.
+// By default, return the leanest plan with a warning instead of throwing when nothing fits the dedicated-VRAM/host
+// budgets; the runtime may then spill into shared GPU memory. MI_SOFT_VRAM_BUDGET=0 restores the strict budget.
 namespace {
 std::optional<bool> g_soft_vram_override;
 }

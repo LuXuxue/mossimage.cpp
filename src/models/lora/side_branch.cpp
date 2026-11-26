@@ -74,11 +74,10 @@ struct Plan {
   std::size_t coef_bytes = 0, bytes = 0;
 };
 
-// On Turing the A factors stay fp16 (the bf16-linear GEMM path), but B is uploaded as fp32 so delta uses cuBLASLt's
-// fast fp32 kernels; on other devices both factors are bf16.
+// On Turing both LoRA GEMMs run fp32, so A and B are uploaded as fp32; on other devices both factors stay bf16.
 Plan make_plan(const LoraStack& stack) {
   const bool sm75 = kernels::sm75::turing();
-  const int a_bytes = sm75 ? 4 : 2;  // Turing: both LoRA GEMMs run fp32, so upload factors as fp32 directly
+  const int a_bytes = sm75 ? 4 : 2;
   const int b_bytes = sm75 ? 4 : 2;
   const TargetModel& model = stack.model();
   Plan plan;
@@ -173,11 +172,9 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
   if (plan.bytes == 0) return;
   coef_bytes_ = plan.coef_bytes;
   buffer_ = DeviceBuffer(plan.bytes);
-  // sm_75's cuBLASLt GEMMs take fp16 weights (the engine converts bf16 weights to fp16 there); the side-branch
-  // factors are small, so keep them as fp16 from upload on that device.
+  // Turing's LoRA GEMMs use cuBLASLt's fp32 path; the factors are small enough to upload as fp32 directly.
   const bool sm75 = kernels::sm75::turing();
-  factor_dtype_ = sm75 ? DType::kF32 : DType::kBF16;
-  b_dtype_ = sm75 ? DType::kF32 : DType::kBF16;
+  const DType factor_dtype = sm75 ? DType::kF32 : DType::kBF16;
   std::vector<std::byte> host(plan.bytes, std::byte{0});  // staging of every factor (coefficients written later)
   const auto at = [&](std::size_t offset) { return host.data() + offset; };
   for (const SitePlan& sp : plan.sites) {
@@ -193,7 +190,7 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
     br.n = sp.n;
     br.k = sp.k;
     br.rank = sp.rank;
-    br.a = view_at(buffer_.get(), sp.a_offset, factor_dtype_, {sp.rank, sp.k});
+    br.a = view_at(buffer_.get(), sp.a_offset, factor_dtype, {sp.rank, sp.k});
     br.coef = view_at(buffer_.get(), sp.coef_offset, DType::kF32, {sp.rank});
     const bool permute = static_cast<Site>(e % kSites) == Site::kUpGate;
     const auto put_a = [&](const Adapter& a, std::int64_t col0) {
@@ -225,7 +222,7 @@ SideBranches::SideBranches(const LoraStack& stack) : stack_(&stack), adapters_(s
         out.col0 = sl.own_col0;
         out.cols = sl.own_cols;
       }
-      out.b = view_at(buffer_.get(), sl.b_offset, b_dtype_, {sl.rows, cols});
+      out.b = view_at(buffer_.get(), sl.b_offset, factor_dtype, {sl.rows, cols});
       br.slices.push_back(out);
       auto* b16 = reinterpret_cast<std::uint16_t*>(at(sl.b_offset));
       auto* b32 = reinterpret_cast<float*>(at(sl.b_offset));
@@ -463,12 +460,14 @@ void compute_delta(const SiteBranch& site, const Tensor& t, const Tensor& delta,
     fail("compute_delta: scratch too small or not 256-byte aligned");
   }
   if (m == 0) return;
+  // t, the factors and the scratch are fp32 on Turing; delta is always bf16, so its byte offsets use a separate size.
   const std::size_t kE = sm75 ? sizeof(float) : sizeof(std::uint16_t);
+  constexpr std::size_t kOutE = sizeof(std::uint16_t);
   auto* const out = static_cast<std::byte*>(delta.data);
-  const std::size_t pitch = static_cast<std::size_t>(delta.stride[0]) * kE;
+  const std::size_t pitch = static_cast<std::size_t>(delta.stride[0]) * kOutE;
   const auto zero = [&](std::int64_t c0, std::int64_t c1) {
     if (c1 > c0) {
-      MI_CUDA_CHECK(cudaMemset2DAsync(out + c0 * kE, pitch, 0, static_cast<std::size_t>(c1 - c0) * kE,
+      MI_CUDA_CHECK(cudaMemset2DAsync(out + c0 * kOutE, pitch, 0, static_cast<std::size_t>(c1 - c0) * kOutE,
                                       static_cast<std::size_t>(m), stream));
     }
   };
@@ -506,7 +505,7 @@ void compute_delta(const SiteBranch& site, const Tensor& t, const Tensor& delta,
       }
       b = Tensor::view(bnat, s.b.dtype, Device::kCUDA, {n, c});
     }
-    Tensor o = Tensor::view(out + s.row0 * kE, DType::kBF16, Device::kCUDA, {m, s.rows});
+    Tensor o = Tensor::view(out + s.row0 * kOutE, DType::kBF16, Device::kCUDA, {m, s.rows});
     o.stride[0] = delta.stride[0];
     if (sm75) {
       Tensor of32 = Tensor::view(f32out, DType::kF32, Device::kCUDA, {m, s.rows});

@@ -1,8 +1,7 @@
-// sm_75 INT8 ConvRot GEMMs (see kernels/sm75/int8_sm75.h): the sm_80 CUTLASS EVT kernel with Turing's m8n8k16 INT8
-// MMA and tiles that fit 64 KiB of shared memory.
+// sm_75 INT8 ConvRot GEMMs (see kernels/sm75/int8_sm75.h): native tiled __dp4a GEMMs with bit-exact int32
+// accumulation and the same dequantisation order as the sm_80 CUTLASS path.
 #include "kernels/sm75/int8_sm75.h"
 
-#include <atomic>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -16,68 +15,6 @@ namespace mi::kernels::sm75 {
 namespace qd = quant::detail;
 
 namespace {
-
-// The SiTU factor tables of the Turing epilogue: the sm_80 tables (int8_gemm_situ.cu) are filled by a kernel built for
-// sm_80+ only, so the sm_75 path keeps its own 256 KiB copy, filled once per device by a kernel built for 75. The
-// factors are the same functions, so a lookup is bit-identical to the sm_80 table's value.
-constexpr int kBf16Values = 1 << 16;
-__device__ std::uint16_t g_situ_gate[kBf16Values];
-__device__ std::uint16_t g_situ_hidden[kBf16Values];
-
-__global__ void situ_tables_sm75_kernel() {
-  const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-  const float x = __uint_as_float(static_cast<std::uint32_t>(i) << 16);
-  g_situ_gate[i] = __bfloat16_as_ushort(__float2bfloat16_rn(qd::situ_gate_factor(x)));
-  g_situ_hidden[i] = __bfloat16_as_ushort(__float2bfloat16_rn(qd::situ_hidden_factor(x)));
-}
-
-// Fill once per device (see quant::detail::situ_factor_tables; the same lock and capture handling).
-qd::SituFactorTables situ_tables(cudaStream_t stream) {
-  constexpr int kMaxDevices = 64;
-  struct Device {
-    std::atomic<bool> filled{false};
-    std::atomic<const std::uint16_t*> gate{nullptr}, hidden{nullptr};
-  };
-  static Device devices[kMaxDevices];
-  static std::mutex fill_mutex;
-  int dev = 0;
-  MI_CUDA_CHECK(cudaGetDevice(&dev));
-  if (dev < 0 || dev >= kMaxDevices) throw std::runtime_error("mi::kernels::sm75: device ordinal out of range");
-  Device& d = devices[dev];
-  const auto fill = [&] {
-    constexpr int kThreads = 256;
-    situ_tables_sm75_kernel<<<kBf16Values / kThreads, kThreads, 0, stream>>>();
-    MI_CUDA_CHECK_LAUNCH();
-  };
-  if (!d.filled.load(std::memory_order_acquire)) {
-    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-    MI_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
-    if (capture != cudaStreamCaptureStatusNone) {
-      fill();
-    } else {
-      const std::lock_guard<std::mutex> lock(fill_mutex);
-      if (!d.filled.load(std::memory_order_relaxed)) {
-        fill();
-        MI_CUDA_CHECK(cudaStreamSynchronize(stream));
-        d.filled.store(true, std::memory_order_release);
-      }
-    }
-  }
-  if (d.gate.load(std::memory_order_acquire) == nullptr) {
-    void *gate = nullptr, *hidden = nullptr;
-    MI_CUDA_CHECK(cudaGetSymbolAddress(&gate, g_situ_gate));
-    MI_CUDA_CHECK(cudaGetSymbolAddress(&hidden, g_situ_hidden));
-    d.hidden.store(static_cast<const std::uint16_t*>(hidden), std::memory_order_release);
-    d.gate.store(static_cast<const std::uint16_t*>(gate), std::memory_order_release);
-  }
-  return {d.gate.load(std::memory_order_acquire), d.hidden.load(std::memory_order_acquire)};
-}
-
-using Sm75Tile = qd::TileCfg<64, 128, 64, 32, 64, 2>;  // threadblock 64x128, warp 32x64, K 64, 2 stages: 24 KiB
-using Sm75Instr = cutlass::gemm::GemmShape<8, 8, 16>;
-
-template <class Callbacks, class PermuteB = cutlass::layout::NoPermute>
-using Sm75Kernel = typename qd::Int8Kernel<Sm75Tile, Callbacks, PermuteB, cutlass::arch::Sm75, Sm75Instr>::Gemm;
 
 // Native DP4A tiled GEMM for the plain epilogue. Turing's m8n8k16 INT8 MMA is decoded on ordinary CUDA cores here
 // (GTX 16xx has no tensor cores); four int8 MACs per dp4a instruction with a 64x32x128 tile and shared weight reuse
@@ -134,7 +71,7 @@ __global__ void dp4a_plain_kernel(quant::Int8Operands op, const float* __restric
     const float v = qd::dequant(__int2float_rn(acc[i]), xs[r], ws[c], b);
     __nv_bfloat16 bv = __float2bfloat16_rn(v);
     if constexpr (kAddDelta) {
-      // Same order as add_delta_bf16: round the base to bf16, add the bf16 delta in fp32, round once.
+      // Round the base to bf16, add the bf16 delta in fp32, round once — the same order as a separate add-back pass.
       const float sum = __bfloat162float(bv) + __bfloat162float(delta[r * ldd + c]);
       bv = __float2bfloat16_rn(sum);
     }
@@ -151,10 +88,9 @@ void plain(const qd::Problem& p, const quant::Int8Operands& a, const __nv_bfloat
   MI_CUDA_CHECK_LAUNCH();
 }
 
-// The same approach as the runtime-LoRA side branch: run the GEMM with native DP4A into a temporary bf16 matrix,
-// then apply the bit-exact SIMT epilogue. The probe (sm75_probe gemmepi) shows 1.4-1.55x over the emulated-MMA
-// CUTLASS epilogues with bit-identical output. One scratch buffer per stream: a stream's calls are ordered, and
-// separate streams never share a buffer. sm_75 does not capture these blocks into CUDA graphs.
+// Fused epilogues: run the GEMM with native DP4A into a temporary bf16 matrix, then apply the bit-exact SIMT
+// epilogue. One scratch buffer per stream: a stream's calls are ordered, and separate streams never share a buffer.
+// sm_75 does not capture these blocks into CUDA graphs.
 void* scratch(cudaStream_t stream, std::size_t bytes) {
   static std::mutex mutex;
   static std::unordered_map<cudaStream_t, std::pair<void*, std::size_t>> buffers;
@@ -190,6 +126,7 @@ void plain_add(const qd::Problem& p, const quant::Int8Operands& a, const __nv_bf
   const dim3 grid((p.n + BN - 1) / BN, (p.m + BM - 1) / BM);
   dp4a_plain_kernel<BM, BN, BK, true><<<grid, dim3(32, 8), 0, stream>>>(a, a.x_scale, a.w_scale, nullptr, out, ldo,
                                                                        delta, ldd);
+  MI_CUDA_CHECK_LAUNCH();
 }
 
 void gated_residual(const qd::Problem& p, const quant::Int8Operands& a, const __nv_bfloat16* bias,
