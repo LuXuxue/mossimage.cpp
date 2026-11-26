@@ -626,7 +626,7 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
     };
   }
   control.on_step = [&](const pipeline::StepInfo& s) {
-    if (!quiet && verbose) std::fprintf(stderr, "\rstep %d/%d  %.2f s/step ", s.step, s.num_steps, s.step_seconds);
+    if (!quiet) std::fprintf(stderr, "\rstep %d/%d  %.2f s/step ", s.step, s.num_steps, s.step_seconds);
     return true;
   };
   const auto run = [&](const pipeline::Request& q, const fs::path& png) {
@@ -634,7 +634,7 @@ int generate_or_check(const std::vector<std::string>& args, bool check) {
     pipeline::Result r = pipe.generate(q, control);
     rates = r.hardware;
     held.job_done(r.plan, shape, false, r.cancelled, r.memory.arena_creations, r.dit_load.source);
-    if (!quiet && verbose) std::fprintf(stderr, "\n");
+    if (!quiet) std::fprintf(stderr, "\n");
     if (r.cancelled) return r;
     if (!png.empty()) {
       const std::vector<pipeline::PngText> text =
