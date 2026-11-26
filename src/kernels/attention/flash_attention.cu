@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -176,7 +177,10 @@ void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& 
   if (kernels::sm75::turing()) {
     // Turing: the sm_75 family's own exact attention. Cards with tensor cores use the fp16 MMA kernel; GTX 16xx
     // (TU116/TU117) use the fp32-cuBLASLt path, since their SM executes mma.sync on ordinary arithmetic units.
-    if (kernels::sm75::no_tensor_cores()) {
+    // A/B switch for measuring the fp32 GEMM path against the original fp16-MMA kernel on GTX 16xx.
+    const char* override = std::getenv("MI_SM75_FP32_ATTN");
+    const bool use_fp32 = override == nullptr || (override[0] != '0' && override[0] != '\0');
+    if (kernels::sm75::no_tensor_cores() && use_fp32) {
       kernels::sm75::flash_fwd_f32(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen, causal, scale, workspace,
                                    workspace_bytes, stream);
     } else {

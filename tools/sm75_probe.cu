@@ -722,9 +722,16 @@ void attention() {
           mi::kernels::sm75::flash_fwd(tq, tk, tv, to, tc, tc, len, causal, scale, dl.get(), ws, nullptr);
         },
         iters, 2);
+    const auto ms32 = bench(
+        [&] {
+          mi::kernels::sm75::flash_fwd_f32(tq, tk, tv, to, tc, tc, len, causal, scale, dl.get(), ws, nullptr);
+        },
+        iters, 2);
     const double flops = (causal ? 0.5 : 1.0) * 2.0 * len * len * dim * heads;
-    std::printf("attn L %5d heads %2d kv %2d dim %3d causal %d: %8.3f ms  %6.2f TFLOPS\n", len, heads, kv, dim,
-                causal ? 1 : 0, ms, flops / (ms * 1e-3) / 1e12);
+    std::printf("attn L %5d heads %2d kv %2d dim %3d causal %d: MMA %8.3f ms (%5.2f TFLOPS)  fp32 %8.3f ms "
+                "(%5.2f TFLOPS)  speedup %.2fx\n",
+                len, heads, kv, dim, causal ? 1 : 0, ms, flops / (ms * 1e-3) / 1e12, ms32,
+                flops / (ms32 * 1e-3) / 1e12, ms / ms32);
   };
   run(266, 24, 24, 128, false, 30);   // 256^2 DiT
   run(4113, 24, 24, 128, false, 5);   // 1024^2 DiT

@@ -81,8 +81,17 @@ fp16x2 ALU ceiling above 1.8 TFLOPS.
 ## Implemented: fp32 exact attention on GTX 16xx
 
 `kernels/sm75/attention_f32_sm75.cu` replaces the emulated fp16 MMA attention with chunked cuBLASLt fp32 GEMMs
-(QKᵀ and P·V) and a SIMT softmax. Both matmuls run at 0.7–1.5 TFLOPS, and all `sm75_check` attention cases
-(attn128/attn256/big, including GQA, varlen and bottom-right causal) pass the cosine ≥ 0.9999 and LSE ≤ 2e-4 gates.
+(QKᵀ and P·V) and a parallel SIMT softmax. All `sm75_check` attention cases (attn128/attn256/big, including GQA,
+varlen and bottom-right causal) pass the cosine ≥ 0.9999 and LSE ≤ 2e-4 gates. Measured with `sm75_probe attn`:
+
+| Shape | fp16 MMA (emulated) | fp32 GEMMs | Speedup |
+|---|---:|---:|---:|
+| 266 tokens, 24 heads, D128 | 2.6 ms | 2.4 ms | 1.09x |
+| 4113 tokens, 24 heads, D128 | 350 ms | 211 ms | **1.66x** |
+| 4096 tokens, 32/8 GQA, D256 causal | 502 ms | 390 ms | 1.29x |
+
+End-to-end at 1024² (1 step, cached text embedding) the gain is only ~3 % (42.0 -> 40.9 s/step): the DiT weight
+streaming and the 12 s tiled VAE decode dominate. `MI_SM75_FP32_ATTN=0` selects the old kernel for A/B measurement.
 It needs a larger workspace (`attention::flash_fwd_workspace_bytes(total_q, heads, max_seqlen)`, ~40 MiB at 256²),
 and cuBLASLt plan objects are cached for the lifetime of the process because captured CUDA graphs may replay them.
 

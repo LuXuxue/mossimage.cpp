@@ -142,27 +142,48 @@ __global__ void convert_qkv_kernel(const __nv_bfloat16* __restrict__ q, const __
 // causal_shift = len_k - len_q (bottom-right FA2 alignment). Writes LSE in the engine's [head, token] layout.
 __global__ void softmax_kernel(float* __restrict__ s, int len_k, int causal_shift, bool causal, float scale,
                                float* __restrict__ lse, std::int64_t lse_head_off, int q_start) {
-  if (threadIdx.x != 0) return;
-  const int row = blockIdx.x;
+  __shared__ float shared[16];  // [0..7]: warp maxima; [8..15]: warp sums
+  const int row = blockIdx.x, tid = threadIdx.x;
   float* in = s + static_cast<std::int64_t>(row) * len_k;
   int allowed = len_k;
   if (causal) allowed = std::min(len_k, std::max(0, row + causal_shift + 1));
-  float mx = -INFINITY;
-  for (int j = 0; j < allowed; ++j) mx = fmaxf(mx, in[j] * scale);
+  float local_max = -INFINITY;
+  for (int j = tid; j < allowed; j += blockDim.x) local_max = fmaxf(local_max, in[j] * scale);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) local_max = fmaxf(local_max, __shfl_down_sync(0xffffffffu, local_max, off));
+  if ((tid & 31) == 0) shared[tid >> 5] = local_max;
+  __syncthreads();
+  if (tid == 0) {
+    float mx = -INFINITY;
+    for (int w = 0; w < blockDim.x / 32; ++w) mx = fmaxf(mx, shared[w]);
+    shared[0] = mx;
+  }
+  __syncthreads();
+  const float mx = shared[0];
   if (mx == -INFINITY) {
-    for (int j = 0; j < len_k; ++j) in[j] = 0.f;
-    lse[lse_head_off + q_start + row] = INFINITY;
+    for (int j = tid; j < len_k; j += blockDim.x) in[j] = 0.f;
+    if (tid == 0) lse[lse_head_off + q_start + row] = INFINITY;
     return;
   }
-  float sum = 0.f;
-  for (int j = 0; j < len_k; ++j) {
+  float local_sum = 0.f;
+  for (int j = tid; j < len_k; j += blockDim.x) {
     const float p = j < allowed ? __expf(in[j] * scale - mx) : 0.f;
     in[j] = p;
-    sum += p;
+    local_sum += p;
   }
-  const float inv = 1.f / sum;
-  for (int j = 0; j < len_k; ++j) in[j] *= inv;
-  lse[lse_head_off + q_start + row] = mx + logf(sum);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) local_sum += __shfl_down_sync(0xffffffffu, local_sum, off);
+  if ((tid & 31) == 0) shared[8 + (tid >> 5)] = local_sum;
+  __syncthreads();
+  if (tid == 0) {
+    float sum = 0.f;
+    for (int w = 0; w < blockDim.x / 32; ++w) sum += shared[8 + w];
+    shared[1] = sum;
+    lse[lse_head_off + q_start + row] = mx + logf(sum);
+  }
+  __syncthreads();
+  const float inv = 1.f / shared[1];
+  for (int j = tid; j < len_k; j += blockDim.x) in[j] *= inv;
 }
 
 // V is [len_k, dim]; cuBLASLt's linear computes out = x·wᵀ, so PV needs w = Vᵀ [dim, len_k].
