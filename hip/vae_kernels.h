@@ -114,9 +114,9 @@ struct ConvArgs {
   int h = 0, w_out = 0, c = 0, n = 0;
   int taps = 0;
   bool upsample = false;
-  // Optional fp16 activation storage: x, out and residual point to fp16 bits reinterpreted as float pointers. Bias and
-  // weights stay fp32. The host keeps the buffers in the matching element type so its pointer arithmetic stays in
-  // elements; only the kernels cast back. Off by default, so every other caller is unchanged.
+  // fp16 activation storage: x, out and residual point to fp16 bits reinterpreted as float pointers. Bias and weights
+  // stay fp32. The host keeps the buffers in the matching element type so its pointer arithmetic stays in elements;
+  // only the kernels cast back. Default on gfx1035 with the fp16 operand path, off elsewhere and in the checks.
   bool x_fp16 = false;
   bool out_fp16 = false;  // also selects the residual's storage
 };
@@ -126,9 +126,9 @@ void conv(const ConvArgs& a, Products products, hipStream_t stream);
 std::size_t packed_weight_elems(int n, int k, Products products);
 void pack_weight(const float* w, int n, int k, Products products, std::uint16_t* out);
 
-// conv_out: a 3x3 convolution (zero padding 1) to n <= 4 channels in fp32 with the TF32-rounded operands' exact products,
-// one output pixel per thread: out[m, n] = sum_k + bias[n]. w_tf32: [n, 9 c] KRSC, already TF32-rounded (host_tf32);
-// c a multiple of 4; out [h w, n].
+// conv_out: a 3x3 convolution (zero padding 1) to n <= 4 channels with fp32 accumulation, one output pixel per thread:
+// out[m, n] = sum_k + bias[n]. w_tf32: [n, 9 c] KRSC, TF32-rounded (host_tf32) or fp16-rounded when fp16 is set;
+// c a multiple of 4; out [h w, n] fp32. x_fp16 selects fp16 activation storage for x.
 void conv_narrow(const float* x, const float* w_tf32, const float* bias, float* out, int h, int w, int c, int n,
                  hipStream_t stream, bool fp16 = false, bool x_fp16 = false);
 

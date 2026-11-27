@@ -32,8 +32,7 @@
 namespace mi::hip {
 
 struct VaeDecodeStats {
-  double seconds = 0;              // decode() wall time, the latents' upload and the RGB download included
-  std::uint64_t device_bytes = 0;  // device memory decode() allocated (weights not included)
+  double seconds = 0;  // decode() wall time, the latents' upload and the RGB download included
   // With set_profile(true): device milliseconds per op kind, in order of first use.
   std::vector<std::pair<std::string, double>> profile;
 };
@@ -87,7 +86,7 @@ class VaeDecoder {
   // A full decode is retried in tiles by the caller if it fails.
   VaeDecodeStats decode(const float* latents, std::uint32_t h, std::uint32_t w, std::vector<std::uint8_t>& rgb,
                         std::vector<float>* image = nullptr);
-  // ---- Exact band-tiled decode (fp32/TF32 only) ----
+  // ---- Exact band-tiled decode ----
   // The schedule with the smallest workspace for this band height, and among those the fastest. tile is in image
   // pixels, a multiple of 8.
   static VaeTilePlan plan_tiled_min_memory(int base_channels, std::uint32_t h, std::uint32_t w, int tile);

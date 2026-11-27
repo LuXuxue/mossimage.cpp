@@ -19,7 +19,7 @@
 //     band, both the min-memory planner and a uniform schedule): RGB must be byte-identical.
 // Exit status: 0 everything passed, 1 a check failed, 2 bad usage or no usable device.
 // Usage: hip_vae_check [--device N] [--kat-only | --no-kat] [--vae FILE] [--golden DIR] [--case NAME]... [--no-golden] [--no-nonsquare]
-//                      [--out-dir DIR] [--iters N] [--profile] [--conv-products 4|3] [--tiled-check]
+//                      [--out-dir DIR] [--iters N] [--profile] [--conv-products 4|3|1] [--tiled-check]
 // Some Windows SDK builds (notably the TheRock clang-cl toolchain) ship no zlib. Keep the check buildable there: the
 // PNG golden-image checks then report that zlib is unavailable; all other checks, including --tiled-check, work.
 #if defined(MI_HIP_VAE_NO_ZLIB)

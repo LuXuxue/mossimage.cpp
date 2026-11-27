@@ -73,8 +73,9 @@ from about 6 s to 4.2 s (30% faster). Accumulation, GroupNorm statistics, the co
 so full and band-tiled decodes remain byte-identical. The fp16 path changes output bytes by at most one level versus the
 TF32 path. Other devices keep the TF32/fp32 defaults.
 
-The VAE decoder's other switches are `MI_HIP_VAE_ATTN_PIECES=3` (exact
-3-piece attention, non-gfx1035 fp16 path only) and `MI_HIP_VAE_PROFILE` (per-op timings).
+The VAE decoder's other switches are `MI_HIP_VAE_ATTN_PIECES=3` (exact 3-piece
+attention; ignored on gfx1035 where the fp16 operand path is always used) and
+`MI_HIP_VAE_PROFILE` (per-op timings).
 
 ## Implementation notes
 
@@ -109,8 +110,7 @@ The VAE decoder's other switches are `MI_HIP_VAE_ATTN_PIECES=3` (exact
 - The VAE decoder's mid attention packs Q/K/V/P into 2 TF32 bf16 pieces by
   default (3 GEMM products instead of 6), with a small decoded-image difference
   from the fp32-accurate path. On gfx1035 it uses one fp16 operand per product
-  instead. Set `MI_HIP_VAE_ATTN_PIECES=3` for the exact 3-piece path on other
-  devices; `MI_HIP_VAE_PROFILE` (any value) prints per-op VAE times.
+  and fp16 activation buffers; the switches above select the other modes.
 - The DiT attention output head stride is the head dimension (128), not the
   full residual width; using the latter corrupts adjacent token rows.
 - The LoRA delta must be added before the base GEMM's bf16 rounding, not to the

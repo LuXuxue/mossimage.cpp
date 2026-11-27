@@ -486,8 +486,7 @@ VaeDecodeStats decode_impl(const VaeDecoder::Weights& wt, Products products, boo
     q = x == at(r0) ? at(r1) : at(r0);
   }
   run.norm(wt.norm_out, p, static_cast<std::int64_t>(ch) * cw, p, true);
-  // With fp32 activations the narrow output can reuse the dead ping-pong half, as before. With fp16 activations it
-  // needs its own fp32 buffer (the half is only two bytes per channel).
+  // conv_out's narrow result stays fp32 in its own buffer; the activations may be fp16.
   float* rgb_src = cout.as<float>();
   ops.run("conv_out 3x3" + dims(ch, cw), [&] {
     hip_vae::conv_narrow(reinterpret_cast<const float*>(p), wt.f32(wt.conv_out.w), wt.f32(wt.conv_out.b),
@@ -504,7 +503,6 @@ VaeDecodeStats decode_impl(const VaeDecoder::Weights& wt, Products products, boo
     check(hipMemcpy(image->data(), rgb_src, static_cast<std::size_t>(n) * 4, hipMemcpyDeviceToHost), "hipMemcpy of the image");
   }
   VaeDecodeStats st;
-  st.device_bytes = l.total();
   if (profile) st.profile = ops.profile();
   return st;
 }
@@ -887,15 +885,6 @@ class Planner {
     }
   }
 
-  std::vector<int> tiles() const {
-    std::vector<int> t;
-    const std::int64_t rows = g_.rows(3);
-    for (std::int64_t n = rows / 8; n >= 1; --n) {
-      const auto tile = static_cast<int>(((rows + n - 1) / n + 7) / 8 * 8);
-      if (t.empty() || t.back() != tile) t.push_back(tile);
-    }
-    return t;
-  }
   std::vector<PlanSeg> options(int tile) const {
     std::vector<PlanSeg> opts;
     for (const SegmentInfo& si : infos_) {
@@ -1278,7 +1267,7 @@ class TiledRunner {
       if (!unit(t, u)) return false;
     return true;
   }
-  // Writes only the band's owned rows; no blending or neighbour reads happen here.
+  // Writes only the band's owned rows to the checkpoint or the RGB8 buffer.
   void commit(const SegmentInfo& si, const Tile& t) {
     require(t.level == si.out_level, "internal: band is not at the segment's output level");
     const std::int64_t a = t.o0, b = t.o1;
@@ -1374,7 +1363,6 @@ VaeDecodeStats tiled_impl(const VaeDecoder::Weights& wt, Products products, bool
     image_stage.download(image->data(), n * 4);
   }
   VaeDecodeStats st;
-  st.device_bytes = plan.workspace_bytes + image_bytes;
   if (profile) st.profile = ops.profile();
   return st;
 }

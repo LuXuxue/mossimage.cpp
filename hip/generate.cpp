@@ -51,7 +51,7 @@ std::uint64_t host_available_bytes() {
 
 [[noreturn]] void fail(const std::string& what) { throw std::invalid_argument("hip generate: " + what); }
 
-// The one surviving VAE tiling control. An invalid value must not turn a decode failure into a confusing planner
+// The band height is the only tiling control. An invalid value must not turn a decode failure into a confusing planner
 // exception, so warn and fall back to the default instead.
 int band_tile_px() {
   constexpr int kDefault = 512;
@@ -232,7 +232,6 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     std::optional<TextEncoder> encoder;
     encoder.emplace(device, component(r.te_file, "text_encoder"), te_options);
     const double load_s = now_s() - t0;
-    out.text_encoder_s = load_s;
     report("text encoder load", 1, 1);
     t0 = now_s();
     report("text encoder", 0, 1);
@@ -318,8 +317,7 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     report("vae", 0, 1);
     VaeDecodeStats vst;
     // --vae-tiled requests tiling up front; a full decode that throws is retried the same way. This is an error
-    // fallback, not a memory prediction. The exact band decoder is byte-identical to the full decode, so tiling does
-    // not shift the brightness of any tile.
+    // fallback, not a memory prediction. The exact band decoder is byte-identical to the full decode.
     const auto tiled = [&]() -> VaeDecodeStats {
       const VaeTilePlan plan = VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, band_tile_px());
       std::fprintf(stderr, "moss-infer-hip: exact band-tiled VAE: %s\n", plan.describe().c_str());
