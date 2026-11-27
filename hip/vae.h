@@ -32,7 +32,8 @@
 namespace mi::hip {
 
 struct VaeDecodeStats {
-  double seconds = 0;  // decode() wall time, the latents' upload and the RGB download included
+  double seconds = 0;              // decode() wall time, the latents' upload and the RGB download included
+  std::uint64_t device_bytes = 0;  // device memory decode() allocated (weights not included)
   // With set_profile(true): device milliseconds per op kind, in order of first use.
   std::vector<std::pair<std::string, double>> profile;
 };
@@ -51,7 +52,8 @@ struct VaeTilePlan {
   int base_channels = 0;               // decoder width the plan is for
   int tile = 0;                        // band height in image pixels (a multiple of 8)
   std::vector<Segment> segments;
-  std::uint64_t workspace_bytes = 0;  // device bytes decode_tiled_exact() allocates
+  std::uint64_t workspace_bytes = 0;  // device bytes the planner estimated for the activation mode at plan time
+  bool fp16_act = false;              // activation storage (fp16 vs fp32) the plan was made for
   double relative_cost = 0;           // estimated tail work (conv MACs + memory traffic) vs the untiled tail
 
   std::string describe() const;

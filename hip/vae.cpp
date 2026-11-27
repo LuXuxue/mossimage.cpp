@@ -503,6 +503,7 @@ VaeDecodeStats decode_impl(const VaeDecoder::Weights& wt, Products products, boo
     check(hipMemcpy(image->data(), rgb_src, static_cast<std::size_t>(n) * 4, hipMemcpyDeviceToHost), "hipMemcpy of the image");
   }
   VaeDecodeStats st;
+  st.device_bytes = l.total();
   if (profile) st.profile = ops.profile();
   return st;
 }
@@ -946,6 +947,7 @@ class Planner {
     p.width = w_;
     p.base_channels = base_;
     p.tile = tile;
+    p.fp16_act = vae_fp16_act();
     p.segments.reserve(segs.size());
     double total = 0;
     for (const PlanSeg& s : segs) {
@@ -1311,7 +1313,7 @@ class TiledRunner {
 template <class Act>
 VaeDecodeStats tiled_impl(const VaeDecoder::Weights& wt, Products products, bool profile, int c, const float* latents,
                           std::uint32_t h, std::uint32_t w, std::vector<std::uint8_t>& rgb, const VaeTilePlan& plan,
-                          std::vector<float>* image, const Layout& l) {
+                          std::vector<float>* image, const Layout& l, std::uint64_t ws_bytes) {
   const int mid = 4 * c;
   const Planner p(c, h, w);
   std::vector<PlanSeg> segs;
@@ -1323,7 +1325,7 @@ VaeDecodeStats tiled_impl(const VaeDecoder::Weights& wt, Products products, bool
             W = static_cast<int>(16 * w);
   const std::size_t image_bytes = image != nullptr ? static_cast<std::size_t>(H) * W * 3 * 4 : 0;
   Stream stream;
-  DeviceBuffer ws(static_cast<std::size_t>(plan.workspace_bytes));
+  DeviceBuffer ws(static_cast<std::size_t>(ws_bytes));
   DeviceBuffer image_stage(image_bytes);
   struct Drain {
     hipStream_t s;
@@ -1382,11 +1384,15 @@ VaeDecodeStats VaeDecoder::decode_tiled_exact(const float* latents, std::uint32_
   for (const VaeTilePlan::Segment& s : plan.segments) segs.push_back({s.first_unit, s.end_unit, s.band_rows});
   const PlanLayout pl = p.layout(segs, true);
   const Fixed& f = p.fixed();
-  require(static_cast<std::uint64_t>(pl.block) + pl.work + f.total() == plan.workspace_bytes,
-          "tile plan workspace out of date");
+  // A plan made before the decoder was constructed was stamped with the default (fp32) activation mode. Its estimate
+  // is still a safe upper bound, but the workspace must be sized for the decoder's actual mode. Only compare against
+  // the estimate when both modes agree; otherwise recompute below.
+  const std::uint64_t ws_bytes = static_cast<std::uint64_t>(pl.block) + pl.work + f.total();
+  if (plan.fp16_act == vae_fp16_act())
+    require(ws_bytes == plan.workspace_bytes, "tile plan workspace out of date");
   const std::size_t H = 16ull * h, W = 16ull * w;
   const std::size_t image_bytes = image != nullptr ? H * W * 3 * 4 : 0;
-  const std::uint64_t need = plan.workspace_bytes + image_bytes;  // the fp32 image needs its own staging buffer
+  const std::uint64_t need = ws_bytes + image_bytes;  // the fp32 image needs its own staging buffer
   const std::uint64_t free = device_.free_memory();
   if (need > free) {
     char msg[256];
@@ -1396,8 +1402,11 @@ VaeDecodeStats VaeDecoder::decode_tiled_exact(const float* latents, std::uint32_
     throw std::runtime_error(msg);
   }
   VaeDecodeStats st =
-      vae_fp16_act() ? tiled_impl<std::uint16_t>(*weights_, conv_products_, profile_, c, latents, h, w, rgb, plan, image, l)
-                     : tiled_impl<float>(*weights_, conv_products_, profile_, c, latents, h, w, rgb, plan, image, l);
+      vae_fp16_act() ? tiled_impl<std::uint16_t>(*weights_, conv_products_, profile_, c, latents, h, w, rgb, plan, image, l,
+                                                 ws_bytes)
+                     : tiled_impl<float>(*weights_, conv_products_, profile_, c, latents, h, w, rgb, plan, image, l,
+                                         ws_bytes);
+  st.device_bytes = need;
   st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   return st;
 }

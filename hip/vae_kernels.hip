@@ -103,7 +103,7 @@ __device__ __forceinline__ void store_tile_out(const FragAcc (&acc)[kMf][kNfT], 
           }
         }
         if constexpr (kOutFp16) {
-          std::uint16_t ho[8];
+          alignas(16) std::uint16_t ho[8];  // read back as uint4 below
           HIP_BLOCK_UNROLL
           for (int j = 0; j < 8; ++j) ho[j] = h16(y[j]);
           std::uint16_t* o16 = reinterpret_cast<std::uint16_t*>(out) + off;
@@ -684,7 +684,7 @@ __global__ __launch_bounds__(kWave) void gn_apply_kernel(const GnApplyArgs a) {
     r[j] = y;
   }
   if constexpr (kYFp16) {
-    const std::uint16_t ho[4] = {h16(r[0]), h16(r[1]), h16(r[2]), h16(r[3])};
+    alignas(8) const std::uint16_t ho[4] = {h16(r[0]), h16(r[1]), h16(r[2]), h16(r[3])};  // read back as uint2 below
     reinterpret_cast<uint2*>(a.y)[i] = *reinterpret_cast<const uint2*>(ho);
   } else {
     reinterpret_cast<float4*>(a.y)[i] = make_float4(r[0], r[1], r[2], r[3]);
@@ -791,6 +791,8 @@ void conv(const ConvArgs& a, Products products, hipStream_t stream) {
   require(products != Products::kFp32 || a.taps == 1, "conv", "fp32 products are for 1x1 convolutions (linears)");
   require(products != Products::kFp16 || a.taps == 1 || a.taps == 9, "conv", "fp16 products need a 1x1 or 3x3 convolution");
   require(aligned16(a.x) && aligned16(a.w) && aligned16(a.out) && aligned16(a.residual), "conv", "pointers must be 16-byte aligned");
+  if (products != Products::kFp16)
+    require(!a.x_fp16 && !a.out_fp16, "conv", "fp16 activation buffers need the fp16 product path");
   const int k = a.taps * a.c;
   // A single launch of the largest convolutions can take long enough to trip the OS's GPU watchdog. Split the output
   // rows into bounded chunks: each output row still belongs to exactly one workgroup, so the result is identical, but
@@ -807,16 +809,35 @@ void conv(const ConvArgs& a, Products products, hipStream_t stream) {
     cka.m0 = m0;
     const dim3 grid(grid_of((rows + kTileM - 1) / kTileM * cka.n_tiles, 1, "conv"));
     if (products == Products::kFp16) {
-      // The activation buffers are either all fp16 or all fp32 within one decode; x_fp16 selects which kernel to launch.
-      if (a.x_fp16) {
-        if (a.taps == 1) conv_kernel<1, false, 1, true, true><<<grid, block, 0, stream>>>(cka);
-        else if (a.upsample) conv_kernel<9, true, 1, true, true><<<grid, block, 0, stream>>>(cka);
-        else conv_kernel<9, false, 1, true, true><<<grid, block, 0, stream>>>(cka);
+      // x_fp16 selects x/residual storage, out_fp16 selects out storage. They normally agree, but dispatch on each
+      // flag rather than assuming one implies the other.
+#define MI_CONV_FP16(T, U, X, O) conv_kernel<T, U, 1, X, O><<<grid, block, 0, stream>>>(cka)
+      if (a.taps == 1) {
+        if (a.x_fp16) {
+          if (a.out_fp16) MI_CONV_FP16(1, false, true, true);
+          else MI_CONV_FP16(1, false, true, false);
+        } else {
+          if (a.out_fp16) MI_CONV_FP16(1, false, false, true);
+          else MI_CONV_FP16(1, false, false, false);
+        }
+      } else if (a.upsample) {
+        if (a.x_fp16) {
+          if (a.out_fp16) MI_CONV_FP16(9, true, true, true);
+          else MI_CONV_FP16(9, true, true, false);
+        } else {
+          if (a.out_fp16) MI_CONV_FP16(9, true, false, true);
+          else MI_CONV_FP16(9, true, false, false);
+        }
       } else {
-        if (a.taps == 1) conv_kernel<1, false, 1><<<grid, block, 0, stream>>>(cka);
-        else if (a.upsample) conv_kernel<9, true, 1><<<grid, block, 0, stream>>>(cka);
-        else conv_kernel<9, false, 1><<<grid, block, 0, stream>>>(cka);
+        if (a.x_fp16) {
+          if (a.out_fp16) MI_CONV_FP16(9, false, true, true);
+          else MI_CONV_FP16(9, false, true, false);
+        } else {
+          if (a.out_fp16) MI_CONV_FP16(9, false, false, true);
+          else MI_CONV_FP16(9, false, false, false);
+        }
       }
+#undef MI_CONV_FP16
     } else if (products == Products::kFp32) {
       conv_kernel<1, false, 9><<<grid, block, 0, stream>>>(cka);
     } else if (a.taps == 1) {
