@@ -98,8 +98,9 @@ attention; ignored on gfx1035 where the fp16 operand path is always used) and
   several threads. The fast transform differs from the reference at a small
   fraction of bf16 weight values; set `MI_HIP_TE_EXACT_DEQUANT` (any value) for
   bit-exact but much slower weights. Projection GEMMs use the LDS-staged tiled
-  kernel on row-major weights by default; `MI_HIP_TE_PACKED_GEMM` (any value)
-  selects the original packed rocWMMA path. "text encoder load" and "text
+  kernel on row-major weights by default; `MI_HIP_TE_PACKED_GEMM` (any value
+  except `0`) selects the original packed rocWMMA path, `0` keeps the tiled
+  kernel. "text encoder load" and "text
   encoder" are reported separately.
   The int8 ConvRot layer weights default to staying int8 on the device:
   `te_dequant.hip` runs the same radix-4 transform there as the host path and

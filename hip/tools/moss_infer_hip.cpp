@@ -667,6 +667,12 @@ int run_main(const std::vector<std::string>& argv) {
     if (e.what()[0] != '\0') std::fprintf(stderr, "moss-infer-hip: %s\n", e.what());
     std::fputs(kUsage, stderr);
     return 2;
+  } catch (const std::exception& e) {
+    // --params reads and parses a file: a missing or malformed file throws std::runtime_error, not
+    // std::invalid_argument. Without this handler the exception escapes run_main() and terminates the process.
+    std::fprintf(stderr, "moss-infer-hip: %s\n", e.what());
+    std::fputs(kUsage, stderr);
+    return 2;
   }
   if (a.help) {
     std::fputs(kUsage, stdout);

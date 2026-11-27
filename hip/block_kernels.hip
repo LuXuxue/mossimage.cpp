@@ -220,8 +220,12 @@ __global__ __launch_bounds__(kWave) void gemm_situ_kernel(const GemmArgs a) {
 
   for (int i = thread_id(); i < rows * cols; i += kWave) {
     const int r = i / cols, c = i % cols;
-    // The GEMM output is a bf16 tensor in the reference: round both halves before SiTU.
-    const float h = rbf(mem[r * kMemCols + c]), g = rbf(mem[r * kMemCols + kSituTileF + c]);
+    // The GEMM output is a bf16 tensor in the reference: round both halves before SiTU. A LoRA delta is folded
+    // into the fp32 accumulator first, at the same point as the INT8 epilogue.
+    const std::int64_t drow = (m0 + r) * a.ldl;
+    const float dh = a.lora_delta != nullptr ? f(a.lora_delta[drow + f0 + c]) : 0.0f;
+    const float dg = a.lora_delta != nullptr ? f(a.lora_delta[drow + a.n + f0 + c]) : 0.0f;
+    const float h = rbf(mem[r * kMemCols + c] + dh), g = rbf(mem[r * kMemCols + kSituTileF + c] + dg);
     a.out[(m0 + r) * a.ldo + f0 + c] = bf(situ_value(h, g));
   }
 }
@@ -444,10 +448,10 @@ void rms_norm_modulate(const bf16_bits* x, std::int64_t ldx, const bf16_bits* we
 }
 
 void gemm(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* w, std::int64_t ldw,
-          int m, int n, int k, hipStream_t stream) {
+          int m, int n, int k, hipStream_t stream, const bf16_bits* lora_delta, std::int64_t ldl) {
   if (m == 0 || n == 0) return;
   const Blocking bl = blocking_of(m, n, k, kGemmTileM, kGemmTileN, kGemmTileN);
-  const GemmArgs a{out, ldo, x, ldx, w, ldw, nullptr, m, n, k, bl.bm, bl.bn, nullptr, nullptr};
+  const GemmArgs a{out, ldo, x, ldx, w, ldw, nullptr, m, n, k, bl.bm, bl.bn, nullptr, nullptr, lora_delta, ldl};
   gemm_kernel<Epilogue::kPlain><<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("gemm");
 }
@@ -484,19 +488,19 @@ void attention(const AttentionArgs& p, hipStream_t stream) {
 }
 
 void gemm_gated_residual(bf16_bits* residual, std::int64_t ldr, const bf16_bits* x, std::int64_t ldx, const bf16_bits* w,
-                         std::int64_t ldw, const bf16_bits* gate, int m, int n, int k, hipStream_t stream) {
+                         std::int64_t ldw, const bf16_bits* gate, int m, int n, int k, hipStream_t stream, const bf16_bits* lora_delta, std::int64_t ldl) {
   if (m == 0 || n == 0) return;
   const Blocking bl = blocking_of(m, n, k, kGemmTileM, kGemmTileN, kGemmTileN);
-  const GemmArgs a{residual, ldr, x, ldx, w, ldw, gate, m, n, k, bl.bm, bl.bn, nullptr, nullptr};
+  const GemmArgs a{residual, ldr, x, ldx, w, ldw, gate, m, n, k, bl.bm, bl.bn, nullptr, nullptr, lora_delta, ldl};
   gemm_kernel<Epilogue::kGatedResidual><<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("gemm_gated_residual");
 }
 
 void gemm_situ_glu(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* w_up_gate,
-                   std::int64_t ldw, int m, int f, int k, hipStream_t stream) {
+                   std::int64_t ldw, int m, int f, int k, hipStream_t stream, const bf16_bits* lora_delta, std::int64_t ldl) {
   if (m == 0 || f == 0) return;
   const Blocking bl = blocking_of(m, f, k, kSituTileM, kSituTileF, 2 * kSituTileF);
-  const GemmArgs a{out, ldo, x, ldx, w_up_gate, ldw, nullptr, m, f, k, bl.bm, bl.bn, nullptr, nullptr};
+  const GemmArgs a{out, ldo, x, ldx, w_up_gate, ldw, nullptr, m, f, k, bl.bm, bl.bn, nullptr, nullptr, lora_delta, ldl};
   gemm_situ_kernel<<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("gemm_situ_glu");
 }
@@ -512,27 +516,27 @@ namespace {
 // The GEMM ops on packed operands. n is a multiple of the tile's N for all of them, so no tile runs past the weight.
 std::int64_t pack_rows(int tokens) { return (static_cast<std::int64_t>(tokens) + kPackRowsMultiple - 1) / kPackRowsMultiple * kPackRowsMultiple; }
 
-void packed_gemm_plain(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const BlockBuffers& b, int n, int k, hipStream_t stream) {
+void packed_gemm_plain(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const BlockBuffers& b, int n, int k, hipStream_t stream, const bf16_bits* lora_delta, std::int64_t ldl) {
   if (b.tokens == 0) return;
   pack_fragments(b.pack, x, ldx, b.tokens, pack_rows(b.tokens), k, stream);
   const Blocking bl = blocking_of(b.tokens, n, k, kGemmTileM, kGemmTileN, kGemmTileN);
-  const GemmArgs a{out, ldo, nullptr, 0, nullptr, 0, nullptr, b.tokens, n, k, bl.bm, bl.bn, b.pack, wp};
+  const GemmArgs a{out, ldo, nullptr, 0, nullptr, 0, nullptr, b.tokens, n, k, bl.bm, bl.bn, b.pack, wp, lora_delta, ldl};
   gemm_kernel<Epilogue::kPlain><<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("gemm (packed)");
 }
-void packed_gemm_gated(bf16_bits* residual, std::int64_t ldr, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const bf16_bits* gate, const BlockBuffers& b, int n, int k, hipStream_t stream) {
+void packed_gemm_gated(bf16_bits* residual, std::int64_t ldr, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const bf16_bits* gate, const BlockBuffers& b, int n, int k, hipStream_t stream, const bf16_bits* lora_delta, std::int64_t ldl) {
   if (b.tokens == 0) return;
   pack_fragments(b.pack, x, ldx, b.tokens, pack_rows(b.tokens), k, stream);
   const Blocking bl = blocking_of(b.tokens, n, k, kGemmTileM, kGemmTileN, kGemmTileN);
-  const GemmArgs a{residual, ldr, nullptr, 0, nullptr, 0, gate, b.tokens, n, k, bl.bm, bl.bn, b.pack, wp};
+  const GemmArgs a{residual, ldr, nullptr, 0, nullptr, 0, gate, b.tokens, n, k, bl.bm, bl.bn, b.pack, wp, lora_delta, ldl};
   gemm_kernel<Epilogue::kGatedResidual><<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("gemm_gated_residual (packed)");
 }
-void packed_gemm_situ(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const BlockBuffers& b, int f, int k, hipStream_t stream) {
+void packed_gemm_situ(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* wp, const BlockBuffers& b, int f, int k, hipStream_t stream, const bf16_bits* lora_delta, std::int64_t ldl) {
   if (b.tokens == 0) return;
   pack_fragments(b.pack, x, ldx, b.tokens, pack_rows(b.tokens), k, stream);
   const Blocking bl = blocking_of(b.tokens, f, k, kSituTileM, kSituTileF, 2 * kSituTileF);
-  const GemmArgs a{out, ldo, nullptr, 0, nullptr, 0, nullptr, b.tokens, f, k, bl.bm, bl.bn, b.pack, wp};
+  const GemmArgs a{out, ldo, nullptr, 0, nullptr, 0, nullptr, b.tokens, f, k, bl.bm, bl.bn, b.pack, wp, lora_delta, ldl};
   gemm_situ_kernel<<<dim3(bl.workgroups), dim3(kWave), 0, stream>>>(a);
   check_launch("gemm_situ_glu (packed)");
 }
@@ -545,7 +549,8 @@ void pack_attention(const BlockBuffers& b, hipStream_t stream) {
   check_launch("pack_attention");
 }
 
-void run_block_op(int op, const BlockWeights& w, const BlockBuffers& b, hipStream_t stream) {
+void run_block_op(int op, const BlockWeights& w, const BlockBuffers& b, hipStream_t stream, const bf16_bits* lora_delta,
+                  std::int64_t ldl) {
   constexpr std::int64_t ldx = kDim, ldq = 3 * kDim;
   const bool packed = w.qkv_packed != nullptr && b.pack != nullptr && b.pack_attn != nullptr;
   const auto mod = [&](int i) { return b.mod + static_cast<std::int64_t>(i) * kDim; };
@@ -555,9 +560,9 @@ void run_block_op(int op, const BlockWeights& w, const BlockBuffers& b, hipStrea
     case 0: rms_norm_modulate(b.x, ldx, w.norm1, mod(1), mod(0), b.y, ldx, b.tokens, kDim, stream); break;
     case 1:
       if (packed) {
-        packed_gemm_plain(b.qkv, ldq, b.y, ldx, w.qkv_packed, b, 3 * kDim, kDim, stream);
+        packed_gemm_plain(b.qkv, ldq, b.y, ldx, w.qkv_packed, b, 3 * kDim, kDim, stream, lora_delta, ldl);
       } else {
-        gemm(b.qkv, ldq, b.y, ldx, w.qkv, kDim, b.tokens, 3 * kDim, kDim, stream);
+        gemm(b.qkv, ldq, b.y, ldx, w.qkv, kDim, b.tokens, 3 * kDim, kDim, stream, lora_delta, ldl);
       }
       break;
     case 2: qk_norm_rope(b.qkv, ldq, b.tokens, kHeads, w.q_norm, w.k_norm, b.rope, kHeadDim, stream); break;
@@ -569,31 +574,32 @@ void run_block_op(int op, const BlockWeights& w, const BlockBuffers& b, hipStrea
       break;
     case 4:
       if (packed) {
-        packed_gemm_gated(b.x, ldx, b.attn, ldx, w.o_packed, mod(2), b, kDim, kDim, stream);
+        packed_gemm_gated(b.x, ldx, b.attn, ldx, w.o_packed, mod(2), b, kDim, kDim, stream, lora_delta, ldl);
       } else {
-        gemm_gated_residual(b.x, ldx, b.attn, ldx, w.o, kDim, mod(2), b.tokens, kDim, kDim, stream);
+        gemm_gated_residual(b.x, ldx, b.attn, ldx, w.o, kDim, mod(2), b.tokens, kDim, kDim, stream, lora_delta, ldl);
       }
       break;
     case 5: rms_norm_modulate(b.x, ldx, w.norm2, mod(4), mod(3), b.y, ldx, b.tokens, kDim, stream); break;
     case 6:
       if (packed) {
-        packed_gemm_situ(b.ffn, kFfnDim, b.y, ldx, w.up_gate_packed, b, kFfnDim, kDim, stream);
+        packed_gemm_situ(b.ffn, kFfnDim, b.y, ldx, w.up_gate_packed, b, kFfnDim, kDim, stream, lora_delta, ldl);
       } else {
-        gemm_situ_glu(b.ffn, kFfnDim, b.y, ldx, w.up_gate, kDim, b.tokens, kFfnDim, kDim, stream);
+        gemm_situ_glu(b.ffn, kFfnDim, b.y, ldx, w.up_gate, kDim, b.tokens, kFfnDim, kDim, stream, lora_delta, ldl);
       }
       break;
     default:
       if (packed) {
-        packed_gemm_gated(b.x, ldx, b.ffn, kFfnDim, w.down_packed, mod(5), b, kDim, kFfnDim, stream);
+        packed_gemm_gated(b.x, ldx, b.ffn, kFfnDim, w.down_packed, mod(5), b, kDim, kFfnDim, stream, lora_delta, ldl);
       } else {
-        gemm_gated_residual(b.x, ldx, b.ffn, kFfnDim, w.down, kFfnDim, mod(5), b.tokens, kDim, kFfnDim, stream);
+        gemm_gated_residual(b.x, ldx, b.ffn, kFfnDim, w.down, kFfnDim, mod(5), b.tokens, kDim, kFfnDim, stream, lora_delta,
+                            ldl);
       }
       break;
   }
 }
 
 void run_block(const BlockWeights& w, const BlockBuffers& b, hipStream_t stream) {
-  for (int op = 0; op < kBlockOps; ++op) run_block_op(op, w, b, stream);
+  for (int op = 0; op < kBlockOps; ++op) run_block_op(op, w, b, stream, nullptr, 0);
 }
 
 }  // namespace hip_block

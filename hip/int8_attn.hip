@@ -196,7 +196,9 @@ __global__ __launch_bounds__(kThreads) void quant_k_kernel(const bf16* qkv, std:
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffull, mx, off, 32));
   const float inv_scale = 127.0f / (mx + 1e-7f);
-  if (lane == 0) ks[(static_cast<std::size_t>(col0) / 16) * heads + head] = 1.0f / inv_scale;
+  // A group past the sequence end has no valid keys: its amax is zero and its scale slot belongs to a later
+  // sequence (or lies past the buffer). Writing it would race with that sequence's real scale or corrupt memory.
+  if (key0 < seqlen && lane == 0) ks[(static_cast<std::size_t>(col0) / 16) * heads + head] = 1.0f / inv_scale;
 
 #pragma unroll
   for (int p = 0; p < 16; ++p) {

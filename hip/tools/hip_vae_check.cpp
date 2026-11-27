@@ -1405,16 +1405,22 @@ void run_tiled_exact_check(VaeDecoder& decoder) {
         std::vector<std::uint8_t> rgb;
         std::vector<float> image;
         decoder.decode_tiled_exact(z.data(), cs.h, cs.w, rgb, plan, &image);
-        std::size_t bad_bytes = 0;
-        for (std::size_t i = 0; i < rgb.size(); ++i) bad_bytes += rgb[i] != rgb_full[i];
-        std::size_t bad_image = 0;
+        // Compare sizes before indexing: a decoder returning the wrong shape must fail cleanly, not read past
+        // the full-frame result vectors.
+        const bool sizes_ok = rgb.size() == rgb_full.size() && image.size() == image_full.size();
+        std::size_t bad_bytes = 0, bad_image = 0;
         double max_diff = 0.0;
-        for (std::size_t i = 0; i < image.size(); ++i) {
-          bad_image += std::bit_cast<std::uint32_t>(image[i]) != std::bit_cast<std::uint32_t>(image_full[i]);
-          max_diff = std::max(max_diff, std::abs(static_cast<double>(image[i] - image_full[i])));
+        if (sizes_ok) {
+          for (std::size_t i = 0; i < rgb.size(); ++i) bad_bytes += rgb[i] != rgb_full[i];
+          for (std::size_t i = 0; i < image.size(); ++i) {
+            bad_image += std::bit_cast<std::uint32_t>(image[i]) != std::bit_cast<std::uint32_t>(image_full[i]);
+            max_diff = std::max(max_diff, std::abs(static_cast<double>(image[i] - image_full[i])));
+          }
+        } else {
+          bad_bytes = rgb_full.size() + rgb.size() + 1;
+          bad_image = image_full.size() + image.size() + 1;
         }
-        const bool ok = rgb.size() == rgb_full.size() && image.size() == image_full.size() && bad_bytes == 0 &&
-                        bad_image == 0;
+        const bool ok = sizes_ok && bad_bytes == 0 && bad_image == 0;
         if (!ok) ++failures;
         std::printf("  %-9s %-8s %s: %s %zu of %zu bytes differ, %zu of %zu fp32 values differ (max |diff| %.3g)\n",
                     planner == 0 ? "min-mem" : "uniform", ("tile " + std::to_string(tile)).c_str(), plan.describe().c_str(),

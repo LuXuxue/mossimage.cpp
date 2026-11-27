@@ -89,6 +89,19 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     return file.empty() ? r.model_dir / sub : file;
   };
 
+  // The adapter holds device weights for the whole run. Allocate it before any memory budget is computed so that
+  // the budget and the later activation check both account for it.
+  std::optional<Lora> lora;
+  if (!r.lora_file.empty()) {
+    device.make_current();
+    lora.emplace(r.lora_file, r.lora_scale, kDiTLayers);
+  }
+  const std::uint64_t lora_bytes = lora != std::nullopt ? static_cast<std::uint64_t>(lora->device_bytes()) : 0;
+  if (r.vram_budget != 0 && lora_bytes >= r.vram_budget)
+    fail("the LoRA's device weights (" + std::to_string(lora_bytes) + " bytes) leave nothing under the VRAM budget");
+  const std::uint64_t budget_limit =
+      r.vram_budget != 0 ? r.vram_budget - lora_bytes : 0;  // the budget that remains for VAE + DiT
+
   // The VAE first (about 0.1 GiB of weights, kept through the run). A full decode that fails is retried in tiles
   // after the text encoder and DiT have been freed.
   std::optional<VaeDecoder> vae;
@@ -98,14 +111,14 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     vae->set_profile(std::getenv("MI_HIP_VAE_PROFILE") != nullptr);
     // An explicit budget is a hard limit on the decode as well. If the full decode does not fit, use the exact band
     // decoder; refuse before the text encoder and the sampling steps only when even that does not fit.
-    if (r.vram_budget != 0 && vae->weight_bytes() + vae->workspace_bytes(lh, lw) > r.vram_budget) {
+    if (budget_limit != 0 && vae->weight_bytes() + vae->workspace_bytes(lh, lw) > budget_limit) {
       std::uint64_t tiled_bytes = 0;
       try {
         tiled_bytes = VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, band_tile_px()).workspace_bytes;
       } catch (const std::exception& e) {
         std::fprintf(stderr, "moss-infer-hip: no tiled VAE schedule: %s\n", e.what());
       }
-      if (tiled_bytes != 0 && vae->weight_bytes() + tiled_bytes <= r.vram_budget) {
+      if (tiled_bytes != 0 && vae->weight_bytes() + tiled_bytes <= budget_limit) {
         std::fprintf(stderr, "moss-infer-hip: full VAE decode exceeds the VRAM budget; using the exact band decoder\n");
         force_tiled = true;
       } else {
@@ -151,19 +164,23 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
   } else {
     std::snprintf(budget, sizeof budget, "the automatic budget");
   }
-  struct DitPlan {
-    std::uint64_t activations, weights;
-  };
-  const auto plan = [&](const std::vector<std::uint64_t>& lengths, std::uint64_t free) {
+  // Kept separate from plan() so the check after the DiT is loaded can re-evaluate it with the actual INT8 layout:
+  // --tier is only a request, the loaded tensors decide which scratch Dit::forward() allocates.
+  const auto activation_bytes = [&](const std::vector<std::uint64_t>& lengths, bool int8) {
     std::uint64_t tokens = 0, text_rows = 0, longest = 0;
     for (const std::uint64_t length : lengths) {
       tokens += hw + length;
       text_rows += length;
       longest = std::max(longest, length);
     }
-    const std::uint64_t activations = Dit::activation_bytes(tokens, lengths.size(), hw, r.int8_dit, !r.lora_file.empty()) +
-                                      longest * (kDiTTextDim + 2 * std::uint64_t{kDiTFfnDim}) * kBf16 +
-                                      text_rows * kDiTDim * kBf16;
+    return Dit::activation_bytes(tokens, lengths.size(), hw, int8, lora.has_value()) +
+           longest * (kDiTTextDim + 2 * std::uint64_t{kDiTFfnDim}) * kBf16 + text_rows * kDiTDim * kBf16;
+  };
+  struct DitPlan {
+    std::uint64_t activations, weights;
+  };
+  const auto plan = [&](const std::vector<std::uint64_t>& lengths, std::uint64_t free) {
+    const std::uint64_t activations = activation_bytes(lengths, r.int8_dit);
     const std::uint64_t need = activations + kReserve;
     char msg[512];
     if (need > free && r.vram_budget == 0) free = need + kAllocatorSlack;
@@ -175,15 +192,15 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
       throw std::runtime_error(msg);
     }
     std::uint64_t room = free - need;
-    if (r.vram_budget != 0) {
-      if (r.vram_budget <= vae_bytes + need) {
+    if (budget_limit != 0) {
+      if (budget_limit <= vae_bytes + need) {
         std::snprintf(msg, sizeof msg,
                       "%s leaves nothing for the DiT's weights: the VAE's weights take %.2f GiB and the DiT at %ux%u needs "
                       "%.2f GiB beside its weights (activations %.2f GiB, reserve %.2f GiB)",
                       budget, gib(vae_bytes), r.width, r.height, gib(need), gib(activations), gib(kReserve));
         throw std::runtime_error(msg);
       }
-      room = std::min(room, r.vram_budget - vae_bytes - need);
+      room = std::min(room, budget_limit - vae_bytes - need);
     }
     const std::uint64_t weights = room > kWeightRounding ? room - kWeightRounding : 0;
     if (weights < Dit::minimum_weight_bytes()) {
@@ -253,21 +270,20 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     const DitPlan p = plan(lengths, device.free_memory());
     DitOptions options;
     options.device_budget = p.weights;  // >= Dit::minimum_weight_bytes(), so never 0 (every block resident)
-    std::optional<Lora> lora;
-    if (!r.lora_file.empty()) {
-      lora.emplace(r.lora_file, r.lora_scale, kDiTLayers);
-      options.lora = &*lora;
-    }
+    options.lora = lora.has_value() ? &*lora : nullptr;
     Dit dit(device, component(r.dit_file, "transformer"), options);
     out.dit_resident_blocks = dit.resident_blocks();
     // What is left must hold the activations; the reserve absorbs the runtime's own allocations and the rounding.
     out.dit_free_bytes = device.free_memory();
-    if (out.dit_free_bytes < p.activations + kActivationMargin) {
+    // Re-evaluate with the loaded model's real activation mode: --tier high/reference is only a request, a
+    // single-file --dit override can load INT8 tensors even when the tier says reference.
+    const std::uint64_t activations = std::max(p.activations, activation_bytes(lengths, dit.uses_int8()));
+    if (out.dit_free_bytes < activations + kActivationMargin) {
       char msg[512];
       std::snprintf(msg, sizeof msg,
                     "the DiT's weights take %.2f GiB of device memory (%s); beside them its activations at %ux%u need "
                     "%.2f GiB, %s reports %.2f GiB free",
-                    gib(dit.weight_bytes()), budget, r.width, r.height, gib(p.activations + kActivationMargin),
+                    gib(dit.weight_bytes()), budget, r.width, r.height, gib(activations + kActivationMargin),
                     device.info().name.c_str(), gib(out.dit_free_bytes));
       // With an explicit budget this is a real limit. With the automatic budget the report can be zero long before
       // shared memory is exhausted, so continue and let an actual hipMalloc failure report the real limit.

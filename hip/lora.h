@@ -44,6 +44,7 @@ class Lora {
   int max_rank() const { return max_rank_; }
   int max_n() const { return max_n_; }
   int adapters() const { return adapters_; }
+  std::size_t device_bytes() const { return weights_.bytes(); }
 
   struct Loaded {
     std::vector<bf16> a;  // [rank, k]

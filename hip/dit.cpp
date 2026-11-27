@@ -168,14 +168,20 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
   }
 
   // The blocks: the first `resident` on the device, the rest in pinned host memory, all packed on the host.
+  // The official bf16 bundle keeps proj.q/k/v.weight apart (the engine fuses them at load); the converted
+  // INT8 ConvRot bundle stores one proj.qkv.weight. Accept both so --tier reference works with either file.
+  const bool fused_qkv = index.has("layers.0.proj.qkv.weight");
+  const auto qkv_names = [&](int l) {
+    const std::string p = "layers." + std::to_string(l) + ".";
+    return fused_qkv ? std::vector<std::string>{p + "proj.qkv.weight"}
+                     : std::vector<std::string>{p + "proj.q.weight", p + "proj.k.weight", p + "proj.v.weight"};
+  };
   const auto block_names = [](int l) {
     const std::string p = "layers." + std::to_string(l) + ".";
-    // FUSED proj.qkv.weight [3d, d] (q, k, v stacked), not separate q/k/v, as this model stores it.
     return std::vector<std::string>{p + "norm1.weight", p + "norm2.weight", p + "q_norm.weight", p + "k_norm.weight",
-                                    p + "proj.qkv.weight", p + "proj.o.weight", p + "proj.ffn_up_gate.weight",
-                                    p + "proj.ffn_down.weight"};
+                                    p + "proj.o.weight", p + "proj.ffn_up_gate.weight", p + "proj.ffn_down.weight"};
   };
-  const std::vector<std::vector<std::int64_t>> block_shapes = {{d}, {d}, {kHead}, {kHead}, {3 * d, d}, {d, d}, {2 * f, d},
+  const std::vector<std::vector<std::int64_t>> block_shapes = {{d}, {d}, {kHead}, {kHead}, {d, d}, {2 * f, d},
                                                                {d, f}};
   // The globals and the refiner stay resident, and streaming needs its two slots: a budget below that cannot hold.
   if (options.device_budget > 0 && options.device_budget < minimum_weight_bytes()) {
@@ -200,8 +206,8 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
   const std::size_t i8_down_scale = i8_down_q + d * f;
   const std::size_t i8_block_bytes = i8_down_scale + d * 4;
   for (int l = 0; l < kDiTLayers; ++l) {
-    const std::string qkv_name = "layers." + std::to_string(l) + ".proj.qkv.weight";
-    const bool is_int8 = index.at(qkv_name).dtype == "I8";
+    const std::vector<std::string> qkv = qkv_names(l);
+    const bool is_int8 = index.at(qkv.front()).dtype == "I8";
     is_int8_[l] = is_int8;
     if (is_int8) {
       const std::string p = "layers." + std::to_string(l) + ".";
@@ -214,8 +220,11 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
       i8_check(p + "norm2.weight", {d}, "BF16");
       i8_check(p + "q_norm.weight", {kHead}, "BF16");
       i8_check(p + "k_norm.weight", {kHead}, "BF16");
-      i8_check(p + "proj.qkv.weight", {3 * d, d}, "I8");
-      i8_check(p + "proj.qkv.weight_scale", {3 * d, 1}, "F32");
+      const std::int64_t qrows = fused_qkv ? 3 * d : d;
+      for (const std::string& name : qkv) {
+        i8_check(name, {qrows, d}, "I8");
+        i8_check(name + "_scale", {qrows, 1}, "F32");
+      }
       i8_check(p + "proj.o.weight", {d, d}, "I8");
       i8_check(p + "proj.o.weight_scale", {d, 1}, "F32");
       i8_check(p + "proj.ffn_up_gate.weight", {2 * f, d}, "I8");
@@ -228,8 +237,12 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
       index.read_into(p + "norm2.weight", dst + d * kBf16, d * kBf16);
       index.read_into(p + "q_norm.weight", dst + 2 * d * kBf16, kHead * kBf16);
       index.read_into(p + "k_norm.weight", dst + 2 * d * kBf16 + kHead * kBf16, kHead * kBf16);
-      index.read_into(p + "proj.qkv.weight", dst + i8_qkv_q, 3 * d * d);
-      index.read_into(p + "proj.qkv.weight_scale", dst + i8_qkv_scale, 3 * d * 4);
+      for (std::size_t i = 0; i < qkv.size(); ++i) {
+        index.read_into(qkv[i], dst + i8_qkv_q + static_cast<std::size_t>(i * qrows * d),
+                        static_cast<std::size_t>(qrows * d));
+        index.read_into(qkv[i] + "_scale", dst + i8_qkv_scale + static_cast<std::size_t>(i * qrows * 4),
+                        static_cast<std::size_t>(qrows * 4));
+      }
       index.read_into(p + "proj.o.weight", dst + i8_o_q, d * d);
       index.read_into(p + "proj.o.weight_scale", dst + i8_o_scale, d * 4);
       index.read_into(p + "proj.ffn_up_gate.weight", dst + i8_up_q, 2 * f * d);
@@ -268,6 +281,8 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
     }
     const std::vector<std::string> names = block_names(l);
     for (std::size_t i = 0; i < names.size(); ++i) check_tensor(names[i], block_shapes[i]);
+    const std::int64_t qrows = fused_qkv ? 3 * d : d;
+    for (const std::string& name : qkv) check_tensor(name, {qrows, d});
     const bool on_device = l < resident;
     HostBuffer streamed;
     if (!on_device) streamed = HostBuffer(kBlock.bytes);
@@ -275,9 +290,17 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
     std::memset(dst, 0, kBlock.bytes);
     const std::size_t plain[4] = {kBlock.norm1, kBlock.norm2, kBlock.q_norm, kBlock.k_norm};
     for (std::size_t i = 0; i < 4; ++i) index.read_into(names[i], dst + plain[i], index.at(names[i]).bytes);
-    // The fused qkv [3d, d] is q, k, v stacked: packing it whole gives the [9216, 3072] qkv layout; o, up_gate and down pack
-    // to their slots.
-    const std::size_t packed_at[4] = {kBlock.qkv, kBlock.o, kBlock.up_gate, kBlock.down};
+    // qkv is stored as [3d, d] = q, k, v stacked (whether it came from one fused tensor or three separate ones);
+    // packing it whole gives the [9216, 3072] qkv layout. o, up_gate and down pack to their slots.
+    row_major.resize(static_cast<std::size_t>(3 * d * d));
+    bf16* qkv_rm = row_major.data();
+    for (std::size_t i = 0; i < qkv.size(); ++i) {
+      std::vector<bf16> part(static_cast<std::size_t>(qrows * d));
+      index.read_into(qkv[i], part.data(), part.size() * kBf16);
+      std::memcpy(qkv_rm + static_cast<std::size_t>(i * d * d), part.data(), part.size() * kBf16);
+    }
+    pack_host(reinterpret_cast<bf16*>(dst + kBlock.qkv), qkv_rm, 3 * d, d);
+    const std::size_t packed_at[3] = {kBlock.o, kBlock.up_gate, kBlock.down};
     for (std::size_t i = 4; i < names.size(); ++i) {
       const std::vector<std::int64_t>& s = block_shapes[i];
       row_major.resize(static_cast<std::size_t>(s[0] * s[1]));
@@ -629,7 +652,27 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
         }
       } else {
         for (int op = 0; op < hip_block::kBlockOps; ++op) {
-          hip_block::run_block_op(op, blocks_[static_cast<std::size_t>(l)], b, st);
+          const bf16* lora_delta = nullptr;
+          std::int64_t ldl = 0;
+          if (lb != nullptr) {
+            if (op == 1) {
+              lora_delta = compute_lora_delta(lb->site[static_cast<int>(LoraSite::kQkv)], b.y, kDim, 3 * kDim, b.tokens,
+                                              st);
+              ldl = 3 * kDim;
+            } else if (op == 4) {
+              lora_delta = compute_lora_delta(lb->site[static_cast<int>(LoraSite::kO)], b.attn, kDim, kDim, b.tokens, st);
+              ldl = kDim;
+            } else if (op == 6) {
+              lora_delta = compute_lora_delta(lb->site[static_cast<int>(LoraSite::kUpGate)], b.y, kDim, 2 * kFfn,
+                                              b.tokens, st);
+              ldl = 2 * kFfn;
+            } else if (op == 7) {
+              lora_delta = compute_lora_delta(lb->site[static_cast<int>(LoraSite::kDown)], b.ffn, kFfn, kDim, b.tokens,
+                                              st);
+              ldl = kDim;
+            }
+          }
+          hip_block::run_block_op(op, blocks_[static_cast<std::size_t>(l)], b, st, lora_delta, ldl);
           mark(op);
         }
       }

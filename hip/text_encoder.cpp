@@ -218,7 +218,9 @@ struct TextEncoder::Impl {
       scale_off[i] = sc_off;
       sc_off += static_cast<std::size_t>(tensors[dev_keys[i]].info->shape[0]);
     }
-    const int threads = std::min<int>(8, static_cast<int>(std::thread::hardware_concurrency()));
+    // hardware_concurrency() is allowed to return 0; at least the calling thread must be present so that
+    // errors[] has room for the exception work(0) stores there.
+    const int threads = std::max(1, std::min<int>(8, static_cast<int>(std::thread::hardware_concurrency())));
     std::atomic<std::size_t> next{0};
     std::vector<std::exception_ptr> errors(static_cast<std::size_t>(threads));
     const auto work = [&](int t) {

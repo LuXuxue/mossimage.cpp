@@ -56,7 +56,7 @@ void rms_norm_modulate(const bf16_bits* x, std::int64_t ldx, const bf16_bits* we
 
 // out[m, n] = bf16(x[m, k] · w[n, k]ᵀ), with fp32 accumulators and K ascending.
 void gemm(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* w, std::int64_t ldw,
-          int m, int n, int k, hipStream_t stream);
+          int m, int n, int k, hipStream_t stream, const bf16_bits* lora_delta = nullptr, std::int64_t ldl = 0);
 
 // In place, per head: q and k = rope(rms_norm(.)). qkv: [tokens, >= 2 * heads * 128] with q heads then k heads;
 // q_norm, k_norm: [128]; table: [tokens, 128] RoPE rows, [sin(64) | cos(64)].
@@ -88,11 +88,11 @@ void attention(const AttentionArgs& a, hipStream_t stream);
 
 // residual[m, n] += bf16(bf16(x[m, k] · w[n, k]ᵀ) * gate[n]), read and written in place.
 void gemm_gated_residual(bf16_bits* residual, std::int64_t ldr, const bf16_bits* x, std::int64_t ldx, const bf16_bits* w,
-                         std::int64_t ldw, const bf16_bits* gate, int m, int n, int k, hipStream_t stream);
+                         std::int64_t ldw, const bf16_bits* gate, int m, int n, int k, hipStream_t stream, const bf16_bits* lora_delta = nullptr, std::int64_t ldl = 0);
 
 // out[m, f] = situ(bf16(x · hiddenᵀ), bf16(x · gateᵀ)) for the stored [hidden | gate] weight w_up_gate[2f, k].
 void gemm_situ_glu(bf16_bits* out, std::int64_t ldo, const bf16_bits* x, std::int64_t ldx, const bf16_bits* w_up_gate,
-                   std::int64_t ldw, int m, int f, int k, hipStream_t stream);
+                   std::int64_t ldw, int m, int f, int k, hipStream_t stream, const bf16_bits* lora_delta = nullptr, std::int64_t ldl = 0);
 
 // One block's weights: norm1, norm2 [kDim]; q_norm, k_norm [128]; qkv [3 kDim, kDim]; o [kDim, kDim];
 // up_gate [2 kFfnDim, kDim]; down [kDim, kFfnDim]. All contiguous.
@@ -127,7 +127,7 @@ struct BlockBuffers {
   int max_seqlen;
   int tokens;
   // Used with packed weights. pack: [ceil(tokens / kPackRowsMultiple) * kPackRowsMultiple, kFfnDim]. pack_attn:
-  // [tokens + 32 * batch, 3 kDim].
+  // [tokens + kAttentionStepN * batch, 3 kDim].
   bf16_bits* pack = nullptr;
   bf16_bits* pack_attn = nullptr;
 };
@@ -138,7 +138,8 @@ void pack_attention(const BlockBuffers& b, hipStream_t stream);
 // The block's ops, in order, so a caller can time each one.
 inline constexpr int kBlockOps = 8;
 const char* block_op_name(int op);
-void run_block_op(int op, const BlockWeights& w, const BlockBuffers& b, hipStream_t stream);
+void run_block_op(int op, const BlockWeights& w, const BlockBuffers& b, hipStream_t stream,
+                  const bf16_bits* lora_delta = nullptr, std::int64_t ldl = 0);
 void run_block(const BlockWeights& w, const BlockBuffers& b, hipStream_t stream);
 
 }  // namespace hip_block

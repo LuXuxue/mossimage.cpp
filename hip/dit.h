@@ -64,6 +64,12 @@ class Dit {
   // Device memory of forward()'s activations over `tokens` joint tokens of `rows` rows on an h x w = hw latent grid.
   static std::uint64_t activation_bytes(std::uint64_t tokens, std::uint64_t rows, std::uint64_t hw,
                                         bool int8 = false, bool lora = false);
+  // Whether any block was loaded as INT8: the caller must plan scratch from this, not from the requested tier.
+  bool uses_int8() const {
+    for (bool v : is_int8_)
+      if (v) return true;
+    return false;
+  }
 
   // The text refiner on one prompt's text-encoder output, bf16 bits [length, 4096]: device bf16 [length, 3072].
   DeviceBuffer encode_text(const std::vector<std::uint16_t>& embeds, std::uint32_t length);

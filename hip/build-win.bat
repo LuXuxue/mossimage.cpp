@@ -1,6 +1,6 @@
 @echo off
 rem Windows build driver for the HIP backend (TheRock SDK): loads the MSVC environment, then configures and builds.
-setlocal
+setlocal EnableDelayedExpansion
 rem Locate vcvars64.bat through the VS installer instead of a machine-specific install path. VCVARS64 overrides it.
 set "VCVARS="
 if defined VCVARS64 set "VCVARS=%VCVARS64%"
@@ -44,7 +44,7 @@ set "RECONFIG="
 set "CACHED_TARGET="
 if exist "%CFG%" (
   for /f "usebackq tokens=1,* delims==" %%A in (`findstr /b "HIP_TARGET:" "%CFG%"`) do set "CACHED_TARGET=%%B"
-  if not "%CACHED_TARGET%"=="%HIP_TARGET%" set "RECONFIG=1"
+  if not "!CACHED_TARGET!"=="%HIP_TARGET%" set "RECONFIG=1"
 ) else (
   set "RECONFIG=1"
 )

@@ -787,6 +787,8 @@ void conv(const ConvArgs& a, Products products, hipStream_t stream) {
   require(a.c > 0 && a.c % kFrag == 0, "conv", "c must be a positive multiple of 16");
   require(a.h > 0 && a.w_out > 0 && a.n > 0, "conv", "empty shape");
   require(a.ldo >= a.n && a.ldo % 4 == 0, "conv", "ldo must cover n and be a multiple of 4");
+  // The fp16 epilogue stores eight halfs as one uint4, so every row's output offset must be 16-byte aligned.
+  if (a.out_fp16) require(a.ldo % 8 == 0, "conv", "fp16 output ldo must be a multiple of 8");
   require(!a.upsample || (a.taps == 9 && a.h % 2 == 0 && a.w_out % 2 == 0), "conv", "upsample needs a 3x3 conv and an even output");
   require(products != Products::kFp32 || a.taps == 1, "conv", "fp32 products are for 1x1 convolutions (linears)");
   require(products != Products::kFp16 || a.taps == 1 || a.taps == 9, "conv", "fp16 products need a 1x1 or 3x3 convolution");
