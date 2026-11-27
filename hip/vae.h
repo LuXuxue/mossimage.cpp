@@ -81,14 +81,6 @@ class VaeDecoder {
   // A full decode is retried in tiles by the caller if it fails.
   VaeDecodeStats decode(const float* latents, std::uint32_t h, std::uint32_t w, std::vector<std::uint8_t>& rgb,
                         std::vector<float>* image = nullptr);
-  // ComfyUI-style overlap-and-blend fallback for a device that cannot hold the full decode. Three tile grids (the
-  // requested one, half-wide/double-high, and double-wide/half-high) are averaged; each grid feathers its tiles with
-  // a linear ramp over the overlap. The three grids cancel most of the brightness bias from each tile's GroupNorm
-  // statistics. tile_px and overlap_px are image pixels, rounded down to multiples of 16. NOT byte-identical to decode().
-  VaeDecodeStats decode_tiled(const float* latents, std::uint32_t h, std::uint32_t w,
-                              std::vector<std::uint8_t>& rgb, std::vector<float>* image = nullptr,
-                              std::uint32_t tile_px = 512, std::uint32_t overlap_px = 128);
-
   // ---- Exact band-tiled decode (fp32/TF32 only) ----
   // The schedule with the smallest workspace for this band height, and among those the fastest. tile is in image
   // pixels, a multiple of 8.

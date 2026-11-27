@@ -54,25 +54,14 @@ outside the repository.
 ### VAE tiling
 
 The decoder runs a full-frame decode by default. If that fails, the run retries
-in tiles automatically. `--vae-tiled` requests tiling up front. Tiling geometry
-comes from the environment, only on the tiled path:
+in tiles automatically. `--vae-tiled` requests tiling up front. Both use the
+exact band decoder: it computes the decoder's GroupNorm statistics over the
+whole image, so its output is byte-identical to the full decode and has no
+tile-boundary brightness steps. The only tiling control is the band height:
 
 | Variable | Effect |
 |---|---|
 | `MI_HIP_VAE_BAND_TILE_PX` | band height in image pixels (default 512) |
-| `MI_HIP_VAE_OVERLAP` | opt into the overlap-and-blend path instead of exact band tiling |
-| `MI_HIP_VAE_TILE_PX` | tile side for overlap-and-blend, in image pixels (default 512) |
-| `MI_HIP_VAE_OVERLAP_PX` | overlap for overlap-and-blend, in image pixels (default 128) |
-
-The tiled default is the exact band decoder: it computes the decoder's
-GroupNorm statistics over the whole image, so its output is byte-identical to
-the full decode and has no tile-boundary brightness steps. ComfyUI's
-overlap-and-blend decoder was evaluated too: it averages the requested tile
-grid with half-wide/double-high and double-wide/half-high grids, each with a
-linear feather over the overlap. On small shared-memory APUs this costs roughly
-3.7x the single-grid decode time and still leaves brightness differences of
-several levels, so it is kept only as an opt-in fallback. The band path falls
-back to it if a band schedule cannot be allocated.
 
 The VAE decoder's other switches are `MI_HIP_VAE_ATTN_PIECES=3` (exact
 3-piece attention) and `MI_HIP_VAE_PROFILE` (per-op timings).
