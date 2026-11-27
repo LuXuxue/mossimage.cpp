@@ -38,10 +38,23 @@ __device__ __forceinline__ float tf32(float v) {
   return bits_to_float((u + 0x1000u) & 0xffffe000u);
 }
 
+// fp16 round/clamp helpers for the single-piece gfx1035 path; host_fp16_bits in vae_kernels.h rounds the same way.
+__device__ __forceinline__ std::uint16_t h16(float v) {
+  const __half h = __float2half_rn(fminf(fmaxf(v, -65504.0f), 65504.0f));
+  return *reinterpret_cast<const std::uint16_t*>(&h);
+}
+__device__ __forceinline__ float fh16(std::uint16_t h) { return __half2float(*reinterpret_cast<const __half*>(&h)); }
+
 // v as kPieces bf16 pieces, each the nearest bf16 of the remainder (exact in fp32): host_split's order. An infinity or
-// NaN is piece 0 with the other pieces 0 (its remainder would be NaN).
-template <int kPieces, bool kTf32>
+// NaN is piece 0 with the other pieces 0 (its remainder would be NaN). kFp16 keeps one fp16-rounded operand.
+template <int kPieces, bool kTf32, bool kFp16 = false>
 __device__ __forceinline__ void split(float v, std::uint16_t (&piece)[kPieces]) {
+  if constexpr (kFp16) {
+    piece[0] = h16(v);
+    HIP_BLOCK_UNROLL
+    for (int t = 1; t < kPieces; ++t) piece[t] = 0;
+    return;
+  }
   const bool finite = (float_to_bits(v) & 0x7f800000u) != 0x7f800000u;
   float r = kTf32 ? tf32(v) : v;
   HIP_BLOCK_UNROLL
@@ -145,14 +158,14 @@ __device__ __forceinline__ void load_row(const ConvKernelArgs& a, bool row_ok, s
 }
 
 // Row t of the staged A pieces: 16 bf16 per piece, two 16-byte stores each.
-template <int kPieces, bool kTf32>
+template <int kPieces, bool kTf32, bool kFp16 = false>
 __device__ __forceinline__ void stage_row(std::uint16_t (&stage)[kPieces][kTileM * kFrag], int t, const float (&v)[16]) {
   std::uint32_t word[kPieces][8];
   HIP_BLOCK_UNROLL
   for (int c = 0; c < 8; ++c) {
     std::uint16_t lo[kPieces], hi[kPieces];
-    split<kPieces, kTf32>(v[2 * c], lo);
-    split<kPieces, kTf32>(v[2 * c + 1], hi);
+    split<kPieces, kTf32, kFp16>(v[2 * c], lo);
+    split<kPieces, kTf32, kFp16>(v[2 * c + 1], hi);
     HIP_BLOCK_UNROLL
     for (int i = 0; i < kPieces; ++i) word[i][c] = static_cast<std::uint32_t>(lo[i]) | static_cast<std::uint32_t>(hi[i]) << 16;
   }
@@ -164,12 +177,13 @@ __device__ __forceinline__ void stage_row(std::uint16_t (&stage)[kPieces][kTileM
   }
 }
 
-// kProducts: 4 (TF32, all), 3 (TF32 without lo x lo), 9 (fp32, all). A stages through __shared__ memory, split as it is
-// stored; the weight's pieces are packed fragments read from global memory.
+// kProducts: 4 (TF32, all), 3 (TF32 without lo x lo), 9 (fp32, all), 1 (fp16, one product). A stages through __shared__
+// memory, split as it is stored; the weight's pieces are packed fragments read from global memory.
 template <int kTaps, bool kUpsample, int kProducts>
 __global__ __launch_bounds__(kWave) void conv_kernel(const ConvKernelArgs a) {
-  constexpr int kPieces = kProducts == 9 ? 3 : 2;
-  constexpr bool kTf32 = kProducts != 9;
+  constexpr bool kFp16 = kProducts == 1;
+  constexpr int kPieces = kProducts == 9 ? 3 : (kFp16 ? 1 : 2);
+  constexpr bool kTf32 = kProducts != 9 && !kFp16;
   alignas(16) __shared__ std::uint16_t stage[kPieces][kTileM * kFrag];
   alignas(16) __shared__ float epi[kFrag * kFrag];
   const int t = thread_id();
@@ -195,7 +209,7 @@ __global__ __launch_bounds__(kWave) void conv_kernel(const ConvKernelArgs a) {
   float v[16];
   load_row<kTaps, kUpsample>(a, row_ok, m, oy, ox, tap, ch, v);
   advance();
-  stage_row<kPieces, kTf32>(stage, t, v);
+  stage_row<kPieces, kTf32, kFp16>(stage, t, v);
   leaf::pad_barrier();
 
   FragAcc acc[kMf][kConvNf];
@@ -211,7 +225,7 @@ __global__ __launch_bounds__(kWave) void conv_kernel(const ConvKernelArgs a) {
     HIP_BLOCK_UNROLL
     for (int i = 0; i < kPieces; ++i) {
       HIP_BLOCK_UNROLL
-      for (int mf = 0; mf < kMf; ++mf) leaf::load_a(fa[i][mf], &stage[i][mf * kFrag * kFrag], kFrag);
+      for (int mf = 0; mf < kMf; ++mf) leaf::load_a<kFp16>(fa[i][mf], &stage[i][mf * kFrag * kFrag], kFrag);
     }
     HIP_BLOCK_UNROLL
     for (int jj = 0; jj < kPieces; ++jj) {
@@ -219,7 +233,7 @@ __global__ __launch_bounds__(kWave) void conv_kernel(const ConvKernelArgs a) {
       FragB fb[kConvNf];
       HIP_BLOCK_UNROLL
       for (int nf = 0; nf < kConvNf; ++nf) {
-        leaf::load_b(fb[nf], wt + j * a.w_stride + (static_cast<std::int64_t>(nf) * steps + step) * (kFrag * kFrag), kFrag);
+        leaf::load_b<kFp16>(fb[nf], wt + j * a.w_stride + (static_cast<std::int64_t>(nf) * steps + step) * (kFrag * kFrag), kFrag);
       }
       HIP_BLOCK_UNROLL
       for (int ii = 0; ii < kPieces; ++ii) {
@@ -234,7 +248,7 @@ __global__ __launch_bounds__(kWave) void conv_kernel(const ConvKernelArgs a) {
     }
     if (more) {
       leaf::barrier();  // this step's fragment reads of `stage` before the next step's stores
-      stage_row<kPieces, kTf32>(stage, t, v);
+      stage_row<kPieces, kTf32, kFp16>(stage, t, v);
       leaf::pad_barrier();
     }
   }
@@ -249,6 +263,7 @@ struct NarrowArgs {
   float* out;
   std::int64_t m;
   int h, w_out, c, n;
+  bool fp16;  // operand roundings: fp16 instead of TF32
 };
 __global__ __launch_bounds__(kWave) void conv_narrow_kernel(const NarrowArgs a) {
   const std::int64_t m = static_cast<std::int64_t>(blockIdx.x) * kWave + thread_id();
@@ -263,12 +278,13 @@ __global__ __launch_bounds__(kWave) void conv_narrow_kernel(const NarrowArgs a) 
     const float* wp = a.w + static_cast<std::int64_t>(tap) * a.c;
     for (int ch = 0; ch < a.c; ch += 4) {
       const float4 x4 = *reinterpret_cast<const float4*>(xp + ch);
-      const float xv[4] = {tf32(x4.x), tf32(x4.y), tf32(x4.z), tf32(x4.w)};
+      const float xv[4] = {a.fp16 ? fh16(h16(x4.x)) : tf32(x4.x), a.fp16 ? fh16(h16(x4.y)) : tf32(x4.y),
+                           a.fp16 ? fh16(h16(x4.z)) : tf32(x4.z), a.fp16 ? fh16(h16(x4.w)) : tf32(x4.w)};
       HIP_BLOCK_UNROLL
       for (int o = 0; o < 4; ++o) {
         if (o < a.n) {
           HIP_BLOCK_UNROLL
-          for (int q = 0; q < 4; ++q) acc[o] = add(acc[o], mul(xv[q], wp[o * kk + ch + q]));  // TF32 products are exact
+          for (int q = 0; q < 4; ++q) acc[o] = add(acc[o], mul(xv[q], wp[o * kk + ch + q]));  // rounded operands, fp32 sum
         }
       }
     }
@@ -288,6 +304,7 @@ struct SplitArgs {
 // One thread per (row, 16 columns) of the packed output; along rows first when transposed (coalesced reads).
 template <bool kTranspose, int kPieces = 3>
 __global__ __launch_bounds__(kWave) void split_pack_kernel(const SplitArgs a) {
+  constexpr bool kFp16 = kPieces == 1;
   const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * kWave + thread_id();
   if (idx >= static_cast<std::int64_t>(a.rows_pad) * a.col_groups) return;
   const int r = static_cast<int>(kTranspose ? idx % a.rows_pad : idx / a.col_groups);
@@ -301,7 +318,7 @@ __global__ __launch_bounds__(kWave) void split_pack_kernel(const SplitArgs a) {
       const int col = g * kFrag + 2 * c + e;
       float v = 0.0f;
       if (r < a.rows && col < a.cols) v = kTranspose ? a.src[static_cast<std::int64_t>(col) * a.ld + r] : a.src[r * a.ld + col];
-      split<kPieces, false>(v, p[e]);
+      split<kPieces, false, kFp16>(v, p[e]);
     }
     HIP_BLOCK_UNROLL
     for (int i = 0; i < kPieces; ++i) word[i][c] = static_cast<std::uint32_t>(p[0][i]) | static_cast<std::uint32_t>(p[1][i]) << 16;
@@ -328,6 +345,7 @@ struct PieceGemmArgs {
 // attention uses 3 pieces / kMaxSum 2 (6 products); the TF32 option uses 2 / 1 (3 products, dropping lo x lo).
 template <int kPieces = 3, int kMaxSum = 2>
 __global__ __launch_bounds__(kWave) void piece_gemm_kernel(const PieceGemmArgs g) {
+  constexpr bool kFp16 = kPieces == 1;
   alignas(16) __shared__ float epi[kFrag * kFrag];
   const std::int64_t tile = blockIdx.x;
   const std::int64_t m_base = tile / g.n_tiles * kTileM;
@@ -342,7 +360,7 @@ __global__ __launch_bounds__(kWave) void piece_gemm_kernel(const PieceGemmArgs g
     for (int i = 0; i < kPieces; ++i) {
       HIP_BLOCK_UNROLL
       for (int mf = 0; mf < kMf; ++mf) {
-        leaf::load_a(fa[i][mf], ap + i * g.a_stride + (static_cast<std::int64_t>(mf) * g.ksteps + step) * (kFrag * kFrag), kFrag);
+        leaf::load_a<kFp16>(fa[i][mf], ap + i * g.a_stride + (static_cast<std::int64_t>(mf) * g.ksteps + step) * (kFrag * kFrag), kFrag);
       }
     }
     HIP_BLOCK_UNROLL
@@ -351,7 +369,7 @@ __global__ __launch_bounds__(kWave) void piece_gemm_kernel(const PieceGemmArgs g
       FragB fb[kNf];
       HIP_BLOCK_UNROLL
       for (int nf = 0; nf < kNf; ++nf) {
-        leaf::load_b(fb[nf], bp + j * g.b_stride + (static_cast<std::int64_t>(nf) * g.ksteps + step) * (kFrag * kFrag), kFrag);
+        leaf::load_b<kFp16>(fb[nf], bp + j * g.b_stride + (static_cast<std::int64_t>(nf) * g.ksteps + step) * (kFrag * kFrag), kFrag);
       }
       HIP_BLOCK_UNROLL
       for (int ii = 0; ii < kPieces; ++ii) {
@@ -395,6 +413,7 @@ struct SoftmaxArgs {
 // One row per wave: the row's max, the sum of exp(s * scale - max * scale), then the probabilities' pieces.
 template <int kPieces = 3>
 __global__ __launch_bounds__(kWave) void softmax_pack_kernel(const SoftmaxArgs a) {
+  constexpr bool kFp16 = kPieces == 1;
   __shared__ float red[kWave];
   const int t = thread_id();
   const int r = static_cast<int>(blockIdx.x);
@@ -409,7 +428,7 @@ __global__ __launch_bounds__(kWave) void softmax_pack_kernel(const SoftmaxArgs a
   for (int j = t; j < a.l_pad; j += kWave) {
     const float pv = j < a.l ? div(expf(add(mul(s[j], a.scale), -shift)), total) : 0.0f;
     std::uint16_t piece[kPieces];
-    split<kPieces, false>(pv, piece);
+    split<kPieces, false, kFp16>(pv, piece);
     const std::int64_t at = row_at + static_cast<std::int64_t>(j / kFrag) * (kFrag * kFrag) + j % kFrag;
     HIP_BLOCK_UNROLL
     for (int i = 0; i < kPieces; ++i) a.p[i * a.p_stride + at] = piece[i];
@@ -663,6 +682,7 @@ const char* products_name(Products p) {
     case Products::kTf32: return "TF32, 4 products";
     case Products::kTf32Drop: return "TF32, 3 products (no lo x lo)";
     case Products::kFp32: return "fp32, 9 products";
+    case Products::kFp16: return "fp16, 1 product";
   }
   return "?";
 }
@@ -692,6 +712,7 @@ void conv(const ConvArgs& a, Products products, hipStream_t stream) {
   require(a.ldo >= a.n && a.ldo % 4 == 0, "conv", "ldo must cover n and be a multiple of 4");
   require(!a.upsample || (a.taps == 9 && a.h % 2 == 0 && a.w_out % 2 == 0), "conv", "upsample needs a 3x3 conv and an even output");
   require(products != Products::kFp32 || a.taps == 1, "conv", "fp32 products are for 1x1 convolutions (linears)");
+  require(products != Products::kFp16 || a.taps == 1 || a.taps == 9, "conv", "fp16 products need a 1x1 or 3x3 convolution");
   require(aligned16(a.x) && aligned16(a.w) && aligned16(a.out) && aligned16(a.residual), "conv", "pointers must be 16-byte aligned");
   const int k = a.taps * a.c;
   // A single launch of the largest convolutions can take long enough to trip the OS's GPU watchdog. Split the output
@@ -708,7 +729,11 @@ void conv(const ConvArgs& a, Products products, hipStream_t stream) {
     ConvKernelArgs cka = ka;
     cka.m0 = m0;
     const dim3 grid(grid_of((rows + kTileM - 1) / kTileM * cka.n_tiles, 1, "conv"));
-    if (products == Products::kFp32) {
+    if (products == Products::kFp16) {
+      if (a.taps == 1) conv_kernel<1, false, 1><<<grid, block, 0, stream>>>(cka);
+      else if (a.upsample) conv_kernel<9, true, 1><<<grid, block, 0, stream>>>(cka);
+      else conv_kernel<9, false, 1><<<grid, block, 0, stream>>>(cka);
+    } else if (products == Products::kFp32) {
       conv_kernel<1, false, 9><<<grid, block, 0, stream>>>(cka);
     } else if (a.taps == 1) {
       if (tf32_all) conv_kernel<1, false, 4><<<grid, block, 0, stream>>>(cka);
@@ -725,10 +750,10 @@ void conv(const ConvArgs& a, Products products, hipStream_t stream) {
 }
 
 void conv_narrow(const float* x, const float* w_tf32, const float* bias, float* out, int h, int w, int c, int n,
-                 hipStream_t stream) {
+                 hipStream_t stream, bool fp16) {
   require(n >= 1 && n <= 4 && c > 0 && c % 4 == 0 && h > 0 && w > 0, "conv_narrow", "need 1 <= n <= 4, c a multiple of 4");
   require(aligned16(x), "conv_narrow", "x must be 16-byte aligned");
-  const NarrowArgs a{x, w_tf32, bias, out, static_cast<std::int64_t>(h) * w, h, w, c, n};
+  const NarrowArgs a{x, w_tf32, bias, out, static_cast<std::int64_t>(h) * w, h, w, c, n, fp16};
   conv_narrow_kernel<<<dim3(grid_of(a.m, kWave, "conv_narrow")), dim3(kWave), 0, stream>>>(a);
   check_launch("conv_narrow");
 }
@@ -738,12 +763,13 @@ void split_pack(const float* src, std::int64_t ld, bool transpose, int rows, int
   require(rows_pad % kFrag == 0 && cols_pad % kFrag == 0 && rows <= rows_pad && cols <= cols_pad, "split_pack",
           "padded sizes must be multiples of 16 covering the operand");
   require(aligned16(dst), "split_pack", "dst must be 16-byte aligned");
-  require(pieces == 2 || pieces == 3, "split_pack", "pieces must be 2 or 3");
+  require(pieces == 1 || pieces == 2 || pieces == 3, "split_pack", "pieces must be 1, 2 or 3");
   const SplitArgs a{src, ld, dst, static_cast<std::int64_t>(rows_pad) * cols_pad, rows, cols, rows_pad, cols_pad / kFrag};
   const dim3 grid(grid_of(static_cast<std::int64_t>(rows_pad) * a.col_groups, kWave, "split_pack"));
 #define MI_SPLIT(T)                                                                                \
   do {                                                                                             \
-    if (pieces == 2) split_pack_kernel<T, 2><<<grid, dim3(kWave), 0, stream>>>(a);                  \
+    if (pieces == 1) split_pack_kernel<T, 1><<<grid, dim3(kWave), 0, stream>>>(a);                  \
+    else if (pieces == 2) split_pack_kernel<T, 2><<<grid, dim3(kWave), 0, stream>>>(a);              \
     else split_pack_kernel<T, 3><<<grid, dim3(kWave), 0, stream>>>(a);                              \
   } while (0)
   if (transpose) MI_SPLIT(true);
@@ -757,12 +783,13 @@ void piece_gemm(const std::uint16_t* a, std::int64_t a_stride, const std::uint16
   require(k_pad > 0 && k_pad % kFrag == 0, "piece_gemm", "k_pad must be a positive multiple of 16");
   require(ldo >= n_cols && ldo % 4 == 0, "piece_gemm", "ldo must cover n and be a multiple of 4");
   require(aligned16(a) && aligned16(b) && aligned16(out), "piece_gemm", "pointers must be 16-byte aligned");
-  require(pieces == 2 || pieces == 3, "piece_gemm", "pieces must be 2 or 3");
+  require(pieces == 1 || pieces == 2 || pieces == 3, "piece_gemm", "pieces must be 1, 2 or 3");
   if (m_rows <= 0 || n_cols <= 0) return;
   const PieceGemmArgs g{a, a_stride, b, b_stride, out, ldo, k_pad / kFrag, m_rows, n_cols,
                         static_cast<int>(round_up(n_cols, kTileN) / kTileN)};
   const dim3 grid(grid_of(static_cast<std::int64_t>(round_up(m_rows, kTileM) / kTileM) * g.n_tiles, 1, "piece_gemm"));
-  if (pieces == 2) piece_gemm_kernel<2, 1><<<grid, dim3(kWave), 0, stream>>>(g);
+  if (pieces == 1) piece_gemm_kernel<1, 0><<<grid, dim3(kWave), 0, stream>>>(g);
+  else if (pieces == 2) piece_gemm_kernel<2, 1><<<grid, dim3(kWave), 0, stream>>>(g);
   else piece_gemm_kernel<3, 2><<<grid, dim3(kWave), 0, stream>>>(g);
   check_launch("piece_gemm");
 }
@@ -770,11 +797,12 @@ void piece_gemm(const std::uint16_t* a, std::int64_t a_stride, const std::uint16
 void softmax_pack(const float* s, std::int64_t lds, int rows, int l, float scale, std::uint16_t* p, std::int64_t p_stride,
                   int l_pad, hipStream_t stream, int pieces) {
   require(l > 0 && l_pad >= l && l_pad % kFrag == 0 && lds >= l, "softmax_pack", "l_pad must be a multiple of 16 covering l");
-  require(pieces == 2 || pieces == 3, "softmax_pack", "pieces must be 2 or 3");
+  require(pieces == 1 || pieces == 2 || pieces == 3, "softmax_pack", "pieces must be 1, 2 or 3");
   if (rows <= 0) return;
   const SoftmaxArgs a{s, lds, p, p_stride, l, l_pad, scale};
   const dim3 grid(static_cast<unsigned>(rows));
-  if (pieces == 2) softmax_pack_kernel<2><<<grid, dim3(kWave), 0, stream>>>(a);
+  if (pieces == 1) softmax_pack_kernel<1><<<grid, dim3(kWave), 0, stream>>>(a);
+  else if (pieces == 2) softmax_pack_kernel<2><<<grid, dim3(kWave), 0, stream>>>(a);
   else softmax_pack_kernel<3><<<grid, dim3(kWave), 0, stream>>>(a);
   check_launch("softmax_pack");
 }

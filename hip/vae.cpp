@@ -21,6 +21,14 @@ namespace {
 
 using hip_vae::Products;
 
+// The VAE's operand precision, chosen once when a decoder is constructed (gfx1035 defaults to fp16). The static
+// workspace/planner helpers call layout()/attn_pieces() without a decoder, so keep the choice process-global.
+bool& vae_fp16_flag() {
+  static bool fp16 = false;
+  return fp16;
+}
+bool vae_fp16() { return vae_fp16_flag(); }
+
 constexpr float kResnetEps = 1e-6f;
 constexpr float kBatchNormEps = 1e-4f;  // vae.config.batch_norm_eps
 constexpr int kUpBlocks = 4, kResnetsPerBlock = 3;
@@ -72,7 +80,7 @@ namespace {
 // Host image of the weight buffer: tensors at 256-byte offsets.
 class Packer {
  public:
-  explicit Packer(const st::File& file) : file_(file) {}
+  explicit Packer(const st::File& file, bool fp16) : file_(file), fp16_(fp16) {}
 
   template <class T>
   std::uint64_t add(const std::vector<T>& v) {
@@ -102,10 +110,11 @@ class Packer {
     cv.c = c;
     cv.r = r;
     if (narrow) {
-      for (float& v : krsc) v = hip_vae::host_tf32(v);
+      for (float& v : krsc)
+        v = fp16_ ? hip_vae::host_fp16_value(hip_vae::host_fp16_bits(v)) : hip_vae::host_tf32(v);
       cv.w = add(krsc);
     } else {
-      cv.w = add(packed(krsc, k, static_cast<int>(taps) * c, Products::kTf32));
+      cv.w = add(packed(krsc, k, static_cast<int>(taps) * c, fp16_ ? Products::kFp16 : Products::kTf32));
     }
     cv.b = add(read(p + ".bias", {k}));
     return cv;
@@ -137,6 +146,7 @@ class Packer {
 
  private:
   const st::File& file_;
+  bool fp16_;
   std::vector<char> data_;
 };
 
@@ -199,9 +209,10 @@ Layout layout(int c, std::uint32_t h, std::uint32_t w) {
 
 double gib(std::uint64_t b) { return static_cast<double>(b) / (1024.0 * 1024.0 * 1024.0); }
 
-// Attention operands are packed as 2 TF32 bf16 pieces by default (3 instead of 6 GEMM products), with a small
-// decoded-image difference from the fp32-accurate path. MI_HIP_VAE_ATTN_PIECES=3 restores the exact 3-piece path.
+// fp16 mode uses one fp16 operand per product; otherwise attention packs 2 TF32 bf16 pieces by default (3 instead of
+// 6 GEMM products). MI_HIP_VAE_ATTN_PIECES=3 restores the exact 3-piece path.
 int attn_pieces() {
+  if (vae_fp16()) return 1;
   if (const char* s = std::getenv("MI_HIP_VAE_ATTN_PIECES")) {
     const int v = std::atoi(s);
     if (v == 2 || v == 3) return v;
@@ -354,7 +365,8 @@ class Run {
     a.c = cv.c;
     a.n = cv.k;
     a.taps = 1;
-    ops_.run(name, [&] { hip_vae::conv(a, Products::kFp32, stream_); });
+    const Products p = products_ == Products::kFp16 ? Products::kFp16 : Products::kFp32;
+    ops_.run(name, [&] { hip_vae::conv(a, p, stream_); });
   }
 
   const VaeDecoder::Weights& w_;
@@ -396,7 +408,15 @@ VaeDecoder::VaeDecoder(Device& device, const std::filesystem::path& path) : devi
   require(base_ % 32 == 0, "decoder widths must be multiples of 32");
   const int c = base_, mid = 4 * c;
   Weights& w = *weights_;
-  Packer pk(file);
+  // gfx1035 has no bf16 arithmetic: the default TF32 path needs four fp16 dot products per MAC. One fp16-rounded
+  // operand needs one, which is much faster and is how ComfyUI's --fp16-vae runs. MI_HIP_VAE_FP16=0 keeps the old path.
+  const char* fp16_env = std::getenv("MI_HIP_VAE_FP16");
+  const bool fp16 = fp16_env != nullptr ? std::strcmp(fp16_env, "0") != 0 : device_is_rdna2();
+  if (fp16 && !device_is_rdna2())
+    throw std::runtime_error("hip vae: MI_HIP_VAE_FP16 needs a gfx103x (RDNA2) device");
+  vae_fp16_flag() = fp16;
+  conv_products_ = fp16 ? Products::kFp16 : Products::kTf32;
+  Packer pk(file, fp16);
 
   const std::vector<float> mean = pk.read("bn.running_mean", {128}), var = pk.read("bn.running_var", {128});
   std::vector<float> scale(128);
@@ -416,9 +436,10 @@ VaeDecoder::VaeDecoder(Device& device, const std::filesystem::path& path) : devi
       wqkv.insert(wqkv.end(), wt.begin(), wt.end());
       bqkv.insert(bqkv.end(), bt.begin(), bt.end());
     }
-    w.qkv = Conv{pk.add(Packer::packed(wqkv, 3 * mid, mid, Products::kFp32)), pk.add(bqkv), 3 * mid, mid, 1};
+    const Products ap = fp16 ? Products::kFp16 : Products::kFp32;
+    w.qkv = Conv{pk.add(Packer::packed(wqkv, 3 * mid, mid, ap)), pk.add(bqkv), 3 * mid, mid, 1};
     const std::vector<float> wo = pk.read(a + "to_out.0.weight", {mid, mid});
-    w.attn_out = Conv{pk.add(Packer::packed(wo, mid, mid, Products::kFp32)), pk.add(pk.read(a + "to_out.0.bias", {mid})), mid, mid, 1};
+    w.attn_out = Conv{pk.add(Packer::packed(wo, mid, mid, ap)), pk.add(pk.read(a + "to_out.0.bias", {mid})), mid, mid, 1};
   }
   int prev = mid;
   for (int b = 0; b < kUpBlocks; ++b) {
@@ -457,7 +478,9 @@ void VaeDecoder::require_fits(std::uint32_t h, std::uint32_t w) const {
 }
 
 void VaeDecoder::set_conv_products(Products products) {
-  require(products != Products::kFp32, "the convolutions' weights are packed for TF32 products");
+  require(products != Products::kFp32, "the convolutions' weights are packed for FP16/TF32 products");
+  require((conv_products_ == Products::kFp16) == (products == Products::kFp16),
+          "fp16 and TF32-packed weights cannot be mixed; set MI_HIP_VAE_FP16 before constructing the decoder");
   conv_products_ = products;
 }
 
@@ -524,7 +547,8 @@ VaeDecodeStats VaeDecoder::decode(const float* latents, std::uint32_t h, std::ui
   }
   run.norm(wt.norm_out, p, static_cast<std::int64_t>(ch) * cw, p, true);
   ops.run("conv_out 3x3" + dims(ch, cw), [&] {
-    hip_vae::conv_narrow(p, wt.f32(wt.conv_out.w), wt.f32(wt.conv_out.b), q, ch, cw, c, 3, stream.get());
+    hip_vae::conv_narrow(p, wt.f32(wt.conv_out.w), wt.f32(wt.conv_out.b), q, ch, cw, c, 3, stream.get(),
+                         conv_products_ == Products::kFp16);
   });
   const std::int64_t n = static_cast<std::int64_t>(H) * W * 3;
   ops.run("rgb8", [&] { hip_vae::rgb8(q, out.as<std::uint8_t>(), n, stream.get()); });
@@ -1188,7 +1212,8 @@ class TiledRunner {
         float* o = buf(t, 1);
         ops_.run("tile conv_out" + dims(static_cast<int>(t.rows), static_cast<int>(g_.cols(t.level))), [&] {
           hip_vae::conv_narrow(xt, wt_.f32(wt_.conv_out.w), wt_.f32(wt_.conv_out.b), o,
-                               static_cast<int>(t.rows), static_cast<int>(g_.cols(t.level)), wt_.conv_out.c, 3, stream_);
+                               static_cast<int>(t.rows), static_cast<int>(g_.cols(t.level)), wt_.conv_out.c, 3, stream_,
+                               products_ == Products::kFp16);
         });
         t.x = (t.x + 1) % 3;
         return true;

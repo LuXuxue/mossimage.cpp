@@ -58,12 +58,16 @@ __device__ __forceinline__ void pad_barrier() {
 }
 
 __device__ __forceinline__ void clear(FragAcc& c) { rocwmma::fill_fragment(c, 0.0f); }
+// kFp16 is only used by the gfx1035 single-piece VAE path; the other leaves keep their bf16 interface.
+template <bool kFp16 = false>
 __device__ __forceinline__ void load_a(FragA& a, const std::uint16_t* p, int ld) {
   rocwmma::load_matrix_sync(a, reinterpret_cast<const rocwmma::bfloat16_t*>(p), static_cast<std::uint32_t>(ld));
 }
+template <bool kFp16 = false>
 __device__ __forceinline__ void load_b(FragB& b, const std::uint16_t* p, int ld) {
   rocwmma::load_matrix_sync(b, reinterpret_cast<const rocwmma::bfloat16_t*>(p), static_cast<std::uint32_t>(ld));
 }
+template <bool kFp16 = false>
 __device__ __forceinline__ void load_b_rows(FragB& b, const std::uint16_t* p, int ld) {
   rocwmma::load_matrix_sync(b, reinterpret_cast<const rocwmma::bfloat16_t*>(p), static_cast<std::uint32_t>(ld),
                             rocwmma::mem_row_major);
@@ -99,10 +103,20 @@ __device__ __forceinline__ int col_of_thread() { return ((static_cast<int>(threa
 
 // bf16 -> fp32 is a left shift of the bits. Clamping guards the (unexpected) value outside fp16's range against an
 // infinity that would turn a later dot product into NaN.
+// kFp16 reads the operand as fp16 bits directly (the VAE's single-piece path); the default keeps the bf16 interface.
+template <bool kFp16 = false>
 __device__ __forceinline__ v2h cvt2(std::uint16_t b0, std::uint16_t b1) {
-  const float f0 = detail::f(b0), f1 = detail::f(b1);
-  return {__float2half_rn(fminf(fmaxf(f0, -65504.0f), 65504.0f)),
-          __float2half_rn(fminf(fmaxf(f1, -65504.0f), 65504.0f))};
+  if constexpr (kFp16) {
+    v2h r;
+    auto* h = reinterpret_cast<__half*>(&r);
+    h[0] = *reinterpret_cast<const __half*>(&b0);
+    h[1] = *reinterpret_cast<const __half*>(&b1);
+    return r;
+  } else {
+    const float f0 = detail::f(b0), f1 = detail::f(b1);
+    return {__float2half_rn(fminf(fmaxf(f0, -65504.0f), 65504.0f)),
+            __float2half_rn(fminf(fmaxf(f1, -65504.0f), 65504.0f))};
+  }
 }
 
 struct FragA {
@@ -127,34 +141,37 @@ __device__ __forceinline__ void clear(FragAcc& c) {
 }
 
 // A(m, k) = p[m * ld + k], row-major.
+template <bool kFp16 = false>
 __device__ __forceinline__ void load_a(FragA& a, const std::uint16_t* p, int ld) {
   const int r0 = row_of_thread();
   HIP_BLOCK_UNROLL
   for (int i = 0; i < 2; ++i) {
     const std::uint16_t* row = p + (r0 + i) * ld;
     HIP_BLOCK_UNROLL
-    for (int k = 0; k < 8; ++k) a.v[i][k] = cvt2(row[2 * k], row[2 * k + 1]);
+    for (int k = 0; k < 8; ++k) a.v[i][k] = cvt2<kFp16>(row[2 * k], row[2 * k + 1]);
   }
 }
 
 // B(k, n) = p[n * ld + k]: a weight row, K along the row.
+template <bool kFp16 = false>
 __device__ __forceinline__ void load_b(FragB& b, const std::uint16_t* p, int ld) {
   const int c0 = col_of_thread();
   HIP_BLOCK_UNROLL
   for (int j = 0; j < 4; ++j) {
     const std::uint16_t* col = p + (c0 + j) * ld;
     HIP_BLOCK_UNROLL
-    for (int k = 0; k < 8; ++k) b.v[j][k] = cvt2(col[2 * k], col[2 * k + 1]);
+    for (int k = 0; k < 8; ++k) b.v[j][k] = cvt2<kFp16>(col[2 * k], col[2 * k + 1]);
   }
 }
 
 // B(k, n) = p[k * ld + n]: V's tokens, one column of memory per K row.
+template <bool kFp16 = false>
 __device__ __forceinline__ void load_b_rows(FragB& b, const std::uint16_t* p, int ld) {
   const int c0 = col_of_thread();
   HIP_BLOCK_UNROLL
   for (int j = 0; j < 4; ++j) {
     HIP_BLOCK_UNROLL
-    for (int k = 0; k < 8; ++k) b.v[j][k] = cvt2(p[(2 * k) * ld + c0 + j], p[(2 * k + 1) * ld + c0 + j]);
+    for (int k = 0; k < 8; ++k) b.v[j][k] = cvt2<kFp16>(p[(2 * k) * ld + c0 + j], p[(2 * k + 1) * ld + c0 + j]);
   }
 }
 
@@ -219,11 +236,13 @@ __device__ __forceinline__ void clear(FragAcc& c) {
   HIP_BLOCK_UNROLL
   for (int i = 0; i < 8; ++i) c.v[i] = 0.0f;
 }
+template <bool kFp16 = false>
 __device__ __forceinline__ void load_a(FragA& a, const std::uint16_t* p, int ld) {
   const std::uint16_t* row = p + row_of_thread() * ld;
   HIP_BLOCK_UNROLL
   for (int k = 0; k < 16; ++k) a.v[k] = detail::f(row[k]);
 }
+template <bool kFp16 = false>
 __device__ __forceinline__ void load_b(FragB& b, const std::uint16_t* p, int ld) {
   const int c0 = col_of_thread();
   HIP_BLOCK_UNROLL
@@ -233,6 +252,7 @@ __device__ __forceinline__ void load_b(FragB& b, const std::uint16_t* p, int ld)
     for (int k = 0; k < 16; ++k) b.v[i][k] = detail::f(col[k]);
   }
 }
+template <bool kFp16 = false>
 __device__ __forceinline__ void load_b_rows(FragB& b, const std::uint16_t* p, int ld) {
   const int c0 = col_of_thread();
   HIP_BLOCK_UNROLL

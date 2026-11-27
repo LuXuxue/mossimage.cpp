@@ -265,6 +265,9 @@ struct ConvCase {
 double product(float a, float b, Products p) {
   if (p == Products::kFp32) return static_cast<double>(a) * b;
   if (p == Products::kTf32) return static_cast<double>(hip_vae::host_tf32(a)) * hip_vae::host_tf32(b);
+  if (p == Products::kFp16)
+    return static_cast<double>(hip_vae::host_fp16_value(hip_vae::host_fp16_bits(a))) *
+           hip_vae::host_fp16_value(hip_vae::host_fp16_bits(b));
   std::uint16_t pa[2], pb[2];
   hip_vae::host_split(a, p, pa);
   hip_vae::host_split(b, p, pb);
@@ -280,7 +283,9 @@ void check_conv(const ConvCase& cc, hipStream_t stream) {
   const auto wt = random_f32(2, static_cast<std::size_t>(cc.n) * static_cast<std::size_t>(k), -0.5f, 0.5f);
   const auto bias = random_f32(3, static_cast<std::size_t>(cc.n), -1.0f, 1.0f);
   const auto res = random_f32(4, static_cast<std::size_t>(m * cc.ldo), -4.0f, 4.0f);
-  const Products pack_as = cc.products == Products::kFp32 ? Products::kFp32 : Products::kTf32;
+  const Products pack_as = cc.products == Products::kFp16 ? Products::kFp16
+                           : cc.products == Products::kFp32 ? Products::kFp32
+                                                            : Products::kTf32;
   std::vector<std::uint16_t> packed(hip_vae::packed_weight_elems(cc.n, k, pack_as));
   hip_vae::pack_weight(wt.data(), cc.n, k, pack_as, packed.data());
   DeviceBuffer dx = upload(x), dw = upload(packed), db = upload(bias), dout = upload(res);  // out poisoned with the residual
@@ -1220,6 +1225,7 @@ struct Options {
   fs::path out_dir;
   int iters = 1;
   Products conv_products = Products::kTf32;
+  bool conv_products_set = false;
   bool tiled_check = false;
 };
 
@@ -1471,8 +1477,9 @@ int main(int argc, char** argv) {
       else if (arg == "--profile") o.profile = true;
       else if (arg == "--conv-products") {
         const std::string v = next();
-        if (v != "4" && v != "3") throw std::invalid_argument("--conv-products takes 4 or 3");
-        o.conv_products = v == "4" ? Products::kTf32 : Products::kTf32Drop;
+        if (v != "4" && v != "3" && v != "1") throw std::invalid_argument("--conv-products takes 4, 3 or 1");
+        o.conv_products = v == "4" ? Products::kTf32 : (v == "3" ? Products::kTf32Drop : Products::kFp16);
+        o.conv_products_set = true;
       } else if (arg == "--tiled-check") {
         o.tiled_check = true;
       } else {
@@ -1480,7 +1487,7 @@ int main(int argc, char** argv) {
       }
     } catch (const std::exception& e) {
       std::printf("%s\nusage: %s [--device N] [--kat-only | --no-kat] [--vae FILE] [--golden DIR] [--case NAME]... [--no-golden] [--no-nonsquare]\n"
-                  "       [--out-dir DIR] [--iters N] [--profile] [--conv-products 4|3] [--tiled-check]\n",
+                  "       [--out-dir DIR] [--iters N] [--profile] [--conv-products 4|3|1] [--tiled-check]\n",
                   e.what(), argv[0]);
       return 2;
     }
@@ -1503,7 +1510,7 @@ int main(int argc, char** argv) {
     if (o.decode) {
       const auto t0 = std::chrono::steady_clock::now();
       VaeDecoder decoder(device, o.vae);
-      decoder.set_conv_products(o.conv_products);
+      if (o.conv_products_set) decoder.set_conv_products(o.conv_products);
       decoder.set_profile(o.profile);
       std::printf("\nweights: %.1f MB on the device (decoder c = %d), loaded in %.2f s; decode workspace at 1024^2 %.2f GiB, "
                   "1456^2 %.2f GiB, 2048^2 %.2f GiB\n",

@@ -62,9 +62,16 @@ tile-boundary brightness steps. The only tiling control is the band height:
 | Variable | Effect |
 |---|---|
 | `MI_HIP_VAE_BAND_TILE_PX` | band height in image pixels (default 512) |
+| `MI_HIP_VAE_FP16` | on gfx1035, round convolution/attention operands to fp16 (default on); `=0` restores the exact TF32 product |
+
+gfx1035 has no bf16 arithmetic, so the VAE's TF32 operands used to be split into two bf16 pieces and multiplied with
+four `v_dot2_f32_f16` products per MAC. By default the decoder now keeps one fp16-rounded operand per MAC, which is the
+same precision as TF32's 11-bit significand and cuts the VAE's decode time by roughly 50x on an RDNA2 APU. Accumulation,
+activations, GroupNorm statistics and RGB8 rounding stay fp32, so full and band-tiled decodes remain byte-identical.
+The fp16 path changes a few output bytes by at most one level versus the TF32 path. Other devices keep the TF32 default.
 
 The VAE decoder's other switches are `MI_HIP_VAE_ATTN_PIECES=3` (exact
-3-piece attention) and `MI_HIP_VAE_PROFILE` (per-op timings).
+3-piece attention, non-gfx1035 fp16 path only) and `MI_HIP_VAE_PROFILE` (per-op timings).
 
 ## Implementation notes
 
@@ -98,8 +105,9 @@ The VAE decoder's other switches are `MI_HIP_VAE_ATTN_PIECES=3` (exact
   layer-sized device buffer.
 - The VAE decoder's mid attention packs Q/K/V/P into 2 TF32 bf16 pieces by
   default (3 GEMM products instead of 6), with a small decoded-image difference
-  from the fp32-accurate path. Set `MI_HIP_VAE_ATTN_PIECES=3` for the exact
-  3-piece path; `MI_HIP_VAE_PROFILE` (any value) prints per-op VAE times.
+  from the fp32-accurate path. On gfx1035 it uses one fp16 operand per product
+  instead. Set `MI_HIP_VAE_ATTN_PIECES=3` for the exact 3-piece path on other
+  devices; `MI_HIP_VAE_PROFILE` (any value) prints per-op VAE times.
 - The DiT attention output head stride is the head dimension (128), not the
   full residual width; using the latter corrupts adjacent token rows.
 - The LoRA delta must be added before the base GEMM's bf16 rounding, not to the

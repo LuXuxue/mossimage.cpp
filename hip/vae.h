@@ -4,10 +4,11 @@
 //   latent de-normalization + unpack -> post_quant_conv 1x1 -> conv_in 3x3 -> mid resnet 0 -> mid attention
 //   -> mid resnet 1 -> 4 up blocks (3 resnets each, nearest 2x upsample + 3x3 conv after the first three)
 //   -> GroupNorm + SiLU -> conv_out 3x3 -> clamp and the image processor's rounding to uint8.
-// Convolutions multiply the TF32-rounded operands exactly and accumulate in fp32 (torch's allow_tf32 convolutions), the
-// nearest upsample read inside the following convolution; the attention's linears, scores and P V use two TF32 bf16
-// pieces by default (MI_HIP_VAE_ATTN_PIECES=3 restores the fp32-accurate path); GroupNorm statistics are the engine's
-// exact ones. Accumulation orders
+// Convolutions accumulate in fp32. On gfx1035 (RDNA2, no bf16 instructions) operands are rounded to one fp16 value each
+// by default, so one v_dot2_f32_f16 product serves each MAC; MI_HIP_VAE_FP16=0 restores the exact TF32 product (four
+// bf16-piece dot products) on every device. On other devices the TF32 product is the default. The attention's linears,
+// scores and P V follow the same operand mode (unless MI_HIP_VAE_ATTN_PIECES overrides it on non-fp16 builds); GroupNorm
+// statistics are the engine's exact ones. The nearest upsample is read inside the following convolution. Accumulation orders
 // differ from cuDNN's and torch's, so outputs are close to the engine's, not bit-identical.
 //
 // Memory (untiled): two regions of 2c x 16h x 16w fp32 each (c = 96 for the small decoder) as the engine's ping-pong

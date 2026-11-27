@@ -6,7 +6,8 @@
 // The matrix products run on the backend's 16x16x16 bf16 leaf (mma_leaf.h), which multiplies bf16 values exactly into
 // fp32 accumulators. An fp32 operand becomes bf16 pieces whose sum is the operand: a TF32 value (11 significant bits) is
 // exactly 2 pieces, an fp32 value (24 bits) exactly 3. A product of two operands is the sum of the products of their
-// pieces, each exact in fp32; which of them a kernel adds is its Products value below. Within one 16-wide K step the
+// pieces, each exact in fp32; which of them a kernel adds is its Products value below. On gfx1035 Products::kFp16 keeps a
+// single fp16-rounded operand instead, one dot2 per MAC. Within one 16-wide K step the
 // products are added B piece by B piece from the smallest piece, and for each the A pieces from the smallest.
 // An infinite or NaN operand is its piece 0 alone: a product with it is non-finite, NaN where a piece of the other
 // operand is 0 or has the other sign, so an infinity in an input gives ±Inf or NaN outputs, never finite ones.
@@ -27,6 +28,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "half.h"
+
 namespace hip_vae {
 
 // Rows and columns of a wave's output tile: kTileM x kConvTileN for the convolutions, kTileM x kTileN for piece_gemm.
@@ -40,8 +43,9 @@ inline constexpr int kGroups = 32;  // GroupNorm groups
 //   kTf32       2 x 2 pieces, all 4 products: the exact product of the TF32-rounded operands (cuDNN's TF32 convolution)
 //   kTf32Drop   2 x 2 pieces without lo x lo (i + j < 2): each product short by at most 2^-16 of |a b|
 //   kFp32       3 x 3 pieces, all 9 products: the exact product of fp32 operands (a strict fp32 GEMM)
-enum class Products { kTf32, kTf32Drop, kFp32 };
-inline int pieces_of(Products p) { return p == Products::kFp32 ? 3 : 2; }
+//   kFp16       one fp16 piece per operand, one product: fp16-rounded operands, fp32 accumulation (gfx1035)
+enum class Products { kTf32, kTf32Drop, kFp32, kFp16 };
+inline int pieces_of(Products p) { return p == Products::kFp32 ? 3 : (p == Products::kFp16 ? 1 : 2); }
 const char* products_name(Products p);
 
 inline std::int64_t round_up(std::int64_t v, std::int64_t m) { return (v + m - 1) / m * m; }
@@ -70,9 +74,18 @@ inline float host_bf16_value(std::uint16_t b) {
   std::memcpy(&v, &u, 4);
   return v;
 }
+inline std::uint16_t host_fp16_bits(float v) {  // RNE fp16, clamped like the device's conversion
+  return mi::hip::float_to_half(std::fminf(std::fmaxf(v, -65504.0f), 65504.0f));
+}
+inline float host_fp16_value(std::uint16_t h) { return mi::hip::half_to_float(h); }
 // v (TF32-rounded first for TF32 products) as pieces_of(p) bf16 pieces, each the nearest bf16 of what the previous left.
-// An infinity or NaN is piece 0, the other pieces 0.
+// An infinity or NaN is piece 0, the other pieces 0. kFp16 keeps a single fp16-rounded operand instead.
 inline void host_split(float v, Products p, std::uint16_t* piece) {
+  if (p == Products::kFp16) {
+    piece[0] = host_fp16_bits(v);
+    for (int t = 1; t < pieces_of(p); ++t) piece[t] = 0;
+    return;
+  }
   float r = p == Products::kFp32 ? v : host_tf32(v);
   const bool finite = std::isfinite(v);
   for (int t = 0; t < pieces_of(p); ++t) {
@@ -110,13 +123,13 @@ void pack_weight(const float* w, int n, int k, Products products, std::uint16_t*
 // one output pixel per thread: out[m, n] = sum_k + bias[n]. w_tf32: [n, 9 c] KRSC, already TF32-rounded (host_tf32);
 // c a multiple of 4; out [h w, n].
 void conv_narrow(const float* x, const float* w_tf32, const float* bias, float* out, int h, int w, int c, int n,
-                 hipStream_t stream);
+                 hipStream_t stream, bool fp16 = false);
 
 // ---- Attention ------------------------------------------------------------------------------------------------------
 
 // src [rows, cols] fp32 (element (r, c) = src[r * ld + c], or src[c * ld + r] when `transpose`) -> 3 packed pieces of
 // [rows_pad, cols_pad] (multiples of 16) in dst, zeros past rows and cols.
-// `pieces` selects 3 (the fp32-accurate default) or 2 (TF32 precision, ~2x fewer products) packed bf16 pieces.
+// `pieces` selects 3 (fp32-accurate), 2 (TF32 precision) or 1 (fp16-rounded operand, the gfx1035 fast path).
 void split_pack(const float* src, std::int64_t ld, bool transpose, int rows, int cols, std::uint16_t* dst, int rows_pad,
                 int cols_pad, hipStream_t stream, int pieces = 3);
 
