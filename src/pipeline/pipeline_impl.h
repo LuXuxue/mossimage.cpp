@@ -912,7 +912,9 @@ struct Pipeline::Impl {
       sample_memory();
       arena.reset();
     }
-    arena = std::make_unique<runtime::DeviceArena>(capacity);
+    // In soft-VRAM mode the planner may hand down an arena larger than the dedicated memory currently free: let
+    // cudaMalloc decide whether WDDM can serve it from shared GPU memory instead of refusing it here.
+    arena = std::make_unique<runtime::DeviceArena>(capacity, planner::soft_vram_budget());
     ++mem->arena_creations;
     mem->arena_capacity = std::max(mem->arena_capacity, arena->capacity());
   }

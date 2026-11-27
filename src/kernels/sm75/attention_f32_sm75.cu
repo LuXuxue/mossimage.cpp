@@ -255,6 +255,10 @@ void flash_fwd_f32(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
   static_cast<void>(max_seqlen);
   const std::int64_t total_q = q.dim(0);
   if (total_q == 0) return;
+  // cuBLASLt's fp32 kernels read the matrices past their logical bounds; the matrix views live on the caller's
+  // arena stack, so let the stream drain before the GEMM reuses that memory. Without this, WDDM/Turing drivers
+  // surface an illegal access in the GEMM (seen as "attention_f32: cuBLASLt matmul ...").
+  MI_CUDA_CHECK(cudaStreamSynchronize(stream));
   const int heads = q.dim(1), dim = q.dim(2);
   if (dim != 128 && dim != 256) throw std::runtime_error("flash_fwd_f32: unsupported head dim");
   if (workspace == nullptr || workspace_bytes < flash_fwd_workspace_bytes_sm75(total_q, heads, dim)) {
