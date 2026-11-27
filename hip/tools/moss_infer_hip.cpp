@@ -238,6 +238,19 @@ void apply_params(Args& a, const json::Value& doc) {
   else if (p.find("slg_layers") != nullptr) a.skip = layers(layer_list("slg_layers"));
 }
 
+// Human/JSON-readable name of the VAE path that ran, with the reason when tiling was a fallback.
+std::string vae_decode_label(const hip::GenerateResult& r) {
+  using P = hip::GenerateResult::VaeDecodePath;
+  switch (r.vae_decode_path) {
+    case P::kFull: return "full";
+    case P::kTiledRequested: return "tiled (--vae-tiled)";
+    case P::kTiledBudget: return "tiled (VRAM budget)";
+    case P::kTiledFallback: return "tiled (full decode failed: " + r.vae_decode_note + ")";
+    case P::kNone: return "none";
+  }
+  return "unknown";
+}
+
 std::string json_escape(const std::string& s) {
   std::string out = "\"";
   for (const unsigned char c : s) {
@@ -628,18 +641,20 @@ int run(const Args& a) {
     doc += "  \"timings_s\": {\"text_encoder_load\": " + num(r.text_encoder_load_s) +
            ", \"text_encoder\": " + num(r.text_encoder_s) + ", \"dit_load\": " + num(r.dit_load_s) +
            ", \"denoise\": " + num(r.denoise_s) + ", \"vae\": " + num(r.vae_s) + "},\n";
-    doc += "  \"dit_resident_blocks\": " + std::to_string(r.dit_resident_blocks) + "\n}\n";
+    doc += "  \"dit_resident_blocks\": " + std::to_string(r.dit_resident_blocks) + ", \"vae_decode\": " +
+           json_escape(vae_decode_label(r)) + "\n}\n";
     std::ofstream out(a.json_report, std::ios::binary);
     if (!out) throw std::runtime_error("cannot write " + util::path_utf8(a.json_report));
     out << doc;
   }
   if (!a.quiet) {
+    const std::string decode = vae_decode_label(r);
     std::fprintf(stderr, "done: seed %llu; text encoder load %.1f s, encode %.1f s, DiT load %.1f s (%d of 42 blocks on the "
-                         "device, %.2f GiB free beside them), denoise %.1f s (%.2f s/step), VAE %.1f s\n",
+                         "device, %.2f GiB free beside them), denoise %.1f s (%.2f s/step), VAE %.1f s (%s)\n",
                  static_cast<unsigned long long>(seed), r.text_encoder_load_s, r.text_encoder_s, r.dit_load_s,
                  r.dit_resident_blocks,
                  static_cast<double>(r.dit_free_bytes) / static_cast<double>(1ull << 30), r.denoise_s,
-                 r.denoise_s / static_cast<double>(g.timesteps.size()), r.vae_s);
+                 r.denoise_s / static_cast<double>(g.timesteps.size()), r.vae_s, decode.c_str());
   }
   return 0;
 }

@@ -52,6 +52,10 @@ struct GenerateResult {
   std::vector<std::uint8_t> rgb;  // [height, width, 3]; empty without the decode
   std::vector<float> latents;     // the final latents, f32 [128, height / 16, width / 16]
   double text_encoder_s = 0, text_encoder_load_s = 0, dit_load_s = 0, denoise_s = 0, vae_s = 0;
+  // Which VAE path actually ran, including the reason when tiling was used instead of a full decode.
+  enum class VaeDecodePath { kNone, kFull, kTiledRequested, kTiledBudget, kTiledFallback };
+  VaeDecodePath vae_decode_path = VaeDecodePath::kNone;
+  std::string vae_decode_note;  // the original full-decode error, when that decode failed and tiling was retried
   int dit_resident_blocks = 0;  // of 42; the rest streamed from host memory every step
   std::uint64_t dit_free_bytes = 0;  // device memory free once the DiT's weights loaded, for its activations
 };

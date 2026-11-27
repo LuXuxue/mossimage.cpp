@@ -326,12 +326,21 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
       return vae->decode_tiled_exact(out.latents.data(), lh, lw, out.rgb, plan);
     };
     if (r.vae_tiled || force_tiled) {
+      std::fprintf(stderr, "moss-infer-hip: VAE decode: exact band tiling (%s)\n",
+                   r.vae_tiled ? "--vae-tiled" : "explicit VRAM budget");
+      out.vae_decode_path = r.vae_tiled ? GenerateResult::VaeDecodePath::kTiledRequested
+                                        : GenerateResult::VaeDecodePath::kTiledBudget;
       vst = tiled();
     } else {
+      std::fprintf(stderr, "moss-infer-hip: VAE decode: full frame\n");
       try {
         vst = vae->decode(out.latents.data(), lh, lw, out.rgb);
+        out.vae_decode_path = GenerateResult::VaeDecodePath::kFull;
       } catch (const std::exception& e) {
-        std::fprintf(stderr, "moss-infer-hip: full VAE decode failed (%s); decoding in tiles\n", e.what());
+        std::fprintf(stderr, "moss-infer-hip: full VAE decode failed (%s); falling back to exact band tiling\n",
+                     e.what());
+        out.vae_decode_note = e.what();
+        out.vae_decode_path = GenerateResult::VaeDecodePath::kTiledFallback;
         vst = tiled();
       }
     }
