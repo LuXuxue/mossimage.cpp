@@ -550,57 +550,78 @@ VaeDecodeStats VaeDecoder::decode_tiled(const float* latents, std::uint32_t h, s
   const int H = static_cast<int>(16 * h), W = static_cast<int>(16 * w);
   const int tl = std::max(4, static_cast<int>(tile_px / 16));
   const int ol = std::max(0, std::min(tl / 4, static_cast<int>(overlap_px / 16)));
-  const int step = tl - ol;
+  const int feather = ol * 16;
   const int channels = 128;
+  // A grid with one tile covering the whole image decodes the same pixels three times.
+  if (h <= static_cast<std::uint32_t>(tl) && w <= static_cast<std::uint32_t>(tl))
+    return decode(latents, h, w, rgb, image);
   rgb.assign(static_cast<std::size_t>(H) * W * 3, 0);
   std::vector<float> weight(static_cast<std::size_t>(H) * W, 0.0f), tile_image;
-  std::vector<float> acc_rgb(static_cast<std::size_t>(H) * W * 3, 0.0f);
-  if (image != nullptr) image->assign(static_cast<std::size_t>(H) * W * 3, 0.0f);
+  std::vector<float> acc_rgb(static_cast<std::size_t>(H) * W * 3, 0.0f), acc_image;
+  if (image != nullptr) {
+    image->assign(static_cast<std::size_t>(H) * W * 3, 0.0f);
+    acc_image.assign(static_cast<std::size_t>(H) * W * 3, 0.0f);
+  }
   std::vector<std::uint8_t> tile_rgb;
-  std::vector<float> crop(static_cast<std::size_t>(channels) * tl * tl);
   VaeDecodeStats st;
 
-  constexpr double kPi = 3.14159265358979323846;
-  // `pos` and `tile_start` are both global image pixels. Interior tiles overlap, so their half-cosine ramps are
-  // averaged and normalised by `weight` below; the image-border edges stay at full weight.
-  const auto ramp = [ol, kPi](int pos, int size, int tile_start, int tile_len) -> float {
-    const int t = pos - tile_start;
-    const int feather = ol * 16;
-    if (feather == 0) return 1.0;
-    double v = 1.0;
-    // Half weight at an interior tile edge, rising to one over the feather.
-    if (tile_start > 0 && t < feather) v = std::min(v, 0.5f + 0.5f * std::sin(kPi * t / (2.0 * feather)));
-    if (tile_start + tile_len * 16 < size && t >= tile_len * 16 - feather)
-      v = std::min(v, 0.5f + 0.5f * std::sin(kPi * (tile_len * 16 - 1 - t) / (2.0 * feather)));
-    return static_cast<float>(v);
+  // ComfyUI's VAE.decode_tiled_() averages three overlap-and-blend passes: the requested tile grid, one with half the
+  // width and twice the height, and one with twice the width and half the height. Each tile is normalised by its own
+  // GroupNorm statistics, so a tile's brightness depends on what happens to be inside it. A single grid therefore
+  // leaves a visible brightness step at every tile boundary; the three grids put those steps in different places and
+  // their average reduces them, at roughly three times the decode cost of one grid.
+  struct Grid {
+    int tw, th;
+  };
+  const Grid grids[3] = {{std::max(4, tl / 2), std::min(static_cast<int>(h), tl * 2)},
+                         {std::min(static_cast<int>(w), tl * 2), std::max(4, tl / 2)},
+                         {tl, tl}};
+  int max_tw = 0, max_th = 0;
+  for (const Grid& g : grids) {
+    max_tw = std::max(max_tw, std::min(g.tw, static_cast<int>(w)));
+    max_th = std::max(max_th, std::min(g.th, static_cast<int>(h)));
+  }
+  std::vector<float> crop(static_cast<std::size_t>(channels) * max_tw * max_th);
+
+  // ComfyUI's tiled_scale() mask: a linear ramp over the overlap on *every* edge, including the image borders;
+  // acc/weight below re-normalises. The ramp is in image pixels (16 per latent pixel).
+  const auto edge = [feather](int len, int i) -> float {
+    if (feather == 0 || len <= feather) return 1.0f;
+    if (i < feather) return static_cast<float>(i + 1) / feather;
+    if (i >= len - feather) return static_cast<float>(len - i) / feather;
+    return 1.0f;
   };
 
-  for (int y0 = 0; y0 < static_cast<int>(h); y0 += step) {
-    const int th = std::min(tl, static_cast<int>(h) - y0);
-    for (int x0 = 0; x0 < static_cast<int>(w); x0 += step) {
-      const int tw = std::min(tl, static_cast<int>(w) - x0);
-      // NCHW crop of the latent tile.
-      for (int c = 0; c < channels; ++c) {
-        const float* src = latents + static_cast<std::size_t>(c) * h * w;
-        float* dst = crop.data() + static_cast<std::size_t>(c) * th * tw;
-        for (int y = 0; y < th; ++y)
-          std::memcpy(dst + static_cast<std::size_t>(y) * tw, src + static_cast<std::size_t>(y0 + y) * w + x0,
-                      static_cast<std::size_t>(tw) * sizeof(float));
-      }
-      const auto ts = decode(crop.data(), static_cast<std::uint32_t>(th), static_cast<std::uint32_t>(tw), tile_rgb,
-                             image != nullptr ? &tile_image : nullptr);
-      st.seconds += ts.seconds;
-      if (ts.device_bytes > st.device_bytes) st.device_bytes = ts.device_bytes;
-      for (int y = 0; y < th * 16; ++y) {
-        const float wy = ramp(y0 * 16 + y, H, y0 * 16, th);
-        for (int x = 0; x < tw * 16; ++x) {
-          const float wgt = wy * ramp(x0 * 16 + x, W, x0 * 16, tw);
-          const std::size_t p = static_cast<std::size_t>(y0 * 16 + y) * W + x0 * 16 + x;
-          const std::size_t tp = static_cast<std::size_t>(y) * tw * 16 + x;
-          weight[p] += wgt;
-          for (int k = 0; k < 3; ++k) {
-            acc_rgb[p * 3 + k] += tile_rgb[tp * 3 + k] * wgt;
-            if (image != nullptr) (*image)[p * 3 + k] += tile_image[tp * 3 + k] * wgt;
+  for (const Grid& g : grids) {
+    const int step_y = std::max(1, g.th - ol), step_x = std::max(1, g.tw - ol);
+    for (int y0 = 0; y0 < static_cast<int>(h); y0 += step_y) {
+      const int th = std::min(g.th, static_cast<int>(h) - y0);
+      for (int x0 = 0; x0 < static_cast<int>(w); x0 += step_x) {
+        const int tw = std::min(g.tw, static_cast<int>(w) - x0);
+        // NCHW crop of the latent tile.
+        for (int c = 0; c < channels; ++c) {
+          const float* src = latents + static_cast<std::size_t>(c) * h * w;
+          float* dst = crop.data() + static_cast<std::size_t>(c) * th * tw;
+          for (int y = 0; y < th; ++y)
+            std::memcpy(dst + static_cast<std::size_t>(y) * tw, src + static_cast<std::size_t>(y0 + y) * w + x0,
+                        static_cast<std::size_t>(tw) * sizeof(float));
+        }
+        const auto ts = decode(crop.data(), static_cast<std::uint32_t>(th), static_cast<std::uint32_t>(tw), tile_rgb,
+                               image != nullptr ? &tile_image : nullptr);
+        st.seconds += ts.seconds;
+        if (ts.device_bytes > st.device_bytes) st.device_bytes = ts.device_bytes;
+        const int ph = th * 16, pw = tw * 16;
+        for (int y = 0; y < ph; ++y) {
+          const float wy = edge(ph, y);
+          for (int x = 0; x < pw; ++x) {
+            const float wgt = wy * edge(pw, x);
+            const std::size_t p = static_cast<std::size_t>(y0 * 16 + y) * W + x0 * 16 + x;
+            const std::size_t tp = static_cast<std::size_t>(y) * pw + x;
+            weight[p] += wgt;
+            for (int k = 0; k < 3; ++k) {
+              acc_rgb[p * 3 + k] += tile_rgb[tp * 3 + k] * wgt;
+              if (image != nullptr) acc_image[p * 3 + k] += tile_image[tp * 3 + k] * wgt;
+            }
           }
         }
       }
@@ -610,7 +631,7 @@ VaeDecodeStats VaeDecoder::decode_tiled(const float* latents, std::uint32_t h, s
     const float inv = weight[p] > 1.0e-6f ? 1.0f / weight[p] : 1.0f;
     for (int k = 0; k < 3; ++k) {
       rgb[p * 3 + k] = static_cast<std::uint8_t>(std::max(0.0f, std::min(255.0f, acc_rgb[p * 3 + k] * inv)));
-      if (image != nullptr) (*image)[p * 3 + k] *= inv;
+      if (image != nullptr) (*image)[p * 3 + k] = acc_image[p * 3 + k] * inv;
     }
   }
   st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

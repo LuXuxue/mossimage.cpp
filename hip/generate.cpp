@@ -271,23 +271,30 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     const double t0 = now_s();
     report("vae", 0, 1);
     VaeDecodeStats vst;
-    // --vae-tiled is the only way to request tiling up front. Environment variables choose the mode and geometry.
-    // A full decode that throws is retried on the same tiled path: this is an error fallback, not a memory prediction.
-    const auto tiled = [&]() -> VaeDecodeStats {
-      const bool band = std::getenv("MI_HIP_VAE_BAND_TILE") != nullptr || std::getenv("MI_HIP_VAE_EXACT") != nullptr;
-      if (band) {
-        int tile = 8;
-        if (const char* tp = std::getenv("MI_HIP_VAE_BAND_TILE_PX")) tile = std::atoi(tp);
-        const VaeTilePlan plan = VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, tile);
-        std::fprintf(stderr, "moss-infer-hip: exact band-tiled VAE: %s\n", plan.describe().c_str());
-        return vae->decode_tiled_exact(out.latents.data(), lh, lw, out.rgb, plan);
-      }
+    // --vae-tiled is the only way to request tiling up front. A full decode that throws is retried here too; that is
+    // an error fallback, not a memory prediction. Tiling defaults to the exact band schedule: it is byte-identical to
+    // the full decode, so it has no tile-boundary brightness steps. Overlap-and-blend is opt-in because each tile
+    // normalises by its own GroupNorm statistics and is measurably brighter or darker than its neighbours.
+    const auto overlap_tiled = [&]() -> VaeDecodeStats {
       int tile_px = 512, overlap_px = 128;
       if (const char* tp = std::getenv("MI_HIP_VAE_TILE_PX")) tile_px = std::atoi(tp);
       if (const char* opx = std::getenv("MI_HIP_VAE_OVERLAP_PX")) overlap_px = std::atoi(opx);
       return vae->decode_tiled(out.latents.data(), lh, lw, out.rgb, nullptr,
                                static_cast<std::uint32_t>(std::max(tile_px, 32)),
                                static_cast<std::uint32_t>(std::max(overlap_px, 0)));
+    };
+    const auto tiled = [&]() -> VaeDecodeStats {
+      if (std::getenv("MI_HIP_VAE_OVERLAP") != nullptr) return overlap_tiled();
+      int tile = 512;
+      if (const char* tp = std::getenv("MI_HIP_VAE_BAND_TILE_PX")) tile = std::atoi(tp);
+      const VaeTilePlan plan = VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, tile);
+      std::fprintf(stderr, "moss-infer-hip: exact band-tiled VAE: %s\n", plan.describe().c_str());
+      try {
+        return vae->decode_tiled_exact(out.latents.data(), lh, lw, out.rgb, plan);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "moss-infer-hip: band-tiled VAE failed (%s); falling back to overlap-and-blend\n", e.what());
+        return overlap_tiled();
+      }
     };
     if (r.vae_tiled) {
       vst = tiled();
