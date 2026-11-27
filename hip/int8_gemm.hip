@@ -43,6 +43,7 @@ struct Int8GemmArgs {
   const bf16_bits* gate;        // optional [n] fp32 gate: y = residual + bf16(y)*gate, after the first bf16 rounding
   const bf16_bits* residual;    // optional [m, ldr], may alias y
   std::int64_t ldr;
+  int m_block0 = 0;  // first M block of this chunk when the grid is split over M
 };
 
 #if defined(__GFX10__)
@@ -71,7 +72,7 @@ __global__ __launch_bounds__(256) void int8_gemm_valu(const Int8GemmArgs a, int 
   const int per_group = kGroupM * blocks_n;
   const int group = bid / per_group, idx = bid - group * per_group;
   const int group_rows = std::min(kGroupM, blocks_m - group * kGroupM);
-  const int m0 = (group * kGroupM + idx % group_rows) * BM, n0 = (idx / group_rows) * BN;
+  const int m0 = (a.m_block0 + group * kGroupM + idx % group_rows) * BM, n0 = (idx / group_rows) * BN;
 
   auto load_tile = [&](int buf, int k0) {
     for (int i = tid; i < BM * VPR; i += THREADS) {
@@ -253,7 +254,7 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void int8_gemm_tiled(
   const int group_rows = std::min(kGroupM, blocks_m - group * kGroupM);
   const int mb = group * kGroupM + idx % group_rows;
   const int nb = idx / group_rows;
-  const int m0 = mb * BM, n0 = nb * BN;
+  const int m0 = (a.m_block0 + mb) * BM, n0 = nb * BN;
 
   i8leaf::FragAcc acc[TM][TN];
 #pragma unroll
@@ -388,6 +389,7 @@ void int8_gemm(hip_block::bf16_bits* y, std::int64_t ldy, const std::int8_t* x, 
   const int gy = (n + bn - 1) / bn;
   for (int x0 = 0; x0 < gx; x0 += kChunk) {
     const int xn = std::min(kChunk, gx - x0);
+    a.m_block0 = x0;
     dim3 grid(gy, xn, 1);  // x = N blocks, y = M blocks (matches the kernel's grouped ordering)
     // Deep K: the 128-thread 4x4 fragment grid has the highest matrix density and the LDS reads are amortised. Shallow
     // K: the 512-thread 2x2 grid yields more blocks to interleave across the GPU's WGPs. RDNA2 runs the VALU tile.
@@ -401,6 +403,43 @@ void int8_gemm(hip_block::bf16_bits* y, std::int64_t ldy, const std::int8_t* x, 
   }
   const hipError_t e = hipGetLastError();
   if (e != hipSuccess) throw std::runtime_error(std::string("hip_block::int8_gemm: ") + hipGetErrorString(e));
+}
+
+}  // namespace mi::hip
+
+#else  // !ROCWMMA_I8_LEAF (the NVIDIA logic-check build has no gfx11 int8 WMMA)
+
+#include <cstdint>
+#include <stdexcept>
+
+#include "hip_block.h"
+#include "int8_gemm.h"
+
+namespace mi::hip {
+
+// Same signature as int8_gemm.h: a caller in the NVIDIA build must link even though the kernel cannot run there.
+void int8_gemm(hip_block::bf16_bits* y, std::int64_t ldy, const std::int8_t* x, std::int64_t ldx,
+               const float* x_scale, const std::int8_t* w, const float* w_scale, const float* bias, int m, int n, int k,
+               hipStream_t stream, const hip_block::bf16_bits* lora_delta, std::int64_t ldl,
+               const hip_block::bf16_bits* gate, const hip_block::bf16_bits* residual, std::int64_t ldr) {
+  (void)y;
+  (void)ldy;
+  (void)x;
+  (void)ldx;
+  (void)x_scale;
+  (void)w;
+  (void)w_scale;
+  (void)bias;
+  (void)m;
+  (void)n;
+  (void)k;
+  (void)stream;
+  (void)lora_delta;
+  (void)ldl;
+  (void)gate;
+  (void)residual;
+  (void)ldr;
+  throw std::runtime_error("the INT8 GEMM needs a gfx11 int8 WMMA build");
 }
 
 }  // namespace mi::hip

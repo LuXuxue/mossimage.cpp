@@ -166,8 +166,8 @@ std::string read_file(const fs::path& p) {
   return ss.str();
 }
 
-// The subset of `moss-infer generate --params` this backend acts on. Flags given on the command line are parsed after
-// the file and override these values, exactly as in the CUDA CLI.
+// The subset of `moss-infer generate --params` this backend acts on. The file is applied once, before every
+// command-line flag, so flags override these values regardless of argument order, exactly as in the CUDA CLI.
 void apply_params(Args& a, const json::Value& doc) {
   if (!doc.is_object()) usage("--params: expected a JSON object");
   const json::Value* params = doc.find("parameters");
@@ -275,61 +275,24 @@ std::uint64_t vram_bytes(const std::string& flag, double gib) {
   return static_cast<std::uint64_t>(bytes);
 }
 
-Args parse(const std::vector<std::string>& argv) {
-  Args a;
-  // Accept the CUDA CLI's `generate` / `check` subcommand prefix so the same launcher works with either binary.
-  std::size_t first = 1;
-  if (first < argv.size() && (argv[first] == "generate" || argv[first] == "check")) ++first;
-  for (std::size_t i = first; i < argv.size(); ++i) {
-    const std::string& f = argv[i];
-    if (f == "--no-metadata") {
-      a.metadata = false;
-      continue;
-    }
-    if (f == "--direct-io") {
-      a.direct_io = true;
-      continue;
-    }
-    if (f == "--buffered-io") {
-      a.buffered_io = true;
-      continue;
-    }
-    if (f == "--lora-strict") {
-      a.lora_strict = true;
-      continue;
-    }
-    if (f == "--quiet") {
-      a.quiet = true;
-      continue;
-    }
-    if (f == "--list-devices") {
-      a.list = true;
-      continue;
-    }
-    if (f == "-h" || f == "--help") {
-      a.help = true;
-      return a;
-    }
-    if (f == "--version") {
-      a.version = true;
-      return a;
-    }
-    if (f == "--vae-tiled") {
-      a.vae_tiled = true;
-      continue;
-    }
-    if (i + 1 >= argv.size()) usage(f + " needs a value");
-    const std::string& v = argv[++i];
-    if (f == "--params") {
-      a.params = util::path_from_utf8(v);
-      apply_params(a, json::parse(read_file(a.params)));
-    }
-    else if (f == "--json-report") a.json_report = util::path_from_utf8(v);
+// Apply one command-line flag. --params is handled separately, after all flags have been collected.
+void apply_flag(Args& a, const std::string& f, const std::string& v) {
+  if (f == "--no-metadata") a.metadata = false;
+  else if (f == "--direct-io") a.direct_io = true;
+  else if (f == "--buffered-io") a.buffered_io = true;
+  else if (f == "--lora-strict") a.lora_strict = true;
+  else if (f == "--quiet") a.quiet = true;
+  else if (f == "--list-devices") a.list = true;
+  else if (f == "--vae-tiled") a.vae_tiled = true;
+  else if (f == "--json-report") a.json_report = util::path_from_utf8(v);
     else if (f == "--model") a.model = util::path_from_utf8(v);
     else if (f == "--dit") a.dit = util::path_from_utf8(v);
     else if (f == "--te") a.te = util::path_from_utf8(v);
     else if (f == "--vae") a.vae = util::path_from_utf8(v);
-    else if (f == "--lora") a.lora = util::path_from_utf8(v);
+    else if (f == "--lora") {
+      if (!a.lora.empty()) usage("--lora may be given only once by this backend");
+      a.lora = util::path_from_utf8(v);
+    }
     else if (f == "--lora-scale") a.lora_scale = static_cast<float>(number(f, v));
     else if (f == "--lora-placement") a.lora_placement = v;
     else if (f == "--prompt") a.prompt = v, a.have_prompt = true;
@@ -360,6 +323,7 @@ Args parse(const std::vector<std::string>& argv) {
     else if (f == "--host-ram-budget") a.host_ram_budget = number(f, v);
     else if (f == "--sampler") {
       if (!valid_sampler(v)) usage("--sampler takes euler, ab2, euler_ancestral, heun, dpmpp_2m, dpmpp_2m_sde, er_sde, res_multistep or dataspace");
+      if (v != "euler") usage("--sampler: this backend implements only euler");
       a.sampler = v;
     }
     else if (f == "--scheduler") {
@@ -413,7 +377,39 @@ Args parse(const std::vector<std::string>& argv) {
       a.tier = v;
     }
     else usage("unknown or unsupported flag " + f);
+}
+
+Args parse(const std::vector<std::string>& argv) {
+  Args a;
+  // Accept the CUDA CLI's `generate` / `check` subcommand prefix so the same launcher works with either binary.
+  std::size_t first = 1;
+  if (first < argv.size() && (argv[first] == "generate" || argv[first] == "check")) ++first;
+  std::vector<std::pair<std::string, std::string>> flags;
+  for (std::size_t i = first; i < argv.size(); ++i) {
+    const std::string& f = argv[i];
+    if (f == "-h" || f == "--help") {
+      a.help = true;
+      return a;
+    }
+    if (f == "--version") {
+      a.version = true;
+      return a;
+    }
+    if (f == "--no-metadata" || f == "--direct-io" || f == "--buffered-io" || f == "--lora-strict" ||
+        f == "--quiet" || f == "--list-devices" || f == "--vae-tiled") {
+      flags.emplace_back(f, "");
+      continue;
+    }
+    if (i + 1 >= argv.size()) usage(f + " needs a value");
+    flags.emplace_back(f, argv[++i]);
   }
+  // Like the CUDA CLI: read --params once, then apply every flag in command-line order, so a flag overrides the file
+  // regardless of where --params appears in argv.
+  for (const auto& [f, v] : flags)
+    if (f == "--params") a.params = util::path_from_utf8(v);
+  if (!a.params.empty()) apply_params(a, json::parse(read_file(a.params)));
+  for (const auto& [f, v] : flags)
+    if (f != "--params") apply_flag(a, f, v);
   // Planner and kernel-choice flags the HIP backend does not have. They are accepted (CUDA launchers can drive this
   // binary unchanged) but reported, rather than silently changing nothing.
   const auto note = [](const char* flag) {
@@ -437,7 +433,9 @@ Args parse(const std::vector<std::string>& argv) {
   if (!a.dataspace.empty()) note("--dataspace");
   if (!a.preview.empty()) note("--preview");
   if (!a.then_prompts.empty()) note("--then-prompt");
-  if (a.sampler != "euler") note("--sampler");
+  if (a.noise_source != "philox") note("--noise-source");
+  if (a.eta != 0) note("--eta");
+  if (a.s_noise != 1) note("--s-noise");
   if (a.scheduler != "moss" || a.flow_multiplier != 1.0) note("--scheduler/--flow-multiplier");
   if (a.slg_scale != 0 || !a.slg.empty()) note("--slg-*");
   if (a.cfg_truncation != 1.0) note("--cfg-truncation");

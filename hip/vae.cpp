@@ -1258,19 +1258,20 @@ VaeDecodeStats VaeDecoder::decode_tiled_exact(const float* latents, std::uint32_
   const Fixed& f = p.fixed();
   require(static_cast<std::uint64_t>(pl.block) + pl.work + f.total() == plan.workspace_bytes,
           "tile plan workspace out of date");
+  const int hh = static_cast<int>(2 * h), ww = static_cast<int>(2 * w), H = static_cast<int>(16 * h),
+            W = static_cast<int>(16 * w);
+  const std::size_t image_bytes = image != nullptr ? static_cast<std::size_t>(H) * W * 3 * 4 : 0;
+  const std::uint64_t need = plan.workspace_bytes + image_bytes;  // the fp32 image needs its own staging buffer
   const std::uint64_t free = device_.free_memory();
-  if (plan.workspace_bytes > free) {
+  if (need > free) {
     char msg[256];
     std::snprintf(msg, sizeof msg, "the band-tiled VAE decode needs %.2f GiB of device memory, %s has %.2f GiB free",
-                  static_cast<double>(plan.workspace_bytes) / (1u << 30), device_.info().name.c_str(),
+                  static_cast<double>(need) / (1u << 30), device_.info().name.c_str(),
                   static_cast<double>(free) / (1u << 30));
     throw std::runtime_error(msg);
   }
-  const int hh = static_cast<int>(2 * h), ww = static_cast<int>(2 * w), H = static_cast<int>(16 * h),
-            W = static_cast<int>(16 * w);
   Stream stream;
   DeviceBuffer ws(static_cast<std::size_t>(plan.workspace_bytes));
-  const std::size_t image_bytes = image != nullptr ? static_cast<std::size_t>(H) * W * 3 * 4 : 0;
   DeviceBuffer image_stage(image_bytes);
   struct Drain {
     hipStream_t s;

@@ -3,12 +3,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "half.h"
 #include "safetensors.h"
 #include "weights/quant/quant_codec.h"
 
@@ -74,10 +77,10 @@ bool parse_target(const std::string& key, const st::File& file, Target& t) {
     t.module = std::string(m.substr(0, m.size() - 1));
     t.alpha_name = "layers." + std::to_string(t.layer) + ".proj." + t.module + ".alpha";
     const std::string suffix = rest.substr(m.size());
-    const bool down = suffix == "lora.down.weight" || suffix == "lora_down.weight" || suffix == "lora_A.weight" ||
-                      suffix == "lora_A";
-    const bool up = suffix == "lora.up.weight" || suffix == "lora_up.weight" || suffix == "lora_B.weight" ||
-                    suffix == "lora_B";
+    // `name` has already been normalized (underscores became dots), so both spellings must be compared in their
+    // normalized form: lora_down.weight -> lora.down.weight, lora_A.weight -> lora.A.weight.
+    const bool down = suffix == "lora.down.weight" || suffix == "lora.A.weight" || suffix == "lora.A";
+    const bool up = suffix == "lora.up.weight" || suffix == "lora.B.weight" || suffix == "lora.B";
     if (!down && !up) return false;
     const st::TensorInfo* info = file.find(key);
     if (down) t.down = info;
@@ -87,11 +90,22 @@ bool parse_target(const std::string& key, const st::File& file, Target& t) {
   return false;
 }
 
+// LoRA factors ship as F32, BF16 or F16; widen them to fp32 before rounding to bf16 for the device.
 std::vector<float> read_f32(const st::File& file, const st::TensorInfo& t) {
-  if (t.dtype != "F32") fail(t.name + " is " + t.dtype + ", expected F32");
-  std::vector<float> v(static_cast<std::size_t>(t.bytes / 4));
-  file.read(t, v.data());
-  return v;
+  if (t.dtype == "F32") {
+    std::vector<float> v(static_cast<std::size_t>(t.bytes / 4));
+    file.read(t, v.data());
+    return v;
+  }
+  if (t.dtype == "BF16" || t.dtype == "F16") {
+    std::vector<std::uint16_t> raw(static_cast<std::size_t>(t.bytes / 2));
+    file.read(t, raw.data());
+    std::vector<float> v(raw.size());
+    for (std::size_t i = 0; i < raw.size(); ++i)
+      v[i] = t.dtype == "BF16" ? mi::quant::bf16_to_float(raw[i]) : half_to_float(raw[i]);
+    return v;
+  }
+  fail(t.name + " is " + t.dtype + ", expected F32, BF16 or F16");
 }
 
 // One adapter's factors as bf16, with the coefficient folded into B's columns.
@@ -137,6 +151,11 @@ Lora::Lora(const std::filesystem::path& file, float strength, int blocks) {
   if (!std::filesystem::is_regular_file(file)) fail("not a file: " + path_);
 
   st::File st_file(file);
+  // Alpha names are built in normalized form, but safetensors lookup is by the file's original key. Keep the mapping
+  // so `lora_unet_layers_0_proj_q.alpha` or `diffusion_model.layers.0.proj.q.alpha` is found from
+  // `layers.0.proj.q.alpha`.
+  std::unordered_map<std::string, std::string> original_key;
+  for (const st::TensorInfo& info : st_file.tensors()) original_key.emplace(normalize(info.name), info.name);
   // Group the file's keys by (layer, module). A module may have lora_down/lora_up/alpha separately.
   std::vector<Target> targets;
   for (const st::TensorInfo& info : st_file.tensors()) {
@@ -163,8 +182,14 @@ Lora::Lora(const std::filesystem::path& file, float strength, int blocks) {
     const int rank = static_cast<int>(t.down->shape[0]);
     if (rank <= 0) fail("a LoRA rank is zero");
     float alpha = static_cast<float>(rank);  // no alpha tensor: alpha / rank = 1
-    const st::TensorInfo* ai = st_file.find(t.alpha_name);
-    if (ai != nullptr) alpha = read_f32(st_file, *ai).at(0);
+    const auto ak = original_key.find(t.alpha_name);
+    if (ak != original_key.end()) {
+      const st::TensorInfo* ai = st_file.find(ak->second);
+      if (ai != nullptr) {
+        const std::vector<float> av = read_f32(st_file, *ai);
+        if (!av.empty() && std::isfinite(av[0])) alpha = av[0];
+      }
+    }
     const float coef = strength * (alpha / static_cast<float>(rank));
     int n = 0, k = 0;
     switch (static_cast<LoraSite>(t.site)) {

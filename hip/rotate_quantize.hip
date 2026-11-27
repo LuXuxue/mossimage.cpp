@@ -72,6 +72,7 @@ __device__ __forceinline__ void hadamard256(float (&v)[16], float* tile, int h) 
   __syncwarp();
   HIP_BLOCK_UNROLL
   for (int j = 0; j < 16; ++j) v[j] = tile[j * kStride + h];
+  __syncwarp();  // the tile is reused by the next pair of this warp
   two_stages(v);
 }
 
@@ -200,6 +201,9 @@ void check_launch(const char* what) {
 // Rotate a [rows, k] bf16 row and quantize to [rows, k] int8 with one per-row scale.
 void rotate_quantize(const bf16* x, std::int64_t ldx, std::int64_t rows, std::int64_t k, std::int8_t* q,
                      std::int64_t ldq, float* scale, hipStream_t stream) {
+  if (k <= 0 || k % kConvRotGroup != 0 || rows < 0 || ldx < k || ldq < k || x == nullptr || q == nullptr ||
+      scale == nullptr)
+    throw std::invalid_argument("rotate_quantize: k must be a positive multiple of 256 and the strides at least k");
   const int groups = static_cast<int>(k) / kConvRotGroup;
   const BlockShape bs = BlockShape::of(groups);
   const int threads = 32 * bs.warps;
@@ -225,6 +229,9 @@ void rotate_quantize(const bf16* x, std::int64_t ldx, std::int64_t rows, std::in
 // length of each half. Numerically identical to situ_glu followed by rotate_quantize, without the intermediate tensor.
 void rotate_quantize_situ(const bf16* up_gate, std::int64_t ld, std::int64_t rows, std::int64_t k, std::int8_t* q,
                           std::int64_t ldq, float* scale, hipStream_t stream) {
+  if (k <= 0 || k % kConvRotGroup != 0 || rows < 0 || ld < 2 * k || ldq < k || up_gate == nullptr || q == nullptr ||
+      scale == nullptr)
+    throw std::invalid_argument("rotate_quantize_situ: k must be a positive multiple of 256 and the strides at least k");
   const int groups = static_cast<int>(k) / kConvRotGroup;
   const BlockShape bs = BlockShape::of(groups);
   const int threads = 32 * bs.warps;

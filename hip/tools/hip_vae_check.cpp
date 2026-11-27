@@ -1407,7 +1407,8 @@ void run_tiled_exact_check(VaeDecoder& decoder) {
           bad_image += std::bit_cast<std::uint32_t>(image[i]) != std::bit_cast<std::uint32_t>(image_full[i]);
           max_diff = std::max(max_diff, std::abs(static_cast<double>(image[i] - image_full[i])));
         }
-        const bool ok = rgb.size() == rgb_full.size() && bad_bytes == 0;
+        const bool ok = rgb.size() == rgb_full.size() && image.size() == image_full.size() && bad_bytes == 0 &&
+                        bad_image == 0;
         if (!ok) ++failures;
         std::printf("  %-9s %-8s %s: %s %zu of %zu bytes differ, %zu of %zu fp32 values differ (max |diff| %.3g)\n",
                     planner == 0 ? "min-mem" : "uniform", ("tile " + std::to_string(tile)).c_str(), plan.describe().c_str(),

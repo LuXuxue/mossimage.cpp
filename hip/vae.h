@@ -5,8 +5,9 @@
 //   -> mid resnet 1 -> 4 up blocks (3 resnets each, nearest 2x upsample + 3x3 conv after the first three)
 //   -> GroupNorm + SiLU -> conv_out 3x3 -> clamp and the image processor's rounding to uint8.
 // Convolutions multiply the TF32-rounded operands exactly and accumulate in fp32 (torch's allow_tf32 convolutions), the
-// nearest upsample read inside the following convolution; the attention's linears are exact-product fp32 GEMMs, its
-// scores and P V fp32-accurate (vae_kernels.h); GroupNorm statistics are the engine's exact ones. Accumulation orders
+// nearest upsample read inside the following convolution; the attention's linears, scores and P V use two TF32 bf16
+// pieces by default (MI_HIP_VAE_ATTN_PIECES=3 restores the fp32-accurate path); GroupNorm statistics are the engine's
+// exact ones. Accumulation orders
 // differ from cuDNN's and torch's, so outputs are close to the engine's, not bit-identical.
 //
 // Memory (untiled): two regions of 2c x 16h x 16w fp32 each (c = 96 for the small decoder) as the engine's ping-pong

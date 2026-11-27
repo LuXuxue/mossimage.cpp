@@ -51,6 +51,22 @@ std::uint64_t host_available_bytes() {
 
 [[noreturn]] void fail(const std::string& what) { throw std::invalid_argument("hip generate: " + what); }
 
+// The one surviving VAE tiling control. An invalid value must not turn a decode failure into a confusing planner
+// exception, so warn and fall back to the default instead.
+int band_tile_px() {
+  constexpr int kDefault = 512;
+  const char* s = std::getenv("MI_HIP_VAE_BAND_TILE_PX");
+  if (s == nullptr || *s == '\0') return kDefault;
+  char* end = nullptr;
+  const long v = std::strtol(s, &end, 10);
+  if (end != s && *end == '\0' && v >= 8 && v <= std::numeric_limits<int>::max() && v % 8 == 0)
+    return static_cast<int>(v);
+  std::fprintf(stderr,
+               "moss-infer-hip: ignoring MI_HIP_VAE_BAND_TILE_PX=%s (want a positive multiple of 8); using %d\n", s,
+               kDefault);
+  return kDefault;
+}
+
 }  // namespace
 
 GenerateResult generate(Device& device, const GenerateRequest& r) {
@@ -76,9 +92,39 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
   // The VAE first (about 0.1 GiB of weights, kept through the run). A full decode that fails is retried in tiles
   // after the text encoder and DiT have been freed.
   std::optional<VaeDecoder> vae;
+  bool force_tiled = false;
   if (r.decode) {
     vae.emplace(device, component(r.vae_file, "vae/diffusion_pytorch_model.safetensors"));
     vae->set_profile(std::getenv("MI_HIP_VAE_PROFILE") != nullptr);
+    // An explicit budget is a hard limit on the decode as well. If the full decode does not fit, use the exact band
+    // decoder; refuse before the text encoder and the sampling steps only when even that does not fit.
+    if (r.vram_budget != 0 && vae->weight_bytes() + vae->workspace_bytes(lh, lw) > r.vram_budget) {
+      std::uint64_t tiled_bytes = 0;
+      try {
+        tiled_bytes = VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, band_tile_px()).workspace_bytes;
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "moss-infer-hip: no tiled VAE schedule: %s\n", e.what());
+      }
+      if (tiled_bytes != 0 && vae->weight_bytes() + tiled_bytes <= r.vram_budget) {
+        std::fprintf(stderr, "moss-infer-hip: full VAE decode exceeds the VRAM budget; using the exact band decoder\n");
+        force_tiled = true;
+      } else {
+        char msg[512];
+        if (tiled_bytes != 0)
+          std::snprintf(msg, sizeof msg,
+                        "the VAE decode at %ux%u does not fit a VRAM budget of %.2f GiB: the weights take %.2f GiB, a "
+                        "full decode %.2f GiB and the smallest band-tiled decode %.2f GiB",
+                        r.width, r.height, gib(r.vram_budget), gib(vae->weight_bytes()),
+                        gib(vae->workspace_bytes(lh, lw)), gib(tiled_bytes));
+        else
+          std::snprintf(msg, sizeof msg,
+                        "the VAE decode at %ux%u does not fit a VRAM budget of %.2f GiB: the weights take %.2f GiB, a "
+                        "full decode %.2f GiB, and no band-tiled schedule was found",
+                        r.width, r.height, gib(r.vram_budget), gib(vae->weight_bytes()),
+                        gib(vae->workspace_bytes(lh, lw)));
+        throw std::runtime_error(msg);
+      }
+    }
   }
 
   // The DiT's plan for the prompts' lengths: what it holds beside its weights, the steps' activations, the refiner's
@@ -275,13 +321,11 @@ GenerateResult generate(Device& device, const GenerateRequest& r) {
     // fallback, not a memory prediction. The exact band decoder is byte-identical to the full decode, so tiling does
     // not shift the brightness of any tile.
     const auto tiled = [&]() -> VaeDecodeStats {
-      int tile = 512;
-      if (const char* tp = std::getenv("MI_HIP_VAE_BAND_TILE_PX")) tile = std::atoi(tp);
-      const VaeTilePlan plan = VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, tile);
+      const VaeTilePlan plan = VaeDecoder::plan_tiled_min_memory(vae->base_channels(), lh, lw, band_tile_px());
       std::fprintf(stderr, "moss-infer-hip: exact band-tiled VAE: %s\n", plan.describe().c_str());
       return vae->decode_tiled_exact(out.latents.data(), lh, lw, out.rgb, plan);
     };
-    if (r.vae_tiled) {
+    if (r.vae_tiled || force_tiled) {
       vst = tiled();
     } else {
       try {

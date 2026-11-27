@@ -518,7 +518,7 @@ void int8_attn_run(const Int8AttnBuffers& b, bf16* out, std::int64_t ldo, int ma
 
 namespace mi::hip {
 
-void int8_attn_quantize(const i8attn_bf16*, std::int64_t, const Int8AttnBuffers&, int, std::size_t, hipStream_t) {
+void int8_attn_quantize(const i8attn_bf16*, std::int64_t, const Int8AttnBuffers&, int, hipStream_t, bool) {
   throw std::runtime_error("int8 attention needs a gfx11 int8 WMMA build");
 }
 void int8_attn_run(const Int8AttnBuffers&, i8attn_bf16*, std::int64_t, int, float, hipStream_t) {

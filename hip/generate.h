@@ -40,7 +40,7 @@ struct GenerateRequest {
   // ("reference") DiT does not allocate those buffers.
   bool int8_dit = true;
   bool decode = true;  // false: stop at the final latents
-  bool vae_tiled = false;  // --vae-tiled: decode in tiles; env controls geometry and band-vs-comfy mode
+  bool vae_tiled = false;  // --vae-tiled: decode in tiles; MI_HIP_VAE_BAND_TILE_PX sets the band height
   // Called with the final latents before the decode.
   std::function<void(const std::vector<float>& latents)> on_latents;
   // stage: "text encoder", "denoise", "vae"; done of total within it.

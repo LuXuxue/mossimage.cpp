@@ -52,7 +52,7 @@ __global__ __launch_bounds__(256) void gemm_tiled(const Bf16GemmArgs a) {
   const int tid = static_cast<int>(threadIdx.x);
   const int trow = tid / (BN / TN), tcol = tid % (BN / TN);
   const int orow = trow * TM, ocol = tcol * TN;
-  const int m0 = static_cast<int>(blockIdx.y) * BM, n0 = static_cast<int>(blockIdx.x) * BN;
+  const int m0 = (a.m_block0 + static_cast<int>(blockIdx.y)) * BM, n0 = static_cast<int>(blockIdx.x) * BN;
 
   // Eight bf16 per lane: one 16-byte global load and one 16-byte LDS write per row chunk instead of eight scalar
   // pairs. The LoRA delta GEMMs that use this kernel on RDNA2 are memory-staging bound.
@@ -196,7 +196,7 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_tiled(const Bf16
   const int rows = blocks_m - group * kGroupM < kGroupM ? blocks_m - group * kGroupM : kGroupM;
   const int mb = group * kGroupM + idx % rows;
   const int nb = idx / rows;
-  const int m0 = mb * BM, n0 = nb * BN;
+  const int m0 = (a.m_block0 + mb) * BM, n0 = nb * BN;
 
   v8f acc[TM][TN];
 #pragma unroll
@@ -278,7 +278,7 @@ void bf16_gemm_tiled(bf16* c, std::int64_t ldc, const bf16* a, std::int64_t lda,
                      const bf16* b, std::int64_t ldb, int m, int n, int k, hipStream_t stream,
                      const bf16* residual) {
   if (m == 0 || n == 0 || k == 0) return;
-  const Bf16GemmArgs args{a, b, c, residual, lda, ldb, ldc, m, n, k};
+  Bf16GemmArgs args{a, b, c, residual, lda, ldb, ldc, m, n, k};
   constexpr int kChunk = 4096;
   // The same template instantiation is launched on both architectures so the mangled kernel name exists in every
   // object of the fat binary. Only the grid and the thread count differ: RDNA2's body uses a 64x64 tile / 256 threads.
@@ -288,6 +288,7 @@ void bf16_gemm_tiled(bf16* c, std::int64_t ldc, const bf16* a, std::int64_t lda,
   const int gx = (m + tile - 1) / tile, gy = (n + tile - 1) / tile;
   for (int x0 = 0; x0 < gx; x0 += kChunk) {
     const int xn = x0 + kChunk < gx ? kChunk : gx - x0;
+    args.m_block0 = x0;
     dim3 grid(gy, xn, 1);
     if (rdna2) {
       gemm_tiled<128, 128, 128, 2, 2, 4, 4><<<grid, 256, 0, stream>>>(args);

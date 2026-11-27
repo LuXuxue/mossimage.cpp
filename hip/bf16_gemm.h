@@ -16,6 +16,7 @@ struct Bf16GemmArgs {
   const hip_block::bf16_bits* residual;  // optional [m, ldc], added before the bf16 store
   std::int64_t lda, ldb, ldc;
   int m, n, k;
+  int m_block0 = 0;  // first M block of this chunk when the grid is split over M
 };
 
 void bf16_gemm_tiled(hip_block::bf16_bits* c, std::int64_t ldc,

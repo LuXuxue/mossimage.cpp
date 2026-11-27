@@ -56,7 +56,8 @@ inline std::size_t int8_attn_bytes(int tokens, int batch) {
          padded * heads * sizeof(float) +      // q_scale
          (padded / 16u) * heads * sizeof(float) +  // k_scale
          heads * dim * sizeof(float) +         // v_scale
-         ((static_cast<std::size_t>(tokens) + 255u) / 256u) * heads * dim * sizeof(float);  // part
+         ((static_cast<std::size_t>(tokens) + 255u) / 256u) * heads * dim * sizeof(float) +  // part
+          (static_cast<std::size_t>(batch) + 1u) * sizeof(std::int32_t);  // cu_seqlens
 }
 
 // Sequence b starts at column seq_base(cu[b], b): cu rounded out to a 64-key tile plus a 64-key

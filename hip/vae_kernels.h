@@ -1,6 +1,7 @@
 // The FLUX.2 VAE decoder's kernels (vae_kernels.hip), at the engine's reference precision (DecodeMode::reference(),
 // kernels/vae/vae_kernels.h): fp32 NHWC activations, convolutions on TF32-rounded operands with fp32 accumulation,
-// fp32-exact attention linears, fp32-accurate attention, GroupNorm statistics from exact integer sums.
+// attention linears/scores/PV from two TF32 bf16 pieces by default (three for the exact fp32 path), GroupNorm
+// statistics from exact integer sums.
 //
 // The matrix products run on the backend's 16x16x16 bf16 leaf (mma_leaf.h), which multiplies bf16 values exactly into
 // fp32 accumulators. An fp32 operand becomes bf16 pieces whose sum is the operand: a TF32 value (11 significant bits) is
