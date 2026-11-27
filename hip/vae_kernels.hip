@@ -69,7 +69,7 @@ __device__ __forceinline__ void split(float v, std::uint16_t (&piece)[kPieces]) 
 
 // out[m, n] = (acc + bias[n]) + residual[m, n] for the tile's rows < m_end and columns < n_end, one 16 x 16 fragment at a
 // time through `epi`: thread t writes 8 columns of fragment row t / 2. bias, residual: null for none.
-template <int kNfT>
+template <int kNfT, bool kOutFp16 = false>
 __device__ __forceinline__ void store_tile_out(const FragAcc (&acc)[kMf][kNfT], float* epi, std::int64_t m_base, int n_base,
                                                std::int64_t m_end, int n_end, const float* bias, const float* residual,
                                                float* out, std::int64_t ldo) {
@@ -86,20 +86,38 @@ __device__ __forceinline__ void store_tile_out(const FragAcc (&acc)[kMf][kNfT], 
         float y[8];
         HIP_BLOCK_UNROLL
         for (int j = 0; j < 8; ++j) y[j] = epi[fr * kFrag + fc + j];
-        float* o = out + m * ldo + n0;
+        const std::int64_t off = m * ldo + n0;
         if (bias != nullptr) {
           HIP_BLOCK_UNROLL
           for (int j = 0; j < 8; ++j) y[j] = n0 + j < n_end ? add(y[j], bias[n0 + j]) : y[j];
         }
         if (residual != nullptr) {
-          const float* rr = residual + m * ldo + n0;
-          HIP_BLOCK_UNROLL
-          for (int j = 0; j < 8; ++j) y[j] = n0 + j < n_end ? add(y[j], rr[j]) : y[j];
+          if constexpr (kOutFp16) {
+            const std::uint16_t* rr = reinterpret_cast<const std::uint16_t*>(residual) + off;
+            HIP_BLOCK_UNROLL
+            for (int j = 0; j < 8; ++j) y[j] = n0 + j < n_end ? add(y[j], fh16(rr[j])) : y[j];
+          } else {
+            const float* rr = residual + off;
+            HIP_BLOCK_UNROLL
+            for (int j = 0; j < 8; ++j) y[j] = n0 + j < n_end ? add(y[j], rr[j]) : y[j];
+          }
         }
-        if (n0 + 8 <= n_end) {
+        if constexpr (kOutFp16) {
+          std::uint16_t ho[8];
+          HIP_BLOCK_UNROLL
+          for (int j = 0; j < 8; ++j) ho[j] = h16(y[j]);
+          std::uint16_t* o16 = reinterpret_cast<std::uint16_t*>(out) + off;
+          if (n0 + 8 <= n_end) {
+            *reinterpret_cast<uint4*>(o16) = *reinterpret_cast<const uint4*>(ho);
+          } else {
+            for (int j = 0; j < n_end - n0; ++j) o16[j] = ho[j];
+          }
+        } else if (n0 + 8 <= n_end) {
+          float* o = out + off;
           reinterpret_cast<float4*>(o)[0] = make_float4(y[0], y[1], y[2], y[3]);
           reinterpret_cast<float4*>(o)[1] = make_float4(y[4], y[5], y[6], y[7]);
         } else {
+          float* o = out + off;
           for (int j = 0; j < n_end - n0; ++j) o[j] = y[j];
         }
       }
@@ -134,7 +152,7 @@ struct ConvKernelArgs {
 };
 
 // The 16 values of A at row m (output pixel oy, ox), columns tap * c + ch .. + 16 of the im2col; 0 in the padding.
-template <int kTaps, bool kUpsample>
+template <int kTaps, bool kUpsample, bool kXFp16 = false>
 __device__ __forceinline__ void load_row(const ConvKernelArgs& a, bool row_ok, std::int64_t m, int oy, int ox, int tap,
                                          int ch, float (&v)[16]) {
   HIP_BLOCK_UNROLL
@@ -146,14 +164,27 @@ __device__ __forceinline__ void load_row(const ConvKernelArgs& a, bool row_ok, s
     if (iy < 0 || ix < 0 || iy >= a.h || ix >= a.wd) return;
     pix = kUpsample ? static_cast<std::int64_t>(iy >> 1) * (a.wd >> 1) + (ix >> 1) : static_cast<std::int64_t>(iy) * a.wd + ix;
   }
-  const float4* p = reinterpret_cast<const float4*>(a.x + pix * a.c + ch);
-  HIP_BLOCK_UNROLL
-  for (int q = 0; q < 4; ++q) {
-    const float4 f4 = p[q];
-    v[4 * q] = f4.x;
-    v[4 * q + 1] = f4.y;
-    v[4 * q + 2] = f4.z;
-    v[4 * q + 3] = f4.w;
+  if constexpr (kXFp16) {
+    const std::uint16_t* hx = reinterpret_cast<const std::uint16_t*>(a.x) + pix * a.c + ch;
+    const uint4 q0 = *reinterpret_cast<const uint4*>(hx);
+    const uint4 q1 = *reinterpret_cast<const uint4*>(hx + 8);
+    const auto* p0 = reinterpret_cast<const __half*>(&q0);
+    const auto* p1 = reinterpret_cast<const __half*>(&q1);
+    HIP_BLOCK_UNROLL
+    for (int i = 0; i < 8; ++i) {
+      v[i] = __half2float(p0[i]);
+      v[i + 8] = __half2float(p1[i]);
+    }
+  } else {
+    const float4* p = reinterpret_cast<const float4*>(a.x + pix * a.c + ch);
+    HIP_BLOCK_UNROLL
+    for (int q = 0; q < 4; ++q) {
+      const float4 f4 = p[q];
+      v[4 * q] = f4.x;
+      v[4 * q + 1] = f4.y;
+      v[4 * q + 2] = f4.z;
+      v[4 * q + 3] = f4.w;
+    }
   }
 }
 
@@ -179,7 +210,7 @@ __device__ __forceinline__ void stage_row(std::uint16_t (&stage)[kPieces][kTileM
 
 // kProducts: 4 (TF32, all), 3 (TF32 without lo x lo), 9 (fp32, all), 1 (fp16, one product). A stages through __shared__
 // memory, split as it is stored; the weight's pieces are packed fragments read from global memory.
-template <int kTaps, bool kUpsample, int kProducts>
+template <int kTaps, bool kUpsample, int kProducts, bool kXFp16 = false, bool kOutFp16 = false>
 __global__ __launch_bounds__(kWave) void conv_kernel(const ConvKernelArgs a) {
   constexpr bool kFp16 = kProducts == 1;
   constexpr int kPieces = kProducts == 9 ? 3 : (kFp16 ? 1 : 2);
@@ -207,7 +238,7 @@ __global__ __launch_bounds__(kWave) void conv_kernel(const ConvKernelArgs a) {
     }
   };
   float v[16];
-  load_row<kTaps, kUpsample>(a, row_ok, m, oy, ox, tap, ch, v);
+  load_row<kTaps, kUpsample, kXFp16>(a, row_ok, m, oy, ox, tap, ch, v);
   advance();
   stage_row<kPieces, kTf32, kFp16>(stage, t, v);
   leaf::pad_barrier();
@@ -218,7 +249,7 @@ __global__ __launch_bounds__(kWave) void conv_kernel(const ConvKernelArgs a) {
   for (int step = 0; step < steps; ++step) {
     const bool more = step + 1 < steps;
     if (more) {
-      load_row<kTaps, kUpsample>(a, row_ok, m, oy, ox, tap, ch, v);
+      load_row<kTaps, kUpsample, kXFp16>(a, row_ok, m, oy, ox, tap, ch, v);
       advance();
     }
     FragA fa[kPieces][kMf];
@@ -252,7 +283,7 @@ __global__ __launch_bounds__(kWave) void conv_kernel(const ConvKernelArgs a) {
       leaf::pad_barrier();
     }
   }
-  store_tile_out(acc, epi, m_base, n_tile * kConvTileN, a.m, a.n, a.bias, a.residual, a.out, a.ldo);
+  store_tile_out<kConvNf, kOutFp16>(acc, epi, m_base, n_tile * kConvTileN, a.m, a.n, a.bias, a.residual, a.out, a.ldo);
 }
 
 // conv_out: one output pixel per thread, n <= 4 accumulators, K ascending (tap, then channel).
@@ -263,8 +294,10 @@ struct NarrowArgs {
   float* out;
   std::int64_t m;
   int h, w_out, c, n;
-  bool fp16;  // operand roundings: fp16 instead of TF32
+  bool fp16;    // operand roundings: fp16 instead of TF32
+  bool x_fp16;  // x holds fp16 bits
 };
+template <bool kXFp16 = false>
 __global__ __launch_bounds__(kWave) void conv_narrow_kernel(const NarrowArgs a) {
   const std::int64_t m = static_cast<std::int64_t>(blockIdx.x) * kWave + thread_id();
   if (m >= a.m) return;
@@ -277,9 +310,19 @@ __global__ __launch_bounds__(kWave) void conv_narrow_kernel(const NarrowArgs a) 
     const float* xp = a.x + (static_cast<std::int64_t>(iy) * a.w_out + ix) * a.c;
     const float* wp = a.w + static_cast<std::int64_t>(tap) * a.c;
     for (int ch = 0; ch < a.c; ch += 4) {
-      const float4 x4 = *reinterpret_cast<const float4*>(xp + ch);
-      const float xv[4] = {a.fp16 ? fh16(h16(x4.x)) : tf32(x4.x), a.fp16 ? fh16(h16(x4.y)) : tf32(x4.y),
-                           a.fp16 ? fh16(h16(x4.z)) : tf32(x4.z), a.fp16 ? fh16(h16(x4.w)) : tf32(x4.w)};
+      float xv[4];
+      if constexpr (kXFp16) {
+        const std::uint16_t* xh = reinterpret_cast<const std::uint16_t*>(a.x) +
+                                  (static_cast<std::int64_t>(iy) * a.w_out + ix) * a.c + ch;
+        HIP_BLOCK_UNROLL
+        for (int q = 0; q < 4; ++q) xv[q] = fh16(xh[q]);
+      } else {
+        const float4 x4 = *reinterpret_cast<const float4*>(xp + ch);
+        xv[0] = a.fp16 ? fh16(h16(x4.x)) : tf32(x4.x);
+        xv[1] = a.fp16 ? fh16(h16(x4.y)) : tf32(x4.y);
+        xv[2] = a.fp16 ? fh16(h16(x4.z)) : tf32(x4.z);
+        xv[3] = a.fp16 ? fh16(h16(x4.w)) : tf32(x4.w);
+      }
       HIP_BLOCK_UNROLL
       for (int o = 0; o < 4; ++o) {
         if (o < a.n) {
@@ -300,9 +343,10 @@ struct SplitArgs {
   std::uint16_t* dst;
   std::int64_t stride;  // elements per piece
   int rows, cols, rows_pad, col_groups;
+  bool src_fp16;  // src holds fp16 bits
 };
 // One thread per (row, 16 columns) of the packed output; along rows first when transposed (coalesced reads).
-template <bool kTranspose, int kPieces = 3>
+template <bool kTranspose, int kPieces = 3, bool kSrcFp16 = false>
 __global__ __launch_bounds__(kWave) void split_pack_kernel(const SplitArgs a) {
   constexpr bool kFp16 = kPieces == 1;
   const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * kWave + thread_id();
@@ -317,7 +361,10 @@ __global__ __launch_bounds__(kWave) void split_pack_kernel(const SplitArgs a) {
     for (int e = 0; e < 2; ++e) {
       const int col = g * kFrag + 2 * c + e;
       float v = 0.0f;
-      if (r < a.rows && col < a.cols) v = kTranspose ? a.src[static_cast<std::int64_t>(col) * a.ld + r] : a.src[r * a.ld + col];
+      if (r < a.rows && col < a.cols) {
+        const std::int64_t at = kTranspose ? static_cast<std::int64_t>(col) * a.ld + r : r * a.ld + col;
+        v = kSrcFp16 ? fh16(reinterpret_cast<const std::uint16_t*>(a.src)[at]) : a.src[at];
+      }
       split<kPieces, false, kFp16>(v, p[e]);
     }
     HIP_BLOCK_UNROLL
@@ -340,10 +387,11 @@ struct PieceGemmArgs {
   float* out;
   std::int64_t ldo;
   int ksteps, m, n, n_tiles;
+  bool out_fp16;  // out holds fp16 bits
 };
 // Products i + j <= kMaxSum of kPieces pieces each, all operands packed fragments in global memory. The fp32-accurate
 // attention uses 3 pieces / kMaxSum 2 (6 products); the TF32 option uses 2 / 1 (3 products, dropping lo x lo).
-template <int kPieces = 3, int kMaxSum = 2>
+template <int kPieces = 3, int kMaxSum = 2, bool kOutFp16 = false>
 __global__ __launch_bounds__(kWave) void piece_gemm_kernel(const PieceGemmArgs g) {
   constexpr bool kFp16 = kPieces == 1;
   alignas(16) __shared__ float epi[kFrag * kFrag];
@@ -383,7 +431,7 @@ __global__ __launch_bounds__(kWave) void piece_gemm_kernel(const PieceGemmArgs g
       }
     }
   }
-  store_tile_out(acc, epi, m_base, n_tile * kTileN, g.m, g.n, nullptr, nullptr, g.out, g.ldo);
+  store_tile_out<kNf, kOutFp16>(acc, epi, m_base, n_tile * kTileN, g.m, g.n, nullptr, nullptr, g.out, g.ldo);
 }
 
 // The wave's 32 values reduced through red[] by a halving tree (lane t + off into lane t): max or sum.
@@ -528,17 +576,23 @@ struct GnAccumArgs {
   u64* acc;  // [32][6]: s_lo, s_hi, q0, q1, q2, bad
   std::int64_t pixels, ppc;
   int c, cpg;
+  bool x_fp16;  // x holds fp16 bits
 };
 // One chunk of ppc pixels per wave; lane g sums group g's channels (contiguous, so the wave reads whole pixels). Integer
 // sums: the order does not matter.
+template <bool kXFp16 = false>
 __global__ __launch_bounds__(kWave) void gn_accumulate_kernel(const GnAccumArgs a) {
   const int g = thread_id();
   const std::int64_t p0 = static_cast<std::int64_t>(blockIdx.x) * a.ppc;
   const std::int64_t p1 = p0 + a.ppc < a.pixels ? p0 + a.ppc : a.pixels;
   Lane l{{{0ull, 0ull}}, {{0ull, 0ull, 0ull}}, 0u};
   const float* xg = a.x + g * a.cpg;
+  const std::uint16_t* xg16 = reinterpret_cast<const std::uint16_t*>(a.x) + g * a.cpg;
   for (std::int64_t p = p0; p < p1; ++p) {
-    for (int j = 0; j < a.cpg; ++j) accumulate(l, xg[p * a.c + j]);
+    for (int j = 0; j < a.cpg; ++j) {
+      const std::int64_t at = p * a.c + j;
+      accumulate(l, kXFp16 ? fh16(xg16[at]) : xg[at]);
+    }
   }
   u64* w = a.acc + g * 6;
   // 128- and 192-bit adds from 64-bit atomics, each word's carry from the value the atomic returns.
@@ -601,12 +655,24 @@ struct GnApplyArgs {
   std::int64_t quads;
   int c, cpg, silu;
 };
+template <bool kXFp16 = false, bool kYFp16 = false>
 __global__ __launch_bounds__(kWave) void gn_apply_kernel(const GnApplyArgs a) {
   const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * kWave + thread_id();
   if (i >= a.quads) return;
   const int c0 = static_cast<int>(i % (a.c / 4)) * 4;
-  float4 v = reinterpret_cast<const float4*>(a.x)[i];
-  float r[4] = {v.x, v.y, v.z, v.w};
+  float r[4];
+  if constexpr (kXFp16) {
+    const uint2 q = reinterpret_cast<const uint2*>(a.x)[i];
+    const auto* h = reinterpret_cast<const __half*>(&q);
+    HIP_BLOCK_UNROLL
+    for (int j = 0; j < 4; ++j) r[j] = __half2float(h[j]);
+  } else {
+    const float4 v = reinterpret_cast<const float4*>(a.x)[i];
+    r[0] = v.x;
+    r[1] = v.y;
+    r[2] = v.z;
+    r[3] = v.w;
+  }
   HIP_BLOCK_UNROLL
   for (int j = 0; j < 4; ++j) {
     const int ch = c0 + j;
@@ -617,7 +683,12 @@ __global__ __launch_bounds__(kWave) void gn_apply_kernel(const GnApplyArgs a) {
     if (a.silu) y = silu_f32(y);
     r[j] = y;
   }
-  reinterpret_cast<float4*>(a.y)[i] = make_float4(r[0], r[1], r[2], r[3]);
+  if constexpr (kYFp16) {
+    const std::uint16_t ho[4] = {h16(r[0]), h16(r[1]), h16(r[2]), h16(r[3])};
+    reinterpret_cast<uint2*>(a.y)[i] = *reinterpret_cast<const uint2*>(ho);
+  } else {
+    reinterpret_cast<float4*>(a.y)[i] = make_float4(r[0], r[1], r[2], r[3]);
+  }
 }
 
 // ---- Pipeline ends ----------------------------------------------------------------------------------------------------
@@ -630,6 +701,7 @@ struct UnpackArgs {
   std::int64_t count;
   int h, w;
 };
+template <bool kYFp16 = false>
 __global__ __launch_bounds__(kWave) void latent_unpack_kernel(const UnpackArgs a) {
   const std::int64_t o = static_cast<std::int64_t>(blockIdx.x) * kWave + thread_id();
   if (o >= a.count) return;
@@ -638,7 +710,12 @@ __global__ __launch_bounds__(kWave) void latent_unpack_kernel(const UnpackArgs a
   const int ox = static_cast<int>(px % (2 * a.w)), oy = static_cast<int>(px / (2 * a.w));
   const int ch = 4 * c + 2 * (oy & 1) + (ox & 1);
   const float v = a.z[(static_cast<std::int64_t>(ch) * a.h + oy / 2) * a.w + ox / 2];
-  a.y[o] = add(mul(v, a.scale[ch]), a.mean[ch]);
+  const float y = add(mul(v, a.scale[ch]), a.mean[ch]);
+  if constexpr (kYFp16) {
+    reinterpret_cast<std::uint16_t*>(a.y)[o] = h16(y);
+  } else {
+    a.y[o] = y;
+  }
 }
 
 struct Rgb8Args {
@@ -730,9 +807,16 @@ void conv(const ConvArgs& a, Products products, hipStream_t stream) {
     cka.m0 = m0;
     const dim3 grid(grid_of((rows + kTileM - 1) / kTileM * cka.n_tiles, 1, "conv"));
     if (products == Products::kFp16) {
-      if (a.taps == 1) conv_kernel<1, false, 1><<<grid, block, 0, stream>>>(cka);
-      else if (a.upsample) conv_kernel<9, true, 1><<<grid, block, 0, stream>>>(cka);
-      else conv_kernel<9, false, 1><<<grid, block, 0, stream>>>(cka);
+      // The activation buffers are either all fp16 or all fp32 within one decode; x_fp16 selects which kernel to launch.
+      if (a.x_fp16) {
+        if (a.taps == 1) conv_kernel<1, false, 1, true, true><<<grid, block, 0, stream>>>(cka);
+        else if (a.upsample) conv_kernel<9, true, 1, true, true><<<grid, block, 0, stream>>>(cka);
+        else conv_kernel<9, false, 1, true, true><<<grid, block, 0, stream>>>(cka);
+      } else {
+        if (a.taps == 1) conv_kernel<1, false, 1><<<grid, block, 0, stream>>>(cka);
+        else if (a.upsample) conv_kernel<9, true, 1><<<grid, block, 0, stream>>>(cka);
+        else conv_kernel<9, false, 1><<<grid, block, 0, stream>>>(cka);
+      }
     } else if (products == Products::kFp32) {
       conv_kernel<1, false, 9><<<grid, block, 0, stream>>>(cka);
     } else if (a.taps == 1) {
@@ -750,47 +834,63 @@ void conv(const ConvArgs& a, Products products, hipStream_t stream) {
 }
 
 void conv_narrow(const float* x, const float* w_tf32, const float* bias, float* out, int h, int w, int c, int n,
-                 hipStream_t stream, bool fp16) {
+                 hipStream_t stream, bool fp16, bool x_fp16) {
   require(n >= 1 && n <= 4 && c > 0 && c % 4 == 0 && h > 0 && w > 0, "conv_narrow", "need 1 <= n <= 4, c a multiple of 4");
   require(aligned16(x), "conv_narrow", "x must be 16-byte aligned");
-  const NarrowArgs a{x, w_tf32, bias, out, static_cast<std::int64_t>(h) * w, h, w, c, n, fp16};
-  conv_narrow_kernel<<<dim3(grid_of(a.m, kWave, "conv_narrow")), dim3(kWave), 0, stream>>>(a);
+  const NarrowArgs a{x, w_tf32, bias, out, static_cast<std::int64_t>(h) * w, h, w, c, n, fp16, x_fp16};
+  const dim3 grid(grid_of(a.m, kWave, "conv_narrow"));
+  if (x_fp16) conv_narrow_kernel<true><<<grid, dim3(kWave), 0, stream>>>(a);
+  else conv_narrow_kernel<false><<<grid, dim3(kWave), 0, stream>>>(a);
   check_launch("conv_narrow");
 }
 
 void split_pack(const float* src, std::int64_t ld, bool transpose, int rows, int cols, std::uint16_t* dst, int rows_pad,
-                int cols_pad, hipStream_t stream, int pieces) {
+                int cols_pad, hipStream_t stream, int pieces, bool src_fp16) {
   require(rows_pad % kFrag == 0 && cols_pad % kFrag == 0 && rows <= rows_pad && cols <= cols_pad, "split_pack",
           "padded sizes must be multiples of 16 covering the operand");
   require(aligned16(dst), "split_pack", "dst must be 16-byte aligned");
   require(pieces == 1 || pieces == 2 || pieces == 3, "split_pack", "pieces must be 1, 2 or 3");
-  const SplitArgs a{src, ld, dst, static_cast<std::int64_t>(rows_pad) * cols_pad, rows, cols, rows_pad, cols_pad / kFrag};
+  const SplitArgs a{src, ld, dst, static_cast<std::int64_t>(rows_pad) * cols_pad, rows, cols, rows_pad, cols_pad / kFrag,
+                    src_fp16};
   const dim3 grid(grid_of(static_cast<std::int64_t>(rows_pad) * a.col_groups, kWave, "split_pack"));
-#define MI_SPLIT(T)                                                                                \
-  do {                                                                                             \
-    if (pieces == 1) split_pack_kernel<T, 1><<<grid, dim3(kWave), 0, stream>>>(a);                  \
-    else if (pieces == 2) split_pack_kernel<T, 2><<<grid, dim3(kWave), 0, stream>>>(a);              \
-    else split_pack_kernel<T, 3><<<grid, dim3(kWave), 0, stream>>>(a);                              \
+#define MI_SPLIT(T, S)                                                                              \
+  do {                                                                                              \
+    if (pieces == 1) split_pack_kernel<T, 1, S><<<grid, dim3(kWave), 0, stream>>>(a);                \
+    else if (pieces == 2) split_pack_kernel<T, 2, S><<<grid, dim3(kWave), 0, stream>>>(a);            \
+    else split_pack_kernel<T, 3, S><<<grid, dim3(kWave), 0, stream>>>(a);                            \
   } while (0)
-  if (transpose) MI_SPLIT(true);
-  else MI_SPLIT(false);
+  if (transpose) {
+    if (src_fp16) MI_SPLIT(true, true);
+    else MI_SPLIT(true, false);
+  } else {
+    if (src_fp16) MI_SPLIT(false, true);
+    else MI_SPLIT(false, false);
+  }
 #undef MI_SPLIT
   check_launch("split_pack");
 }
 
 void piece_gemm(const std::uint16_t* a, std::int64_t a_stride, const std::uint16_t* b, std::int64_t b_stride, int k_pad,
-                float* out, std::int64_t ldo, int m_rows, int n_cols, hipStream_t stream, int pieces) {
+                float* out, std::int64_t ldo, int m_rows, int n_cols, hipStream_t stream, int pieces, bool out_fp16) {
   require(k_pad > 0 && k_pad % kFrag == 0, "piece_gemm", "k_pad must be a positive multiple of 16");
   require(ldo >= n_cols && ldo % 4 == 0, "piece_gemm", "ldo must cover n and be a multiple of 4");
   require(aligned16(a) && aligned16(b) && aligned16(out), "piece_gemm", "pointers must be 16-byte aligned");
   require(pieces == 1 || pieces == 2 || pieces == 3, "piece_gemm", "pieces must be 1, 2 or 3");
   if (m_rows <= 0 || n_cols <= 0) return;
   const PieceGemmArgs g{a, a_stride, b, b_stride, out, ldo, k_pad / kFrag, m_rows, n_cols,
-                        static_cast<int>(round_up(n_cols, kTileN) / kTileN)};
+                        static_cast<int>(round_up(n_cols, kTileN) / kTileN), out_fp16};
   const dim3 grid(grid_of(static_cast<std::int64_t>(round_up(m_rows, kTileM) / kTileM) * g.n_tiles, 1, "piece_gemm"));
-  if (pieces == 1) piece_gemm_kernel<1, 0><<<grid, dim3(kWave), 0, stream>>>(g);
-  else if (pieces == 2) piece_gemm_kernel<2, 1><<<grid, dim3(kWave), 0, stream>>>(g);
-  else piece_gemm_kernel<3, 2><<<grid, dim3(kWave), 0, stream>>>(g);
+#define MI_GEMM(P, S, F) piece_gemm_kernel<P, S, F><<<grid, dim3(kWave), 0, stream>>>(g)
+  if (out_fp16) {
+    if (pieces == 1) MI_GEMM(1, 0, true);
+    else if (pieces == 2) MI_GEMM(2, 1, true);
+    else MI_GEMM(3, 2, true);
+  } else {
+    if (pieces == 1) MI_GEMM(1, 0, false);
+    else if (pieces == 2) MI_GEMM(2, 1, false);
+    else MI_GEMM(3, 2, false);
+  }
+#undef MI_GEMM
   check_launch("piece_gemm");
 }
 
@@ -814,13 +914,15 @@ void gn_accum_zero(void* accum, hipStream_t stream) {
   if (e != hipSuccess) throw std::runtime_error(std::string("hip_vae::gn_accum_zero: hipMemsetAsync: ") + hipGetErrorString(e));
 }
 
-void gn_accumulate(const float* x, std::int64_t pixels, int c, void* accum, hipStream_t stream) {
+void gn_accumulate(const float* x, std::int64_t pixels, int c, void* accum, hipStream_t stream, bool x_fp16) {
   require(c > 0 && c % kGroups == 0 && c <= 1024 && pixels > 0, "gn_accumulate", "c must be a multiple of 32 up to 1024");
   const int cpg = c / kGroups;
   require(pixels * cpg <= (std::int64_t{1} << 30), "gn_accumulate", "a group may hold up to 2^30 elements");
   const std::int64_t ppc = std::max<std::int64_t>(1, kGnChunkElems / c);
-  const GnAccumArgs aa{x, static_cast<u64*>(accum), pixels, ppc, c, cpg};
-  gn_accumulate_kernel<<<dim3(grid_of(pixels, ppc, "gn_accumulate")), dim3(kWave), 0, stream>>>(aa);
+  const GnAccumArgs aa{x, static_cast<u64*>(accum), pixels, ppc, c, cpg, x_fp16};
+  const dim3 grid(grid_of(pixels, ppc, "gn_accumulate"));
+  if (x_fp16) gn_accumulate_kernel<true><<<grid, dim3(kWave), 0, stream>>>(aa);
+  else gn_accumulate_kernel<false><<<grid, dim3(kWave), 0, stream>>>(aa);
   check_launch("gn_accumulate");
 }
 
@@ -832,29 +934,40 @@ void gn_finalize(void* accum, std::int64_t count_per_group, float eps, float* st
   check_launch("gn_finalize");
 }
 
-void group_norm_stats(const float* x, std::int64_t pixels, int c, float eps, void* accum, float* stats, hipStream_t stream) {
+void group_norm_stats(const float* x, std::int64_t pixels, int c, float eps, void* accum, float* stats, hipStream_t stream,
+                      bool x_fp16) {
   require(c > 0 && c % kGroups == 0 && c <= 1024 && pixels > 0, "group_norm_stats", "c must be a multiple of 32 up to 1024");
   const int cpg = c / kGroups;
   require(pixels * cpg <= (std::int64_t{1} << 30), "group_norm_stats", "a group may hold up to 2^30 elements");
   gn_accum_zero(accum, stream);
-  gn_accumulate(x, pixels, c, accum, stream);
+  gn_accumulate(x, pixels, c, accum, stream, x_fp16);
   gn_finalize(accum, pixels * cpg, eps, stats, stream);
 }
 
 void group_norm_apply(const float* x, float* y, std::int64_t pixels, int c, const float* stats, const float* gamma,
-                      const float* beta, bool silu, hipStream_t stream) {
+                      const float* beta, bool silu, hipStream_t stream, bool x_fp16, bool y_fp16) {
   require(c > 0 && c % kGroups == 0 && c % 4 == 0, "group_norm_apply", "c must be a multiple of 32");
   require(aligned16(x) && aligned16(y), "group_norm_apply", "x and y must be 16-byte aligned");
   const GnApplyArgs a{x, y, stats, gamma, beta, pixels * c / 4, c, c / kGroups, silu ? 1 : 0};
   if (a.quads == 0) return;
-  gn_apply_kernel<<<dim3(grid_of(a.quads, kWave, "group_norm_apply")), dim3(kWave), 0, stream>>>(a);
+  const dim3 grid(grid_of(a.quads, kWave, "group_norm_apply"));
+  if (x_fp16) {
+    if (y_fp16) gn_apply_kernel<true, true><<<grid, dim3(kWave), 0, stream>>>(a);
+    else gn_apply_kernel<true, false><<<grid, dim3(kWave), 0, stream>>>(a);
+  } else {
+    if (y_fp16) gn_apply_kernel<false, true><<<grid, dim3(kWave), 0, stream>>>(a);
+    else gn_apply_kernel<false, false><<<grid, dim3(kWave), 0, stream>>>(a);
+  }
   check_launch("group_norm_apply");
 }
 
-void latent_unpack(const float* z, const float* scale, const float* mean, float* y, int h, int w, hipStream_t stream) {
+void latent_unpack(const float* z, const float* scale, const float* mean, float* y, int h, int w, hipStream_t stream,
+                   bool y_fp16) {
   require(h > 0 && w > 0, "latent_unpack", "empty latent grid");
   const UnpackArgs a{z, scale, mean, y, 128ll * h * w, h, w};
-  latent_unpack_kernel<<<dim3(grid_of(a.count, kWave, "latent_unpack")), dim3(kWave), 0, stream>>>(a);
+  const dim3 grid(grid_of(a.count, kWave, "latent_unpack"));
+  if (y_fp16) latent_unpack_kernel<true><<<grid, dim3(kWave), 0, stream>>>(a);
+  else latent_unpack_kernel<false><<<grid, dim3(kWave), 0, stream>>>(a);
   check_launch("latent_unpack");
 }
 
