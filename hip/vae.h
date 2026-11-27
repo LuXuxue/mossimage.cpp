@@ -110,8 +110,7 @@ class VaeDecoder {
   std::unique_ptr<Weights> weights_;
   int base_ = 0;
   hip_vae::Products conv_products_ = hip_vae::Products::kTf32;
-  bool fp16_ = false;      // fp16 operands, chosen from this decoder's device at construction
-  bool fp16_act_ = false;  // fp16 activation storage
+  int act_fmt_ = 0;  // activation storage: 0 = fp32, 1 = fp16 bits, 2 = bf16 bits (set with the operand mode)
   bool profile_ = false;
 };
 

@@ -71,7 +71,7 @@ list(APPEND MI_HIP_WARN -ffp-contract=off)
 # DiT's other ops; te_kernels.hip the text encoder's; vae_kernels.hip the VAE decoder's.
 set(MI_HIP_KERNELS block_kernels.hip dit_kernels.hip te_kernels.hip te_dequant.hip vae_kernels.hip int8_gemm.hip rotate_quantize.hip
                     int8_block.hip int8_attn.hip bf16_gemm.hip lora.hip sage_attn_gfx103x.hip)
-set(MI_HIP_KERNEL_HEADERS device_math.h dit_kernels.h gemm_tile.h hip_block.h mma_leaf.h te_kernels.h vae_kernels.h
+set(MI_HIP_KERNEL_HEADERS device_math.h dit_kernels.h gemm_tile.h hip_block.h mma_leaf.h bf16_leaf.h te_kernels.h vae_kernels.h
                            int8_leaf.h int8_block.h int8_gemm.h int8_attn.h bf16_gemm.h lora.h sage_attn_gfx103x.h)
 set(MI_HIP_HOST runtime.cpp safetensors.cpp dit.cpp text_encoder.cpp vae.cpp generate.cpp lora.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../src/weights/quant/quant_codec.cpp)

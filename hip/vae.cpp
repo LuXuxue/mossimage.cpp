@@ -22,22 +22,50 @@ namespace {
 
 using hip_vae::Products;
 
-// The VAE's operand precision, chosen once when a decoder is constructed (gfx1035 defaults to fp16). The static
-// workspace/planner helpers call layout()/attn_pieces() without a decoder, so keep the choice process-global.
-bool& vae_fp16_flag() {
-  static bool fp16 = false;
-  return fp16;
-}
-bool vae_fp16() { return vae_fp16_flag(); }
+// Activation buffer element types. Both 16-bit modes hold uint16 bits, but they are distinct types so the decode's
+// template dispatch can select the right rounding at every kernel boundary. sizeof stays 2 so Act* arithmetic matches
+// the device buffers the host allocates.
+struct fp16_bits {
+  std::uint16_t v;
+};
+struct bf16_bits {
+  std::uint16_t v;
+};
+static_assert(sizeof(fp16_bits) == 2 && sizeof(bf16_bits) == 2, "16-bit activation tags");
 
-// fp16 activation storage: keeps every activation buffer (and the convolutions' inputs and outputs) in fp16, halving
-// their bandwidth. Accumulation, GroupNorm statistics and the final RGB8 conversion stay fp32. It is on by default
-// wherever the fp16 operand path is; MI_HIP_VAE_FP16_ACT=0 restores fp32 activations for comparison.
-bool& vae_fp16_act_flag() {
-  static bool act = false;
-  return act;
+template <class Act>
+struct ActFmtOf {
+  static constexpr int value = 0;
+};
+template <>
+struct ActFmtOf<fp16_bits> {
+  static constexpr int value = 1;
+};
+template <>
+struct ActFmtOf<bf16_bits> {
+  static constexpr int value = 2;
+};
+inline int round_of(Products p) { return p == Products::kFp16 ? 1 : (p == Products::kBf16 ? 2 : 0); }
+
+// The VAE's operand precision, chosen once when a decoder is constructed (gfx1035 defaults to fp16, gfx11 to bf16).
+// The static workspace/planner helpers call layout()/attn_pieces() without a decoder, so keep the choice process-global.
+int& vae_round_flag() {
+  static int round = 0;
+  return round;
 }
-bool vae_fp16_act() { return vae_fp16_act_flag(); }
+int vae_round() { return vae_round_flag(); }
+bool vae_fp16() { return vae_round() == 1; }
+bool vae_bf16() { return vae_round() == 2; }
+
+// 16-bit activation storage: keeps every activation buffer (and the convolutions' inputs and outputs) in the operand's
+// 16-bit format, halving their bandwidth. Accumulation, GroupNorm statistics and RGB8 stay fp32. On by default wherever
+// a 16-bit operand path is; MI_HIP_VAE_FP16_ACT / MI_HIP_VAE_BF16_ACT = 0 restores fp32 activations.
+int& vae_act_fmt_flag() {
+  static int fmt = 0;
+  return fmt;
+}
+int vae_act_fmt() { return vae_act_fmt_flag(); }
+bool vae_fp16_act() { return vae_act_fmt() != 0; }
 
 constexpr float kResnetEps = 1e-6f;
 constexpr float kBatchNormEps = 1e-4f;  // vae.config.batch_norm_eps
@@ -90,7 +118,7 @@ namespace {
 // Host image of the weight buffer: tensors at 256-byte offsets.
 class Packer {
  public:
-  explicit Packer(const st::File& file, bool fp16) : file_(file), fp16_(fp16) {}
+  explicit Packer(const st::File& file, Products products) : file_(file), products_(products) {}
 
   template <class T>
   std::uint64_t add(const std::vector<T>& v) {
@@ -120,11 +148,15 @@ class Packer {
     cv.c = c;
     cv.r = r;
     if (narrow) {
-      for (float& v : krsc)
-        v = fp16_ ? hip_vae::host_fp16_value(hip_vae::host_fp16_bits(v)) : hip_vae::host_tf32(v);
+      if (products_ == Products::kFp16)
+        for (float& v : krsc) v = hip_vae::host_fp16_value(hip_vae::host_fp16_bits(v));
+      else if (products_ == Products::kBf16)
+        for (float& v : krsc) v = hip_vae::host_bf16_value(hip_vae::host_bf16_bits(v));
+      else
+        for (float& v : krsc) v = hip_vae::host_tf32(v);
       cv.w = add(krsc);
     } else {
-      cv.w = add(packed(krsc, k, static_cast<int>(taps) * c, fp16_ ? Products::kFp16 : Products::kTf32));
+      cv.w = add(packed(krsc, k, static_cast<int>(taps) * c, products_));
     }
     cv.b = add(read(p + ".bias", {k}));
     return cv;
@@ -156,7 +188,7 @@ class Packer {
 
  private:
   const st::File& file_;
-  bool fp16_;
+  Products products_;
   std::vector<char> data_;
 };
 
@@ -226,7 +258,7 @@ double gib(std::uint64_t b) { return static_cast<double>(b) / (1024.0 * 1024.0 *
 // fp16 mode uses one fp16 operand per product; otherwise attention packs 2 TF32 bf16 pieces by default (3 instead of
 // 6 GEMM products). MI_HIP_VAE_ATTN_PIECES=3 restores the exact 3-piece path.
 int attn_pieces() {
-  if (vae_fp16()) return 1;
+  if (vae_round() != 0) return 1;
   if (const char* s = std::getenv("MI_HIP_VAE_ATTN_PIECES")) {
     const int v = std::atoi(s);
     if (v == 2 || v == 3) return v;
@@ -280,7 +312,7 @@ std::string dims(int h, int w) { return " @" + std::to_string(h) + "x" + std::to
 template <class Act>
 class Run {
  public:
-  static constexpr bool kAct16 = std::is_same_v<Act, std::uint16_t>;
+  static constexpr int kActFmt = ActFmtOf<Act>::value;
   Run(const VaeDecoder::Weights& w, Ops& ops, hipStream_t stream, Products products, void* accum, float* stats)
       : w_(w), ops_(ops), stream_(stream), products_(products), accum_(accum), stats_(stats) {}
 
@@ -291,8 +323,8 @@ class Run {
     a.bias = w_.f32(cv.b);
     a.residual = reinterpret_cast<const float*>(residual);
     a.out = reinterpret_cast<float*>(y);
-    a.x_fp16 = kAct16;
-    a.out_fp16 = kAct16;
+    a.x_fmt = kActFmt;
+    a.out_fmt = kActFmt;
     a.ldo = cv.k;
     a.h = h;
     a.w_out = w;
@@ -307,11 +339,11 @@ class Run {
   void norm(const Norm& n, const Act* x, std::int64_t pixels, Act* y, bool silu) {
     const std::string shape = " " + std::to_string(n.c) + " ch, " + std::to_string(pixels) + " px";
     ops_.run("group_norm stats" + shape, [&] {
-      hip_vae::group_norm_stats(reinterpret_cast<const float*>(x), pixels, n.c, kResnetEps, accum_, stats_, stream_, kAct16);
+      hip_vae::group_norm_stats(reinterpret_cast<const float*>(x), pixels, n.c, kResnetEps, accum_, stats_, stream_, kActFmt);
     });
     ops_.run(std::string(silu ? "group_norm+silu apply" : "group_norm apply") + shape, [&] {
       hip_vae::group_norm_apply(reinterpret_cast<const float*>(x), reinterpret_cast<float*>(y), pixels, n.c, stats_,
-                                w_.f32(n.gamma), w_.f32(n.beta), silu, stream_, kAct16, kAct16);
+                                w_.f32(n.gamma), w_.f32(n.beta), silu, stream_, kActFmt, kActFmt);
     });
   }
   // ResnetBlock2D: returns the buffer holding the output, x or a.
@@ -344,15 +376,16 @@ class Run {
     norm(w_.attn_norm, x, l.l, xn, false);
     linear("attention qkv", w_.qkv, xn, len, qkv, nullptr);
     const int pcs = attn_pieces();
+    const int round = round_of(products_);
     // A stride is the size of *one* packed piece; the buffer holds `pcs` pieces at that stride.
     const std::int64_t q_stride = l.l_rows * mid, k_stride = l.l_cols * mid, v_stride = l.mid_cols * l.l_k;
     ops_.run("attention split q, k, v", [&] {
       hip_vae::split_pack(reinterpret_cast<const float*>(qkv), 3 * mid, false, len, mid, qp, static_cast<int>(l.l_rows), mid,
-                          stream_, pcs, kAct16);
+                          stream_, pcs, kActFmt, round);
       hip_vae::split_pack(reinterpret_cast<const float*>(qkv + mid), 3 * mid, false, len, mid, kp, static_cast<int>(l.l_cols),
-                          mid, stream_, pcs, kAct16);
+                          mid, stream_, pcs, kActFmt, round);
       hip_vae::split_pack(reinterpret_cast<const float*>(qkv + 2 * mid), 3 * mid, true, mid, len, vtp,
-                          static_cast<int>(l.mid_cols), static_cast<int>(l.l_k), stream_, pcs, kAct16);
+                          static_cast<int>(l.mid_cols), static_cast<int>(l.l_k), stream_, pcs, kActFmt, round);
     });
     // SDPA's scale as the engine forms it: 1 / sqrt(E) in fp32.
     const float scale = 1.0f / std::sqrt(static_cast<float>(mid));
@@ -361,13 +394,16 @@ class Run {
     for (int r0 = 0; r0 < len; r0 += l.slab) {
       const int rows = std::min(l.slab, len - r0);
       ops_.run("attention scores", [&] {
-        hip_vae::piece_gemm(qp + static_cast<std::int64_t>(r0) * mid, q_stride, kp, k_stride, mid, scores, l.l_k, rows, len, stream_, pcs);
+        hip_vae::piece_gemm(qp + static_cast<std::int64_t>(r0) * mid, q_stride, kp, k_stride, mid, scores, l.l_k, rows, len,
+                            stream_, pcs, 0, round);
       });
-      ops_.run("attention softmax", [&] { hip_vae::softmax_pack(scores, l.l_k, rows, len, scale, pp, p_stride, static_cast<int>(l.l_k), stream_, pcs); });
+      ops_.run("attention softmax", [&] {
+        hip_vae::softmax_pack(scores, l.l_k, rows, len, scale, pp, p_stride, static_cast<int>(l.l_k), stream_, pcs, round);
+      });
       ops_.run("attention P V", [&] {
         hip_vae::piece_gemm(pp, p_stride, vtp, v_stride, static_cast<int>(l.l_k),
                             reinterpret_cast<float*>(o + static_cast<std::int64_t>(r0) * mid), mid, rows,
-                            mid, stream_, pcs, kAct16);
+                            mid, stream_, pcs, kActFmt, round);
       });
     }
     // The reference order: round(to_out(o) + bias), then + residual.
@@ -383,15 +419,15 @@ class Run {
     a.bias = w_.f32(cv.b);
     a.residual = reinterpret_cast<const float*>(residual);
     a.out = reinterpret_cast<float*>(out);
-    a.x_fp16 = kAct16;
-    a.out_fp16 = kAct16;
+    a.x_fmt = kActFmt;
+    a.out_fmt = kActFmt;
     a.ldo = cv.k;
     a.h = 1;
     a.w_out = rows;
     a.c = cv.c;
     a.n = cv.k;
     a.taps = 1;
-    const Products p = products_ == Products::kFp16 ? Products::kFp16 : Products::kFp32;
+    const Products p = round_of(products_) != 0 ? products_ : Products::kFp32;
     ops_.run(name, [&] { hip_vae::conv(a, p, stream_); });
   }
 
@@ -416,7 +452,7 @@ void run_head_ops(const VaeDecoder::Weights& wt, Ops& ops, Products products, hi
   Act* pq = reinterpret_cast<Act*>(scratch + half);
   ops.run("latent unpack", [&] {
     hip_vae::latent_unpack(z, wt.f32(wt.bn_scale), wt.f32(wt.bn_mean), reinterpret_cast<float*>(unpacked),
-                           static_cast<int>(h), static_cast<int>(w), stream, Run<Act>::kAct16);
+                           static_cast<int>(h), static_cast<int>(w), stream, Run<Act>::kActFmt);
   });
   run.conv(wt.post_quant, unpacked, hh, ww, pq);
   run.conv(wt.conv_in, pq, hh, ww, p);
@@ -429,7 +465,7 @@ void run_head_ops(const VaeDecoder::Weights& wt, Ops& ops, Products products, hi
 template <class Act>
 VaeDecodeStats decode_impl(const VaeDecoder::Weights& wt, Products products, bool profile, int c, const float* latents,
                            std::uint32_t h, std::uint32_t w, std::vector<std::uint8_t>& rgb, std::vector<float>* image) {
-  constexpr bool kAct16 = std::is_same_v<Act, std::uint16_t>;
+  constexpr int kActFmt = ActFmtOf<Act>::value;
   const int mid = 4 * c;
   const Layout l = layout(c, h, w);
   const int hh = static_cast<int>(2 * h), ww = static_cast<int>(2 * w), H = static_cast<int>(16 * h), W = static_cast<int>(16 * w);
@@ -459,7 +495,7 @@ VaeDecodeStats decode_impl(const VaeDecoder::Weights& wt, Products products, boo
   Act* pq = at(r1, half);
   ops.run("latent unpack", [&] {
     hip_vae::latent_unpack(z.as<float>(), wt.f32(wt.bn_scale), wt.f32(wt.bn_mean), reinterpret_cast<float*>(unpacked),
-                           static_cast<int>(h), static_cast<int>(w), stream.get(), kAct16);
+                           static_cast<int>(h), static_cast<int>(w), stream.get(), kActFmt);
   });
   run.conv(wt.post_quant, unpacked, hh, ww, pq);
   run.conv(wt.conv_in, pq, hh, ww, p);
@@ -490,7 +526,7 @@ VaeDecodeStats decode_impl(const VaeDecoder::Weights& wt, Products products, boo
   float* rgb_src = cout.as<float>();
   ops.run("conv_out 3x3" + dims(ch, cw), [&] {
     hip_vae::conv_narrow(reinterpret_cast<const float*>(p), wt.f32(wt.conv_out.w), wt.f32(wt.conv_out.b),
-                         rgb_src, ch, cw, c, 3, stream.get(), products == Products::kFp16, kAct16);
+                         rgb_src, ch, cw, c, 3, stream.get(), round_of(products), kActFmt);
   });
   const std::int64_t n = static_cast<std::int64_t>(H) * W * 3;
   ops.run("rgb8", [&] { hip_vae::rgb8(rgb_src, out.as<std::uint8_t>(), n, stream.get()); });
@@ -521,22 +557,30 @@ VaeDecoder::VaeDecoder(Device& device, const std::filesystem::path& path) : devi
   require(base_ % 32 == 0, "decoder widths must be multiples of 32");
   const int c = base_, mid = 4 * c;
   Weights& w = *weights_;
-  // gfx1035 has no bf16 arithmetic: the default TF32 path needs four fp16 dot products per MAC. One fp16-rounded
-  // operand needs one, which is much faster and is how ComfyUI's --fp16-vae runs. MI_HIP_VAE_FP16=0 keeps the old path.
-  // Ask this decoder's device, not whichever device happens to be current (the process may hold several).
-  const bool rdna2 = device_.info().arch.compare(0, 6, "gfx103") == 0;
+  // gfx1035 has no bf16 arithmetic: the TF32 path would need four fp16 dot products per MAC, so it defaults to one
+  // fp16-rounded operand (ComfyUI's --fp16-vae). gfx11/gfx12 have native bf16 WMMA, so they default to one bf16 operand
+  // instead of four bf16 pieces; the leaf is the raw __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32, not rocWMMA.
+  // MI_HIP_VAE_FP16=0 / MI_HIP_VAE_BF16=0 restore the exact TF32 path. Ask this decoder's device, not whichever device
+  // happens to be current (the process may hold several).
+  const std::string arch = device_.info().arch;
+  const bool rdna2 = arch.compare(0, 6, "gfx103") == 0;
+  const bool matrix = arch.compare(0, 5, "gfx11") == 0 || arch.compare(0, 5, "gfx12") == 0;
   const char* fp16_env = std::getenv("MI_HIP_VAE_FP16");
-  const bool fp16 = fp16_env != nullptr ? std::strcmp(fp16_env, "0") != 0 : rdna2;
+  const char* bf16_env = std::getenv("MI_HIP_VAE_BF16");
+  const auto off = [](const char* s) { return s != nullptr && std::strcmp(s, "0") == 0; };
+  const bool fp16 = !off(fp16_env) && fp16_env != nullptr;
+  const bool bf16 = !fp16 && !off(bf16_env) && (bf16_env != nullptr || matrix);
   if (fp16 && !rdna2) throw std::runtime_error("hip vae: MI_HIP_VAE_FP16 needs a gfx103x (RDNA2) device");
-  const char* act_env = std::getenv("MI_HIP_VAE_FP16_ACT");
-  const bool act = act_env != nullptr ? std::strcmp(act_env, "0") != 0 : fp16;
-  if (act && !fp16) throw std::runtime_error("hip vae: MI_HIP_VAE_FP16_ACT needs the fp16 operand path");
-  fp16_ = fp16;
-  fp16_act_ = act;
-  vae_fp16_flag() = fp16;
-  vae_fp16_act_flag() = act;
-  conv_products_ = fp16 ? Products::kFp16 : Products::kTf32;
-  Packer pk(file, fp16);
+  if (bf16 && !matrix) throw std::runtime_error("hip vae: MI_HIP_VAE_BF16 needs a gfx11/gfx12 device");
+  const Products products = fp16 ? Products::kFp16 : (bf16 ? Products::kBf16 : Products::kTf32);
+  const int round = round_of(products);
+  const char* act_env = std::getenv(round == 1 ? "MI_HIP_VAE_FP16_ACT" : "MI_HIP_VAE_BF16_ACT");
+  const int act = round != 0 && !off(act_env) ? round : 0;
+  act_fmt_ = act;
+  vae_round_flag() = round;
+  vae_act_fmt_flag() = act;
+  conv_products_ = products;
+  Packer pk(file, products);
 
   const std::vector<float> mean = pk.read("bn.running_mean", {128}), var = pk.read("bn.running_var", {128});
   std::vector<float> scale(128);
@@ -556,7 +600,7 @@ VaeDecoder::VaeDecoder(Device& device, const std::filesystem::path& path) : devi
       wqkv.insert(wqkv.end(), wt.begin(), wt.end());
       bqkv.insert(bqkv.end(), bt.begin(), bt.end());
     }
-    const Products ap = fp16 ? Products::kFp16 : Products::kFp32;
+    const Products ap = round != 0 ? products : Products::kFp32;
     w.qkv = Conv{pk.add(Packer::packed(wqkv, 3 * mid, mid, ap)), pk.add(bqkv), 3 * mid, mid, 1};
     const std::vector<float> wo = pk.read(a + "to_out.0.weight", {mid, mid});
     w.attn_out = Conv{pk.add(Packer::packed(wo, mid, mid, ap)), pk.add(pk.read(a + "to_out.0.bias", {mid})), mid, mid, 1};
@@ -598,9 +642,9 @@ void VaeDecoder::require_fits(std::uint32_t h, std::uint32_t w) const {
 }
 
 void VaeDecoder::set_conv_products(Products products) {
-  require(products != Products::kFp32, "the convolutions' weights are packed for FP16/TF32 products");
-  require((conv_products_ == Products::kFp16) == (products == Products::kFp16),
-          "fp16 and TF32-packed weights cannot be mixed; set MI_HIP_VAE_FP16 before constructing the decoder");
+  require(products != Products::kFp32, "the convolutions' weights are packed for FP16/BF16/TF32 products");
+  require(round_of(conv_products_) == round_of(products),
+          "different operand formats cannot be mixed; set MI_HIP_VAE_FP16/BF16 before constructing the decoder");
   conv_products_ = products;
 }
 
@@ -610,12 +654,16 @@ VaeDecodeStats VaeDecoder::decode(const float* latents, std::uint32_t h, std::ui
   device_.make_current();
   // The layout/planner helpers are static and read process-global mode flags. Reassert this decoder's mode so using two
   // decoders in one process cannot make one decode with the other's activation storage or attention pieces.
-  vae_fp16_flag() = fp16_;
-  vae_fp16_act_flag() = fp16_act_;
+  vae_round_flag() = round_of(conv_products_);
+  vae_act_fmt_flag() = act_fmt_;
   require_fits(h, w);
-  VaeDecodeStats st =
-      vae_fp16_act() ? decode_impl<std::uint16_t>(*weights_, conv_products_, profile_, base_, latents, h, w, rgb, image)
-                     : decode_impl<float>(*weights_, conv_products_, profile_, base_, latents, h, w, rgb, image);
+  VaeDecodeStats st;
+  if (act_fmt_ == 2)
+    st = decode_impl<bf16_bits>(*weights_, conv_products_, profile_, base_, latents, h, w, rgb, image);
+  else if (act_fmt_ == 1)
+    st = decode_impl<fp16_bits>(*weights_, conv_products_, profile_, base_, latents, h, w, rgb, image);
+  else
+    st = decode_impl<float>(*weights_, conv_products_, profile_, base_, latents, h, w, rgb, image);
   st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   return st;
 }
@@ -1077,7 +1125,7 @@ namespace {
 template <class Act>
 class TiledRunner {
  public:
-  static constexpr bool kAct16 = std::is_same_v<Act, std::uint16_t>;
+  static constexpr int kActFmt = ActFmtOf<Act>::value;
   TiledRunner(const VaeDecoder::Weights& wt, Ops& ops, Products products, hipStream_t stream, const Geometry& g,
               const Units& units, char* block, std::size_t block_bytes, std::array<char*, 3> bufs, void* accum,
               float* stats, std::uint8_t* rgb, float* image, float* cout)
@@ -1106,7 +1154,7 @@ class TiledRunner {
         hip_vae::gn_accum_zero(accum_, stream_);
         if (t.direct) {
           hip_vae::gn_accumulate(reinterpret_cast<const float*>(in), g_.rows(si.in_level) * g_.cols(si.in_level), si.in_ch,
-                                 accum_, stream_, kAct16);
+                                 accum_, stream_, kActFmt);
         } else {
           for (std::int64_t j = 0; j < n; ++j) {
             const Band bd = band(g_, si, band_rows, j);
@@ -1181,7 +1229,7 @@ class TiledRunner {
     const std::int64_t a = t.o0 >> d, b = t.o1 >> d;
     require(a >= t.row0 && b <= t.row0 + t.rows, "internal: tile band outside its buffer");
     const std::size_t off = static_cast<std::size_t>(a - t.row0) * static_cast<std::size_t>(g_.cols(level) * ch);
-    hip_vae::gn_accumulate(reinterpret_cast<const float*>(x + off), (b - a) * g_.cols(level), ch, accum_, stream_, kAct16);
+    hip_vae::gn_accumulate(reinterpret_cast<const float*>(x + off), (b - a) * g_.cols(level), ch, accum_, stream_, kActFmt);
   }
   bool norm(Tile& t, const Act* x, const Norm& n, bool silu, Act* y, int level, int ch) {
     const int k = t.gn_next++;
@@ -1195,7 +1243,7 @@ class TiledRunner {
       finalize(k, level, ch);
     }
     hip_vae::group_norm_apply(reinterpret_cast<const float*>(x), reinterpret_cast<float*>(y), t.rows * g_.cols(level), ch,
-                              stats(k), wt_.f32(n.gamma), wt_.f32(n.beta), silu, stream_, kAct16, kAct16);
+                              stats(k), wt_.f32(n.gamma), wt_.f32(n.beta), silu, stream_, kActFmt, kActFmt);
     return true;
   }
   void conv(const Conv& cv, const Act* x, Act* y, int h, int w, const Act* residual = nullptr,
@@ -1206,8 +1254,8 @@ class TiledRunner {
     a.bias = wt_.f32(cv.b);
     a.residual = reinterpret_cast<const float*>(residual);
     a.out = reinterpret_cast<float*>(y);
-    a.x_fp16 = kAct16;
-    a.out_fp16 = kAct16;
+    a.x_fmt = kActFmt;
+    a.out_fmt = kActFmt;
     a.ldo = cv.k;
     a.h = h;
     a.w_out = w;
@@ -1264,7 +1312,7 @@ class TiledRunner {
         ops_.run("tile conv_out" + dims(static_cast<int>(t.rows), cols), [&] {
           hip_vae::conv_narrow(reinterpret_cast<const float*>(xt), wt_.f32(wt_.conv_out.w), wt_.f32(wt_.conv_out.b), o,
                                static_cast<int>(t.rows), cols, wt_.conv_out.c, 3, stream_,
-                               products_ == Products::kFp16, kAct16);
+                               round_of(products_), kActFmt);
         });
         t.x = (t.x + 1) % 3;
         return true;
@@ -1383,8 +1431,8 @@ VaeDecodeStats VaeDecoder::decode_tiled_exact(const float* latents, std::uint32_
   const auto t0 = std::chrono::steady_clock::now();
   const int c = base_;
   device_.make_current();
-  vae_fp16_flag() = fp16_;
-  vae_fp16_act_flag() = fp16_act_;
+  vae_round_flag() = round_of(conv_products_);
+  vae_act_fmt_flag() = act_fmt_;
   const Layout l = layout(c, h, w);  // validates the latent grid
   require(plan.height == h && plan.width == w && plan.base_channels == c,
           "tile plan was made for another latent grid or decoder width");
@@ -1411,11 +1459,13 @@ VaeDecodeStats VaeDecoder::decode_tiled_exact(const float* latents, std::uint32_
                   static_cast<double>(free) / (1u << 30));
     throw std::runtime_error(msg);
   }
-  VaeDecodeStats st =
-      vae_fp16_act() ? tiled_impl<std::uint16_t>(*weights_, conv_products_, profile_, c, latents, h, w, rgb, plan, image, l,
-                                                 ws_bytes)
-                     : tiled_impl<float>(*weights_, conv_products_, profile_, c, latents, h, w, rgb, plan, image, l,
-                                         ws_bytes);
+  VaeDecodeStats st;
+  if (act_fmt_ == 2)
+    st = tiled_impl<bf16_bits>(*weights_, conv_products_, profile_, c, latents, h, w, rgb, plan, image, l, ws_bytes);
+  else if (act_fmt_ == 1)
+    st = tiled_impl<fp16_bits>(*weights_, conv_products_, profile_, c, latents, h, w, rgb, plan, image, l, ws_bytes);
+  else
+    st = tiled_impl<float>(*weights_, conv_products_, profile_, c, latents, h, w, rgb, plan, image, l, ws_bytes);
   st.device_bytes = need;
   st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   return st;

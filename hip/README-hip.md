@@ -64,18 +64,26 @@ tile-boundary brightness steps. The only tiling control is the band height:
 | `MI_HIP_VAE_BAND_TILE_PX` | band height in image pixels (default 512) |
 | `MI_HIP_VAE_FP16` | on gfx1035, round convolution/attention operands to fp16 (default on); `=0` restores the exact TF32 product |
 | `MI_HIP_VAE_FP16_ACT` | on gfx1035, keep activation buffers in fp16 too (default on); `=0` restores fp32 activations |
+| `MI_HIP_VAE_BF16` | on gfx11/gfx12, round operands to bf16 (default on); `=0` restores the exact TF32 product |
+| `MI_HIP_VAE_BF16_ACT` | on gfx11/gfx12, keep activation buffers in bf16 too (default on); `=0` restores fp32 activations |
 
 gfx1035 has no bf16 arithmetic, so the VAE's TF32 operands used to be split into two bf16 pieces and multiplied with
 four `v_dot2_f32_f16` products per MAC. By default the decoder keeps one fp16-rounded operand per MAC, which is the
 same precision as TF32's 11-bit significand and cuts the VAE's decode time by roughly 50x on an RDNA2 APU. The activation
 buffers are fp16 as well on that path, halving the convolutions' global-memory traffic and cutting a 1536x1024 decode
-from about 6 s to 4.2 s (30% faster). Accumulation, GroupNorm statistics, the conv_out result and RGB8 rounding stay fp32,
-so full and band-tiled decodes remain byte-identical. The fp16 path changes output bytes by at most one level versus the
-TF32 path. Other devices keep the TF32/fp32 defaults.
+from about 6 s to 4.2 s (30% faster).
+
+gfx11/gfx12 have native bf16 WMMA, so their default is one bf16-rounded operand per MAC instead of four bf16 pieces.
+The leaf is the raw `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32` (as in `bf16_gemm.hip`), not rocWMMA. Activation
+buffers are bf16 as well; in that mode the staging copies the operand bits straight into LDS instead of converting
+16-bit -> float -> 16-bit. Measured on gfx1103 at 512x512: the full VAE decode drops from 1.0 s (TF32) to 0.3 s (bf16),
+and forcing fp32 activation storage with `MI_HIP_VAE_BF16_ACT=0` gives 0.5 s, so the activation path contributes about
+40% of the gain. Accumulation, GroupNorm statistics, the conv_out result and RGB8 rounding stay fp32, so full and
+band-tiled decodes remain byte-identical in each mode. The bf16 path changes decoded bytes by at most 8 levels
+(mean 0.16) versus TF32; the fp16 path stays within one level. Other devices keep the TF32/fp32 defaults.
 
 The VAE decoder's other switches are `MI_HIP_VAE_ATTN_PIECES=3` (exact 3-piece
-attention; ignored on gfx1035 where the fp16 operand path is always used) and
-`MI_HIP_VAE_PROFILE` (per-op timings).
+attention; ignored where a one-product operand path is active) and `MI_HIP_VAE_PROFILE` (per-op timings).
 
 ## Implementation notes
 
