@@ -95,7 +95,8 @@ void flash_fwd(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& 
 // On Turing cards without tensor cores the emulated fp16 MMA is slow; this alternative runs the two matmuls as fp32
 // cuBLASLt GEMMs and the softmax on CUDA cores. It needs a larger workspace than flash_fwd (the score matrix), sized
 // by flash_fwd_workspace_bytes_sm75, and produces the same numerics within the engine's attention tolerances.
-std::size_t flash_fwd_workspace_bytes_sm75(std::int64_t total_q, int num_heads, int head_dim);
+std::size_t flash_fwd_workspace_bytes_sm75(std::int64_t total_q, int num_heads, int head_dim,
+                                           std::int64_t max_seqlen);
 void flash_fwd_f32(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& out, const Tensor& cu_seqlens_q,
                    const Tensor& cu_seqlens_k, int max_seqlen, bool causal, float scale, void* workspace,
                    std::size_t workspace_bytes, cudaStream_t stream);

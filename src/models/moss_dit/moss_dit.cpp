@@ -152,7 +152,9 @@ struct MossDit::Activations {
     rope = p.tensor(DType::kBF16, {rope_rows, kernels::kMossRopeDim});
     cu_seqlens = p.tensor(DType::kI32, {cu_pool_ints(rows)});
     if (slots > 0) cu_seqlens_k = p.tensor(DType::kI32, {cu_pool_ints(rows)});
-    lse_bytes = attention::flash_fwd_workspace_bytes(tokens, kHeads, static_cast<int>(tokens));
+    // A run with reference slots reads len_k = own tokens + slots, so the fp32 attention scratch needs a sequence
+    // bound that includes the slots (max_len <= tokens, hence tokens + slots is a safe upper bound).
+    lse_bytes = attention::flash_fwd_workspace_bytes(tokens, kHeads, static_cast<int>(tokens + slots));
     lse = p.bytes(lse_bytes);
     if (step) {
       mod = p.tensor(DType::kBF16, {6 * kDim});

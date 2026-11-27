@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -63,45 +64,51 @@ class F32Gemm {
   void run(const void* w, const void* x, void* d, int m, int n, int k, int ldx, int ldw, int ldo, void* ws,
            cudaStream_t stream) {
     const std::array<int, 6> key{m, n, k, ldx, ldw, ldo};
-    auto it = plans_.find(key);
-    if (it == plans_.end()) {
-      Plan p;
-      check_lt(cublasLtMatrixLayoutCreate(&p.a, CUDA_R_32F, k, n, ldw), "layout A");
-      check_lt(cublasLtMatrixLayoutCreate(&p.b, CUDA_R_32F, k, m, ldx), "layout B");
-      check_lt(cublasLtMatrixLayoutCreate(&p.d, CUDA_R_32F, n, m, ldo), "layout D");
-      cublasLtMatmulPreference_t pref = nullptr;
-      check_lt(cublasLtMatmulPreferenceCreate(&pref), "preference");
-      struct Guard {
-        cublasLtMatmulPreference_t p;
-        ~Guard() { cublasLtMatmulPreferenceDestroy(p); }
-      } guard{pref};
-      const std::size_t ws_bytes = std::size_t{32} << 20;
-      check_lt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_bytes,
-                                                    sizeof ws_bytes), "workspace pref");
-      const std::uint32_t schemes = CUBLASLT_REDUCTION_SCHEME_NONE;
-      check_lt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &schemes,
-                                                    sizeof schemes), "reduction mask");
-      const std::uint32_t aw = alignment(w), ax = alignment(x), ad = alignment(d);
-      check_lt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &aw, sizeof aw),
-               "align A");
-      check_lt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, &ax, sizeof ax),
-               "align B");
-      check_lt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, &ad, sizeof ad),
-               "align C");
-      check_lt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, &ad, sizeof ad),
-               "align D");
-      cublasLtMatmulHeuristicResult_t r{};
-      int found = 0;
-      check_lt(cublasLtMatmulAlgoGetHeuristic(h_, desc_, p.a, p.b, p.d, p.d, pref, 1, &r, &found), "heuristic");
-      if (found == 0) throw std::runtime_error("attention_f32: no cuBLASLt algorithm");
-      p.algo = r.algo;
-      p.ws = r.workspaceSize;
-      it = plans_.emplace(key, p).first;
+    // Plans are never erased, so references into the map stay valid after another thread inserts a plan. Lock only
+    // the cache access; the matmul itself may run concurrently on different streams.
+    const Plan* plan = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it = plans_.find(key);
+      if (it == plans_.end()) {
+        Plan p;
+        check_lt(cublasLtMatrixLayoutCreate(&p.a, CUDA_R_32F, k, n, ldw), "layout A");
+        check_lt(cublasLtMatrixLayoutCreate(&p.b, CUDA_R_32F, k, m, ldx), "layout B");
+        check_lt(cublasLtMatrixLayoutCreate(&p.d, CUDA_R_32F, n, m, ldo), "layout D");
+        cublasLtMatmulPreference_t pref = nullptr;
+        check_lt(cublasLtMatmulPreferenceCreate(&pref), "preference");
+        struct Guard {
+          cublasLtMatmulPreference_t p;
+          ~Guard() { cublasLtMatmulPreferenceDestroy(p); }
+        } guard{pref};
+        const std::size_t ws_bytes = std::size_t{32} << 20;
+        check_lt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_bytes,
+                                                      sizeof ws_bytes), "workspace pref");
+        const std::uint32_t schemes = CUBLASLT_REDUCTION_SCHEME_NONE;
+        check_lt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &schemes,
+                                                      sizeof schemes), "reduction mask");
+        const std::uint32_t aw = alignment(w), ax = alignment(x), ad = alignment(d);
+        check_lt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &aw, sizeof aw),
+                 "align A");
+        check_lt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, &ax, sizeof ax),
+                 "align B");
+        check_lt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, &ad, sizeof ad),
+                 "align C");
+        check_lt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, &ad, sizeof ad),
+                 "align D");
+        cublasLtMatmulHeuristicResult_t r{};
+        int found = 0;
+        check_lt(cublasLtMatmulAlgoGetHeuristic(h_, desc_, p.a, p.b, p.d, p.d, pref, 1, &r, &found), "heuristic");
+        if (found == 0) throw std::runtime_error("attention_f32: no cuBLASLt algorithm");
+        p.algo = r.algo;
+        p.ws = r.workspaceSize;
+        it = plans_.emplace(key, p).first;
+      }
+      plan = &it->second;
     }
-    const Plan& p = it->second;
     const float alpha = 1.f, beta = 0.f;
-    check_lt(cublasLtMatmul(h_, desc_, &alpha, w, p.a, x, p.b, &beta, d, p.d, d, p.d, &p.algo, ws, p.ws, stream),
-             "matmul");
+    check_lt(cublasLtMatmul(h_, desc_, &alpha, w, plan->a, x, plan->b, &beta, d, plan->d, d, plan->d, &plan->algo, ws,
+                            plan->ws, stream), "matmul");
   }
 
  private:
@@ -112,6 +119,7 @@ class F32Gemm {
   };
   cublasLtHandle_t h_ = nullptr;
   cublasLtMatmulDesc_t desc_ = nullptr;
+  std::mutex mutex_;
   std::map<std::array<int, 6>, Plan> plans_;
 };
 
@@ -220,7 +228,9 @@ struct Scratch {
   float *q, *k, *v, *vt, *o, *s;
 };
 
-Scratch slice(void* workspace, std::int64_t total_q, int heads, int dim) {
+// `max_seqlen` is an upper bound on one sequence's key length; varlen runs with reference slots have len_k > len_q,
+// so k/v, Vᵀ and the score matrix must be sized from it rather than from the total query count.
+Scratch slice(void* workspace, std::int64_t total_q, int heads, int dim, std::int64_t max_seqlen) {
   auto* const base = static_cast<std::byte*>(workspace);
   Scratch r;
   std::size_t off = 0;
@@ -228,31 +238,33 @@ Scratch slice(void* workspace, std::int64_t total_q, int heads, int dim) {
   off = pad(off + static_cast<std::size_t>(total_q) * heads * sizeof(float));
   r.lt_ws = base + off;
   off = pad(off + (std::size_t{32} << 20));
-  const std::size_t per = pad(static_cast<std::size_t>(total_q) * dim * sizeof(float));
+  const std::int64_t buf_tokens = std::max<std::int64_t>(total_q, max_seqlen);
+  const std::size_t per = pad(static_cast<std::size_t>(buf_tokens) * dim * sizeof(float));
   r.q = reinterpret_cast<float*>(base + off); off += per;
   r.k = reinterpret_cast<float*>(base + off); off += per;
   r.v = reinterpret_cast<float*>(base + off); off += per;
   r.o = reinterpret_cast<float*>(base + off); off += per;
   r.vt = reinterpret_cast<float*>(base + off);
-  off = pad(off + pad(static_cast<std::size_t>(dim) * total_q * sizeof(float)));
+  off = pad(off + pad(static_cast<std::size_t>(dim) * max_seqlen * sizeof(float)));
   r.s = reinterpret_cast<float*>(base + off);
   return r;
 }
 
 }  // namespace
 
-std::size_t flash_fwd_workspace_bytes_sm75(std::int64_t total_q, int heads, int dim) {
+std::size_t flash_fwd_workspace_bytes_sm75(std::int64_t total_q, int heads, int dim, std::int64_t max_seqlen) {
   if (total_q <= 0) return 0;
-  const std::size_t per = pad(static_cast<std::size_t>(total_q) * dim * sizeof(float));
+  const std::size_t per =
+      pad(static_cast<std::size_t>(std::max<std::int64_t>(total_q, max_seqlen)) * dim * sizeof(float));
   return pad(static_cast<std::size_t>(total_q) * heads * sizeof(float)) + pad(std::size_t{32} << 20) + 4 * per +
-         pad(static_cast<std::size_t>(dim) * total_q * sizeof(float)) +
-         pad(static_cast<std::size_t>(total_q) * total_q * sizeof(float));
+         pad(static_cast<std::size_t>(dim) * max_seqlen * sizeof(float)) +
+         pad(static_cast<std::size_t>(total_q) * max_seqlen * sizeof(float));
 }
 
 void flash_fwd_f32(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& out, const Tensor& cu_seqlens_q,
                    const Tensor& cu_seqlens_k, int max_seqlen, bool causal, float scale, void* workspace,
                    std::size_t workspace_bytes, cudaStream_t stream) {
-  static_cast<void>(max_seqlen);
+  if (max_seqlen <= 0) throw std::runtime_error("flash_fwd_f32: max_seqlen must be positive");
   const std::int64_t total_q = q.dim(0);
   if (total_q == 0) return;
   // cuBLASLt's fp32 kernels read the matrices past their logical bounds; the matrix views live on the caller's
@@ -261,12 +273,13 @@ void flash_fwd_f32(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
   MI_CUDA_CHECK(cudaStreamSynchronize(stream));
   const int heads = q.dim(1), dim = q.dim(2);
   if (dim != 128 && dim != 256) throw std::runtime_error("flash_fwd_f32: unsupported head dim");
-  if (workspace == nullptr || workspace_bytes < flash_fwd_workspace_bytes_sm75(total_q, heads, dim)) {
+  if (workspace == nullptr ||
+      workspace_bytes < flash_fwd_workspace_bytes_sm75(total_q, heads, dim, max_seqlen)) {
     throw std::runtime_error("flash_fwd_f32: workspace too small for the fp32 attention path");
   }
   mi::backend::load_cublaslt();
   static F32Gemm gemm;
-  const Scratch ws = slice(workspace, total_q, heads, dim);
+  const Scratch ws = slice(workspace, total_q, heads, dim, max_seqlen);
   const int batch = cu_seqlens_q.dim(0) - 1;
   std::vector<int> hu(batch + 1), hk(batch + 1);
   MI_CUDA_CHECK(cudaMemcpy(hu.data(), cu_seqlens_q.data, (batch + 1) * sizeof(int), cudaMemcpyDeviceToHost));

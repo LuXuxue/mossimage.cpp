@@ -1,6 +1,5 @@
 #include "kernels/attention/flash_attention.h"
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -72,7 +71,7 @@ void require_sm80(int device) {
 std::size_t flash_fwd_workspace_bytes(std::int64_t total_q, int num_heads, int max_seqlen) {
 #if MOSSINFER_HAVE_SM75
   if (kernels::sm75::turing() && kernels::sm75::no_tensor_cores()) {
-    return kernels::sm75::flash_fwd_workspace_bytes_sm75(std::max<std::int64_t>(total_q, max_seqlen), num_heads, 256);
+    return kernels::sm75::flash_fwd_workspace_bytes_sm75(total_q, num_heads, 256, max_seqlen);
   }
 #else
   static_cast<void>(max_seqlen);
