@@ -39,7 +39,6 @@ using leaf::FragB;
     static __device__ __forceinline__ void load_b(FragB& b, const std::uint16_t* p, int ld) { NS::template load_b<F>(b, p, ld); } \
     static __device__ __forceinline__ void mma(FragAcc& c, const FragA& a, const FragB& b) { NS::mma(c, a, b); }          \
     static __device__ __forceinline__ void store_acc(float* p, const FragAcc& c, int ld) { NS::store_acc(p, c, ld); }     \
-    static __device__ __forceinline__ void load_acc(FragAcc& c, const float* p, int ld) { NS::load_acc(c, p, ld); }       \
   }
 MI_VAE_LEAF_WRAP(StdLeaf, hip_block::leaf);
 MI_VAE_LEAF_WRAP(RawLeaf, hip_vae::rleaf);
@@ -874,6 +873,8 @@ void conv(const ConvArgs& a, Products products, hipStream_t stream) {
   const int round = round_of(products);
   require(a.x_fmt == 0 || a.x_fmt == round, "conv", "16-bit activations must match the operand format");
   require(a.out_fmt == 0 || a.out_fmt == round, "conv", "16-bit output must match the operand format");
+  // One kernel formats the residual read and the output store together from a.x_fmt, so the two buffers must agree.
+  require(a.x_fmt == a.out_fmt, "conv", "x and out/residual must use the same activation format");
   const int k = a.taps * a.c;
   // A single launch of the largest convolutions can take long enough to trip the OS's GPU watchdog. Split the output
   // rows into bounded chunks: each output row still belongs to exactly one workgroup, so the result is identical.
@@ -981,6 +982,8 @@ void piece_gemm(const std::uint16_t* a, std::int64_t a_stride, const std::uint16
   require(ldo >= n_cols && ldo % 4 == 0, "piece_gemm", "ldo must cover n and be a multiple of 4");
   require(aligned16(a) && aligned16(b) && aligned16(out), "piece_gemm", "pointers must be 16-byte aligned");
   require(pieces == 1 || pieces == 2 || pieces == 3, "piece_gemm", "pieces must be 1, 2 or 3");
+  require(round == 0 || pieces == 1, "piece_gemm", "a one-product operand mode needs one piece");
+  require(out_fmt == 0 || out_fmt == round, "piece_gemm", "16-bit output must match the operand format");
   if (m_rows <= 0 || n_cols <= 0) return;
   const PieceGemmArgs g{a, a_stride, b, b_stride, out, ldo, k_pad / kFrag, m_rows, n_cols,
                         static_cast<int>(round_up(n_cols, kTileN) / kTileN), out_fmt};
@@ -1006,6 +1009,7 @@ void softmax_pack(const float* s, std::int64_t lds, int rows, int l, float scale
                   int l_pad, hipStream_t stream, int pieces, int round) {
   require(l > 0 && l_pad >= l && l_pad % kFrag == 0 && lds >= l, "softmax_pack", "l_pad must be a multiple of 16 covering l");
   require(pieces == 1 || pieces == 2 || pieces == 3, "softmax_pack", "pieces must be 1, 2 or 3");
+  require(round == 0 || pieces == 1, "softmax_pack", "a one-product operand mode needs one piece");
   if (rows <= 0) return;
   const SoftmaxArgs a{s, lds, p, p_stride, l, l_pad, scale};
   const dim3 grid(static_cast<unsigned>(rows));

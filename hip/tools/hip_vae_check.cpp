@@ -12,14 +12,17 @@
 //   - Infinities and NaN in an operand give non-finite outputs exactly where the replay's do, the others stay right.
 //   - split_pack, the latent unpack, RGB8 and the GroupNorm statistics bit for bit; the softmax's pieces must be an exact
 //     split of an fp32 probability within 3e-6 of the fp64 softmax; GroupNorm apply within 2e-6 of |a x| + |a mean|.
-//   - The decode: PSNR, max and mean |diff| and identical bytes against the golden PNG. It passes with no NaN, no byte off
-//     by more than 1 and at least 99 % of the bytes identical (the CUDA engine's reference decode: 99.1-99.3 %, max 1).
+//   - The decode: PSNR, max and mean |diff| and identical bytes against the golden PNG. The gate follows the decoder's
+//     operand mode: exact/TF32 passes with no NaN, no byte off by more than 1 and at least 99 % identical (the CUDA
+//     reference decode: 99.1-99.3 %, max 1); one 16-bit operand per MAC (fp16/bf16) passes with no NaN, max 8 and 80 %.
 //   - Non-square decodes (run_nonsquare) and the size limits (check_limits).
 //   - --tiled-check: the same latents decoded full and band-tiled at several band heights (including a partial final
 //     band, both the min-memory planner and a uniform schedule): RGB must be byte-identical.
 // Exit status: 0 everything passed, 1 a check failed, 2 bad usage or no usable device.
 // Usage: hip_vae_check [--device N] [--kat-only | --no-kat] [--vae FILE] [--golden DIR] [--case NAME]... [--no-golden] [--no-nonsquare]
 //                      [--out-dir DIR] [--iters N] [--profile] [--conv-products 4|3|1] [--tiled-check]
+// --conv-products only switches operand rounding within the family the decoder was packed for (4/3: TF32, 1: fp16);
+// bf16 is selected at decoder construction on gfx11/gfx12 and cannot be changed here.
 // Some Windows SDK builds (notably the TheRock clang-cl toolchain) ship no zlib. Keep the check buildable there: the
 // PNG golden-image checks then report that zlib is unavailable; all other checks, including --tiled-check, work.
 #if defined(MI_HIP_VAE_NO_ZLIB)
@@ -1236,8 +1239,9 @@ void run_decode(Device& device, VaeDecoder& decoder, const Options& o, const std
   if (shape.size() != 3 || shape[0] != 128) throw std::runtime_error(name + ": final_latent.npy is not [1, 128, h, w]");
   const auto h = static_cast<std::uint32_t>(shape[1]), w = static_cast<std::uint32_t>(shape[2]);
   const std::vector<float> latent = arr.to_vector<float>();
+  const Products products = decoder.conv_products();
   std::printf("\n%s: decode %ux%u (latents %ux%u), %s, decode allocates %.3f GiB, %.2f GiB free\n", name.c_str(), 16 * w, 16 * h, h,
-              w, hip_vae::products_name(o.conv_products), static_cast<double>(decoder.workspace_bytes(h, w)) / (1u << 30),
+              w, hip_vae::products_name(products), static_cast<double>(decoder.workspace_bytes(h, w)) / (1u << 30),
               static_cast<double>(device.free_memory()) / (1u << 30));
   std::vector<std::uint8_t> rgb;
   std::vector<float> image;
@@ -1279,10 +1283,15 @@ void run_decode(Device& device, VaeDecoder& decoder, const Options& o, const std
   }
   const double n = static_cast<double>(rgb.size()), mse = se / n, identical = static_cast<double>(same) / n;
   const double psnr = mse == 0.0 ? INFINITY : 10.0 * std::log10(255.0 * 255.0 / mse);
-  const bool ok = nans == 0 && max_abs <= 1 && identical >= 0.99;
+  const bool one_operand = products == Products::kFp16 || products == Products::kBf16;
+  const int max_allowed = one_operand ? 8 : 1;
+  const double min_identical = one_operand ? 0.80 : 0.99;
+  const bool ok = nans == 0 && max_abs <= max_allowed && identical >= min_identical;
   if (!ok) ++failures;
+  const char* gate = one_operand ? "no NaN, max |diff| <= 8, >= 80 % identical (one 16-bit operand)"
+                                 : "no NaN, max |diff| <= 1, >= 99 % identical";
   std::printf("  against %s: %s\n    PSNR %.2f dB, max |diff| %d, mean |diff| %.5f, identical bytes %.4f %%, decoder output NaN %zu\n",
-              png.string().c_str(), ok ? "ok" : "FAILED (gate: no NaN, max |diff| <= 1, >= 99 % identical)", psnr, max_abs,
+              png.string().c_str(), ok ? "ok" : (std::string("FAILED (gate: ") + gate + ")").c_str(), psnr, max_abs,
               sum_abs / n, 100.0 * identical, nans);
   std::printf("    |diff| 0: %zu, 1: %zu, 2: %zu, >= 3: %zu bytes\n", hist[0], hist[1], hist[2], hist[3]);
 }

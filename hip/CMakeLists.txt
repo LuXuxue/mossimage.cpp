@@ -1,9 +1,10 @@
 # The HIP backend: MOSS-Image's kernels for AMD GPUs through ROCm, and the same sources through HIP's NVIDIA headers for
 # checking on a CUDA device. Its own project; the engine's build does not include it. Configure once per target (README.md):
-#   -DHIP_TARGET="gfx1100;gfx1103;gfx1200;gfx1201;gfx1035"  one or more AMD architectures in one binary:
+#   -DHIP_TARGET="gfx1100;gfx1103;gfx1200;gfx1201"  one or more AMD architectures in one binary:
 #                                           RDNA3/RDNA4 use the rocWMMA / native WMMA leaves;
-#                                           gfx1035 (RDNA2, no matrix cores and no bf16 instructions) uses the
-#                                           V_DOT4_I32_I8 / V_DOT2_F32_F16 dot-product leaves in the same fat binary
+#   -DHIP_TARGET="gfx1103;gfx1035"          a separate fat binary may add gfx1035 (RDNA2, no matrix cores and no bf16
+#                                           instructions), whose V_DOT4_I32_I8 / V_DOT2_F32_F16 dot-product leaves need
+#                                           -mno-wavefrontsize64; do not combine gfx103x with gfx12 in one build
 #   -DHIP_TARGET=nvidia                     scalar leaf, nvcc with HIP's NVIDIA headers
 # On Linux the ROCm SDK comes from $ROCM_PATH (-DROCM_PATH=...); on Windows a TheRock SDK, e.g.
 #   -DROCM_PATH=<SDK devel root>   (its lib/llvm/bin/clang-cl builds host and device code, its
@@ -67,7 +68,7 @@ endif()
 # operation, as the kernels do.
 list(APPEND MI_HIP_WARN -ffp-contract=off)
 
-# Kernel sources. block_kernels.hip is the DiT block (tools/hip_block checks it against the engine); dit_kernels.hip the
+# Kernel sources. block_kernels.hip is the DiT block (tools/hip_dit_kernel_check checks it against the engine); dit_kernels.hip the
 # DiT's other ops; te_kernels.hip the text encoder's; vae_kernels.hip the VAE decoder's.
 set(MI_HIP_KERNELS block_kernels.hip dit_kernels.hip te_kernels.hip te_dequant.hip vae_kernels.hip int8_gemm.hip rotate_quantize.hip
                     int8_block.hip int8_attn.hip bf16_gemm.hip lora.hip sage_attn_gfx103x.hip)

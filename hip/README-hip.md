@@ -82,8 +82,8 @@ and forcing fp32 activation storage with `MI_HIP_VAE_BF16_ACT=0` gives 0.5 s, so
 band-tiled decodes remain byte-identical in each mode. The bf16 path changes decoded bytes by at most 8 levels
 (mean 0.16) versus TF32; the fp16 path stays within one level. Other devices keep the TF32/fp32 defaults.
 
-The VAE decoder's other switches are `MI_HIP_VAE_ATTN_PIECES=3` (exact 3-piece
-attention; ignored where a one-product operand path is active) and `MI_HIP_VAE_PROFILE` (per-op timings).
+The VAE decoder's other switches are `MI_HIP_VAE_ATTN_PIECES=3` (exact 3-piece attention; effective only in the
+NVIDIA check build — every supported AMD device has a one-product operand path) and `MI_HIP_VAE_PROFILE` (per-op timings).
 
 ## Implementation notes
 
@@ -116,10 +116,11 @@ attention; ignored where a one-product operand path is active) and `MI_HIP_VAE_P
   image and its copy. This is bit-identical to the host dequantization;
   `MI_HIP_TE_DEVICE_DEQUANT=0` restores the host path and uses one fewer
   layer-sized device buffer.
-- The VAE decoder's mid attention packs Q/K/V/P into 2 TF32 bf16 pieces by
-  default (3 GEMM products instead of 6), with a small decoded-image difference
-  from the fp32-accurate path. On gfx1035 it uses one fp16 operand per product
-  and fp16 activation buffers; the switches above select the other modes.
+- The VAE decoder's mid attention packs Q/K/V/P into 2 TF32 bf16 pieces on the
+  TF32 path (3 GEMM products instead of 6), with a small decoded-image difference
+  from the fp32-accurate path. The AMD defaults are one fp16 operand per product
+  with fp16 buffers on gfx103x and one bf16 operand with bf16 buffers on
+  gfx11/gfx12; the switches above select the other modes.
 - The DiT attention output head stride is the head dimension (128), not the
   full residual width; using the latter corrupts adjacent token rows.
 - The LoRA delta must be added before the base GEMM's bf16 rounding, not to the
@@ -138,4 +139,8 @@ them off. On a build with them enabled:
 - `hip_int8_gemm_bench`, `hip_bf16_gemm_bench`, `hip_rotate_quantize_bench`,
   `hip_lora_info`, `hip_te_profile`, `hip_dequant_fast_check` — report kernel
   throughput, LoRA branch shapes and text-encoder timing/accuracy
+- `hip_fused_quant_check` — checks the fused SiTU-GLU + ConvRot quantizer against the two separate ops
+- The probe tools' debug-only switches: `MI_ATTN_QKV` (`hip_attn_probe`) loads a raw qkv dump;
+  `MI_I8ATTN_BACKEND`, `MI_I8ATTN_BENCH`, `MI_I8ATTN_DEBUG`, `MI_I8ATTN_DEQ` (`hip_int8_attn_probe`) select a backend,
+  a throughput loop and intermediate dumps. They affect only those tools.
 - `MI_HIP_OP_TIME` (any value) prints a per-op DiT timing breakdown

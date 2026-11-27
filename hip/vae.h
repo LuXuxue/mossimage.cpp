@@ -4,19 +4,19 @@
 //   latent de-normalization + unpack -> post_quant_conv 1x1 -> conv_in 3x3 -> mid resnet 0 -> mid attention
 //   -> mid resnet 1 -> 4 up blocks (3 resnets each, nearest 2x upsample + 3x3 conv after the first three)
 //   -> GroupNorm + SiLU -> conv_out 3x3 -> clamp and the image processor's rounding to uint8.
-// Convolutions accumulate in fp32. On gfx1035 (RDNA2, no bf16 instructions) operands are rounded to one fp16 value each
-// by default, so one v_dot2_f32_f16 product serves each MAC; MI_HIP_VAE_FP16=0 restores the exact TF32 product (four
-// bf16-piece dot products) on every device. On the same path the activation buffers are fp16 as well (one half per
-// element instead of one float), which halves their bandwidth; MI_HIP_VAE_FP16_ACT=0 restores fp32 activations. Other
-// devices keep the TF32/fp32 defaults. The attention's linears, scores and P V follow the operand mode (unless
-// MI_HIP_VAE_ATTN_PIECES overrides it on non-fp16 builds); GroupNorm statistics, the conv_out result and the RGB8
-// conversion stay fp32. The nearest upsample is read inside the following convolution. Accumulation orders differ from
-// cuDNN's and torch's, so outputs are close to the engine's, not bit-identical.
+// Convolutions accumulate in fp32. Operands and activation buffers follow the device: gfx103x (RDNA2, no bf16
+// instructions) rounds each operand to fp16 (one v_dot2_f32_f16 per MAC), gfx11/gfx12 rounds to bf16 (one native WMMA
+// bf16 product per MAC), and both keep the activation buffers in the same 16-bit format. MI_HIP_VAE_FP16=0 /
+// MI_HIP_VAE_BF16=0 restore the exact TF32 product (four bf16-piece dot products); MI_HIP_VAE_FP16_ACT=0 /
+// MI_HIP_VAE_BF16_ACT=0 restore fp32 activations. Other devices keep the TF32/fp32 defaults. The attention's linears,
+// scores and P V follow the operand mode; GroupNorm statistics, the conv_out result and the RGB8 conversion stay fp32.
+// The nearest upsample is read inside the following convolution. Accumulation orders differ from cuDNN's and torch's,
+// so outputs are close to the engine's, not bit-identical (bf16 differs by at most 8 RGB levels).
 //
-// Memory (untiled): two regions of 2c x 16h x 16w elements each (c = 96 for the small decoder; fp16 on gfx1035, fp32
-// elsewhere) as the engine's ping-pong schedule, the latents, the fp32 conv_out result, the RGB output and the GroupNorm
-// accumulators; the mid attention's scratch lives in the second region. workspace_bytes() is the total; decode() refuses
-// to start when the device's free memory cannot hold it.
+// Memory (untiled): two regions of 2c x 16h x 16w elements each (c = 96 for the small decoder; 16-bit on gfx103x and
+// gfx11/gfx12, fp32 elsewhere) as the engine's ping-pong schedule, the latents, the fp32 conv_out result, the RGB output
+// and the GroupNorm accumulators; the mid attention's scratch lives in the second region. workspace_bytes() is the total;
+// decode() refuses to start when the device's free memory cannot hold it.
 #pragma once
 
 #include <cstdint>
@@ -53,7 +53,7 @@ struct VaeTilePlan {
   int tile = 0;                        // band height in image pixels (a multiple of 8)
   std::vector<Segment> segments;
   std::uint64_t workspace_bytes = 0;  // device bytes the planner estimated for the activation mode at plan time
-  bool fp16_act = false;              // activation storage (fp16 vs fp32) the plan was made for
+  bool fp16_act = false;              // 16-bit vs fp32 activation storage the plan was made for
   double relative_cost = 0;           // estimated tail work (conv MACs + memory traffic) vs the untiled tail
 
   std::string describe() const;
@@ -77,9 +77,12 @@ class VaeDecoder {
   // Throws std::runtime_error naming both sizes when the device's free memory is below workspace_bytes(h, w).
   void require_fits(std::uint32_t h, std::uint32_t w) const;
 
-  // The convolutions' products: kTf32 (exact TF32 products), kTf32Drop or kFp16 (the gfx1035 default). Must agree with
-  // the weights' packing and the activation mode chosen at construction.
+  // The convolutions' products: kTf32 (exact TF32 products), kTf32Drop, kFp16 (the gfx103x default) or kBf16 (the
+  // gfx11/gfx12 default). Must agree with the weights' packing and activation mode chosen at construction. Only the
+  // operand-rounding family may change (e.g. kTf32 -> kTf32Drop), not fp16 <-> bf16.
   void set_conv_products(hip_vae::Products products);
+  // The operand format actually used by this decoder's convolutions (the one above after any set_conv_products call).
+  hip_vae::Products conv_products() const { return conv_products_; }
   // Times every op with device events (VaeDecodeStats::profile).
   void set_profile(bool on) { profile_ = on; }
 
@@ -96,7 +99,7 @@ class VaeDecoder {
   // segment). Useful for testing every band grid, including a partial final band.
   static VaeTilePlan plan_tiled_uniform(int base_channels, std::uint32_t h, std::uint32_t w, int tile);
 
-  // Byte-identical to decode() in the same mode (fp16 or fp32 activations, matching convolutions, exact integer-sum GroupNorms).
+  // Byte-identical to decode() in the same mode (fp32/fp16/bf16 activations, matching convolutions, exact integer-sum GroupNorms).
   // Requires a plan for this latent grid and decoder width. set_profile() works as in decode(). The optional
   // `image` receives the fp32 [16h, 16w, 3] output before the clamp, as in decode().
   VaeDecodeStats decode_tiled_exact(const float* latents, std::uint32_t h, std::uint32_t w,

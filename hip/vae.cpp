@@ -54,8 +54,6 @@ int& vae_round_flag() {
   return round;
 }
 int vae_round() { return vae_round_flag(); }
-bool vae_fp16() { return vae_round() == 1; }
-bool vae_bf16() { return vae_round() == 2; }
 
 // 16-bit activation storage: keeps every activation buffer (and the convolutions' inputs and outputs) in the operand's
 // 16-bit format, halving their bandwidth. Accumulation, GroupNorm statistics and RGB8 stay fp32. On by default wherever
@@ -216,8 +214,8 @@ Layout layout(int c, std::uint32_t h, std::uint32_t w) {
           image + " is past the decoder's limits: a GroupNorm group would hold more than 2^30 elements");
   require(full * (2ull * static_cast<std::uint64_t>(c) / 4) < (1ull << 32),
           image + " is past the decoder's limits: a GroupNorm launch would need 2^32 work-items or more");
-  // fp16 activation storage halves the ping-pong regions and the attention's normalized/linear buffers. The scores,
-  // softmax pieces and GroupNorm accumulators keep their fp32/fp16-piece layouts.
+  // 16-bit activation storage halves the ping-pong regions and the attention's normalized/linear buffers. The scores,
+  // softmax pieces and GroupNorm accumulators keep their fp32/packed-operand layouts.
   const std::uint64_t esz = vae_fp16_act() ? 2ull : 4ull;
   Layout l;
   l.l = 4ll * h * w;
@@ -255,8 +253,9 @@ Layout layout(int c, std::uint32_t h, std::uint32_t w) {
 
 double gib(std::uint64_t b) { return static_cast<double>(b) / (1024.0 * 1024.0 * 1024.0); }
 
-// fp16 mode uses one fp16 operand per product; otherwise attention packs 2 TF32 bf16 pieces by default (3 instead of
-// 6 GEMM products). MI_HIP_VAE_ATTN_PIECES=3 restores the exact 3-piece path.
+// One-product modes (fp16 on gfx103x, bf16 on gfx11/gfx12) use one rounded operand; the TF32 path packs 2 bf16 pieces
+// by default (3 instead of 6 GEMM products). MI_HIP_VAE_ATTN_PIECES=3 restores the exact 3-piece path in the NVIDIA
+// check build; on AMD devices a one-product mode is always active.
 int attn_pieces() {
   if (vae_round() != 0) return 1;
   if (const char* s = std::getenv("MI_HIP_VAE_ATTN_PIECES")) {
@@ -460,7 +459,7 @@ void run_head_ops(const VaeDecoder::Weights& wt, Ops& ops, Products products, hi
   run.attention(p, scratch, l, mid);
 }
 
-// The full decode's device work, instantiated for fp32 or fp16 activation storage. The caller has already selected
+// The full decode's device work, instantiated for fp32, fp16 or bf16 activation storage. The caller has already selected
 // the device, checked the memory budget and started the wall clock.
 template <class Act>
 VaeDecodeStats decode_impl(const VaeDecoder::Weights& wt, Products products, bool profile, int c, const float* latents,
@@ -568,7 +567,7 @@ VaeDecoder::VaeDecoder(Device& device, const std::filesystem::path& path) : devi
   const char* fp16_env = std::getenv("MI_HIP_VAE_FP16");
   const char* bf16_env = std::getenv("MI_HIP_VAE_BF16");
   const auto off = [](const char* s) { return s != nullptr && std::strcmp(s, "0") == 0; };
-  const bool fp16 = !off(fp16_env) && fp16_env != nullptr;
+  const bool fp16 = !off(fp16_env) && (fp16_env != nullptr || rdna2);
   const bool bf16 = !fp16 && !off(bf16_env) && (bf16_env != nullptr || matrix);
   if (fp16 && !rdna2) throw std::runtime_error("hip vae: MI_HIP_VAE_FP16 needs a gfx103x (RDNA2) device");
   if (bf16 && !matrix) throw std::runtime_error("hip vae: MI_HIP_VAE_BF16 needs a gfx11/gfx12 device");

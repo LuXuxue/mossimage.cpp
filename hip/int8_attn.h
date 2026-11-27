@@ -66,7 +66,7 @@ inline std::size_t int8_attn_bytes(int tokens, int batch) {
 constexpr int seq_base(int cu_b, int b) { return ((cu_b + 63) / 64) * 64 + 64 * b; }
 
 // Quantize q/k/v out of the [tokens, 3 * kDim] qkv tensor into the buffers above.
-// b.cu, b.base, b.len, b.pos and b.padded must already be set.
+// b.cu and b.padded must already be set; per-sequence base, length and position offsets are derived from cu on device.
 void int8_attn_quantize(const i8attn_bf16* qkv, std::int64_t ld, const Int8AttnBuffers& b, int tokens,
                         hipStream_t stream, bool quant_v = true);
 
