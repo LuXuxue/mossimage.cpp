@@ -74,6 +74,49 @@ constexpr BlockLayout block_layout() {
 }
 constexpr BlockLayout kBlock = block_layout();
 
+// The INT8 ConvRot block layout: the bf16 norms, then each linear's int8 weight [n, k] and its per-row float scale [n].
+struct Int8Layout {
+  std::size_t qkv_q, qkv_scale, o_q, o_scale, up_q, up_scale, down_q, down_scale, bytes;
+};
+constexpr Int8Layout int8_layout() {
+  Int8Layout l{};
+  const std::size_t norms = 2 * kDim * kBf16 + 2 * kHead * kBf16;
+  l.qkv_q = norms;
+  l.qkv_scale = l.qkv_q + 3 * kDim * kDim;
+  l.o_q = l.qkv_scale + 3 * kDim * 4;
+  l.o_scale = l.o_q + kDim * kDim;
+  l.up_q = l.o_scale + kDim * 4;
+  l.up_scale = l.up_q + 2 * kFfn * kDim;
+  l.down_q = l.up_scale + 2 * kFfn * 4;
+  l.down_scale = l.down_q + kDim * kFfn;
+  l.bytes = l.down_scale + kDim * 4;
+  return l;
+}
+constexpr Int8Layout kInt8 = int8_layout();
+
+// Rebuild the block's pointers from a device base (a resident block or a streaming slot).
+Int8BlockWeights int8_weights_at(const char* base) {
+  const auto fp = [&](std::size_t o) { return reinterpret_cast<const float*>(base + o); };
+  Int8BlockWeights w;
+  w.norm1 = reinterpret_cast<const bf16*>(base);
+  w.norm2 = reinterpret_cast<const bf16*>(base + kDim * kBf16);
+  w.q_norm = reinterpret_cast<const bf16*>(base + 2 * kDim * kBf16);
+  w.k_norm = reinterpret_cast<const bf16*>(base + 2 * kDim * kBf16 + kHead * kBf16);
+  w.qkv.q = reinterpret_cast<const std::int8_t*>(base + kInt8.qkv_q);
+  w.qkv.scale = fp(kInt8.qkv_scale);
+  w.qkv.bias = nullptr;
+  w.o.q = reinterpret_cast<const std::int8_t*>(base + kInt8.o_q);
+  w.o.scale = fp(kInt8.o_scale);
+  w.o.bias = nullptr;
+  w.up_gate.q = reinterpret_cast<const std::int8_t*>(base + kInt8.up_q);
+  w.up_gate.scale = fp(kInt8.up_scale);
+  w.up_gate.bias = nullptr;
+  w.down.q = reinterpret_cast<const std::int8_t*>(base + kInt8.down_q);
+  w.down.scale = fp(kInt8.down_scale);
+  w.down.bias = nullptr;
+  return w;
+}
+
 // The shapes of the tensors the constructor loads into its two kinds of resident buffers, in their order: the globals
 // (embedders, time embedding, modulations, head, the refiner's projection), and each of the two refiner blocks.
 std::vector<std::vector<std::int64_t>> global_shapes() {
@@ -194,17 +237,11 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
   std::vector<bf16> row_major;
   is_int8_.assign(kDiTLayers, false);
   int8_blocks_.resize(kDiTLayers);
-  // The INT8 ConvRot block layout: the bf16 norms, then each linear's int8 weight [n, k] and its per-row float scale [n].
-  const std::size_t i8_norms = 2 * d * kBf16 + 2 * kHead * kBf16;
-  const std::size_t i8_qkv_q = i8_norms;
-  const std::size_t i8_qkv_scale = i8_qkv_q + 3 * d * d;
-  const std::size_t i8_o_q = i8_qkv_scale + 3 * d * 4;
-  const std::size_t i8_o_scale = i8_o_q + d * d;
-  const std::size_t i8_up_q = i8_o_scale + d * 4;
-  const std::size_t i8_up_scale = i8_up_q + 2 * f * d;
-  const std::size_t i8_down_q = i8_up_scale + 2 * f * 4;
-  const std::size_t i8_down_scale = i8_down_q + d * f;
-  const std::size_t i8_block_bytes = i8_down_scale + d * 4;
+  // INT8 blocks use the same resident/streaming split as bf16 blocks. An INT8 block is about half the size of a packed
+  // bf16 one, so a budget sized from bf16 blocks is conservative; the slots take the larger of the two layouts so a
+  // mixed model can stream either kind.
+  const std::size_t i8_block_bytes = kInt8.bytes;
+  const std::size_t slot_bytes = std::max(kBlock.bytes, kInt8.bytes);
   for (int l = 0; l < kDiTLayers; ++l) {
     const std::vector<std::string> qkv = qkv_names(l);
     const bool is_int8 = index.at(qkv.front()).dtype == "I8";
@@ -238,45 +275,38 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
       index.read_into(p + "q_norm.weight", dst + 2 * d * kBf16, kHead * kBf16);
       index.read_into(p + "k_norm.weight", dst + 2 * d * kBf16 + kHead * kBf16, kHead * kBf16);
       for (std::size_t i = 0; i < qkv.size(); ++i) {
-        index.read_into(qkv[i], dst + i8_qkv_q + static_cast<std::size_t>(i * qrows * d),
+        index.read_into(qkv[i], dst + kInt8.qkv_q + static_cast<std::size_t>(i * qrows * d),
                         static_cast<std::size_t>(qrows * d));
-        index.read_into(qkv[i] + "_scale", dst + i8_qkv_scale + static_cast<std::size_t>(i * qrows * 4),
+        index.read_into(qkv[i] + "_scale", dst + kInt8.qkv_scale + static_cast<std::size_t>(i * qrows * 4),
                         static_cast<std::size_t>(qrows * 4));
       }
-      index.read_into(p + "proj.o.weight", dst + i8_o_q, d * d);
-      index.read_into(p + "proj.o.weight_scale", dst + i8_o_scale, d * 4);
-      index.read_into(p + "proj.ffn_up_gate.weight", dst + i8_up_q, 2 * f * d);
-      index.read_into(p + "proj.ffn_up_gate.weight_scale", dst + i8_up_scale, 2 * f * 4);
-      index.read_into(p + "proj.ffn_down.weight", dst + i8_down_q, d * f);
-      index.read_into(p + "proj.ffn_down.weight_scale", dst + i8_down_scale, d * 4);
-      owned_.emplace_back(i8_block_bytes);
-      owned_.back().upload(streamed.data(), i8_block_bytes);
-      weight_bytes_ += i8_block_bytes;
-      const char* base = reinterpret_cast<const char*>(at(owned_.back(), 0));
-      const auto bp = [&](std::size_t o) { return reinterpret_cast<const std::uint8_t*>(base + o); };
-      const auto fp = [&](std::size_t o) { return reinterpret_cast<const float*>(base + o); };
-      Int8BlockWeights w;
-      w.norm1 = reinterpret_cast<const bf16*>(base + 0);
-      w.norm2 = reinterpret_cast<const bf16*>(base + d * kBf16);
-      w.q_norm = reinterpret_cast<const bf16*>(base + 2 * d * kBf16);
-      w.k_norm = reinterpret_cast<const bf16*>(base + 2 * d * kBf16 + kHead * kBf16);
-      w.qkv.q = reinterpret_cast<const std::int8_t*>(base + i8_qkv_q);
-      w.qkv.scale = fp(i8_qkv_scale);
-      w.qkv.bias = nullptr;
-      w.o.q = reinterpret_cast<const std::int8_t*>(base + i8_o_q);
-      w.o.scale = fp(i8_o_scale);
-      w.o.bias = nullptr;
-      w.up_gate.q = reinterpret_cast<const std::int8_t*>(base + i8_up_q);
-      w.up_gate.scale = fp(i8_up_scale);
-      w.up_gate.bias = nullptr;
-      w.down.q = reinterpret_cast<const std::int8_t*>(base + i8_down_q);
-      w.down.scale = fp(i8_down_scale);
-      w.down.bias = nullptr;
-      int8_blocks_[l] = w;
+      index.read_into(p + "proj.o.weight", dst + kInt8.o_q, d * d);
+      index.read_into(p + "proj.o.weight_scale", dst + kInt8.o_scale, d * 4);
+      index.read_into(p + "proj.ffn_up_gate.weight", dst + kInt8.up_q, 2 * f * d);
+      index.read_into(p + "proj.ffn_up_gate.weight_scale", dst + kInt8.up_scale, 2 * f * 4);
+      index.read_into(p + "proj.ffn_down.weight", dst + kInt8.down_q, d * f);
+      index.read_into(p + "proj.ffn_down.weight_scale", dst + kInt8.down_scale, d * 4);
+      if (l < resident) {
+        owned_.emplace_back(i8_block_bytes);
+        owned_.back().upload(streamed.data(), i8_block_bytes);
+        weight_bytes_ += i8_block_bytes;
+        int8_blocks_[l] = int8_weights_at(reinterpret_cast<const char*>(at(owned_.back(), 0)));
+        slot_of_.push_back(-1);
+        host_blocks_.emplace_back();  // resident blocks need no pinned host copy
+      } else {
+        const int s = (l - resident) % 2;
+        if (slots_[s].bytes() == 0) {
+          slots_[s] = DeviceBuffer(slot_bytes);
+          slot_free_[s] = std::make_unique<Event>();
+          copy_done_[s] = std::make_unique<Event>();
+          weight_bytes_ += slot_bytes;
+        }
+        host_weight_bytes_ += i8_block_bytes;
+        slot_of_.push_back(s);
+      }
       // Keep blocks_ aligned with the layer index: a model with mixed INT8/bf16 blocks indexes this vector by l.
       blocks_.push_back(hip_block::BlockWeights{});
-      host_blocks_.emplace_back();  // keep the parallel vectors aligned
-      slot_of_.push_back(-1);  // int8 blocks are always on-device
+      if (l >= resident) host_blocks_.push_back(std::move(streamed));
       continue;
     }
     const std::vector<std::string> names = block_names(l);
@@ -317,10 +347,10 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
     } else {
       const int s = (l - resident) % 2;
       if (slots_[s].bytes() == 0) {
-        slots_[s] = DeviceBuffer(kBlock.bytes);
+        slots_[s] = DeviceBuffer(slot_bytes);
         slot_free_[s] = std::make_unique<Event>();
         copy_done_[s] = std::make_unique<Event>();
-        weight_bytes_ += kBlock.bytes;
+        weight_bytes_ += slot_bytes;
       }
       base = at(slots_[s], 0);
       slot_of_.push_back(s);
@@ -590,6 +620,8 @@ std::vector<std::vector<float>> Dit::forward(const std::vector<float>& latents, 
       copy_async(slots_[s].data(), src.data(), src.bytes(), copy_stream_.get());
       copy_done_[s]->record(copy_stream_.get());
       copy_done_[s]->wait(st);
+      if (is_int8_[static_cast<std::size_t>(l)])
+        int8_blocks_[static_cast<std::size_t>(l)] = int8_weights_at(reinterpret_cast<const char*>(slots_[s].data()));
       mark(hip_block::kBlockOps);
     }
     const LoraBlock* lb = options_.lora != nullptr && options_.lora->loaded()

@@ -30,7 +30,9 @@ inline constexpr int kHeadDim = 128;
 inline constexpr int kFfnDim = 8192;
 
 // Key tokens per step of the online softmax. Part of the numerics: each step's weights are rounded to bf16 relative to
-// the running maximum over the steps so far. The step size follows the engine's FlashAttention-style tile (128 here).
+// the running maximum over the steps so far, so this is also a throughput knob. 128 keys/step is much faster here than
+// 32; the engine's FA2 hdim-128 tiles are 128x32 (sm_89) and 128x64, so exact-attention results are close but not
+// bit-identical to CUDA. This is a deliberate throughput choice, not the engine's tile.
 inline constexpr int kAttentionStepN = 128;
 
 // Packed operands: 16 x 16 fragments contiguous, for rows grouped in 16s and columns in 16s: element (r, c) at

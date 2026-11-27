@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -176,12 +177,15 @@ Lora::Lora(const std::filesystem::path& file, float strength, int blocks) {
   }
 
   constexpr int kDim = 3072, kFfn = 8192;
+  // PEFT/diffusers files put alpha in lora_adapter_metadata instead of an alpha tensor. Without it the adapter runs
+  // at alpha/rank = 1, which is wrong for those files (the engine uses the same fallback).
+  const std::optional<double> meta_alpha = st_file.lora_metadata_alpha();
   std::vector<Adapter> adapters;
   for (const Target& t : targets) {
     if (t.down == nullptr || t.up == nullptr) continue;
     const int rank = static_cast<int>(t.down->shape[0]);
     if (rank <= 0) fail("a LoRA rank is zero");
-    float alpha = static_cast<float>(rank);  // no alpha tensor: alpha / rank = 1
+    float alpha = 0;  // 0: no alpha anywhere, use alpha / rank = 1
     const auto ak = original_key.find(t.alpha_name);
     if (ak != original_key.end()) {
       const st::TensorInfo* ai = st_file.find(ak->second);
@@ -190,10 +194,15 @@ Lora::Lora(const std::filesystem::path& file, float strength, int blocks) {
         if (!av.empty() && std::isfinite(av[0])) alpha = av[0];
       }
     }
+    if (alpha == 0 && meta_alpha.has_value() && std::isfinite(*meta_alpha) && *meta_alpha > 0)
+      alpha = static_cast<float>(*meta_alpha);
+    if (alpha == 0) alpha = static_cast<float>(rank);
     const float coef = strength * (alpha / static_cast<float>(rank));
     int n = 0, k = 0;
     switch (static_cast<LoraSite>(t.site)) {
-      case LoraSite::kQkv: n = kDim, k = kDim; break;
+      // A fused adapter stores q|k|v as one [3 kDim, rank] up factor; the engine splits it into three sites. The branch
+      // assembly below keeps a fused factor intact (n == 3 kDim) and concatenates separate q/k/v factors into one.
+      case LoraSite::kQkv: n = t.module == "qkv" ? 3 * kDim : kDim, k = kDim; break;
       case LoraSite::kO: n = kDim, k = kDim; break;
       case LoraSite::kUpGate: n = 2 * kFfn, k = kDim; break;
       case LoraSite::kDown: n = kDim, k = kFfn; break;

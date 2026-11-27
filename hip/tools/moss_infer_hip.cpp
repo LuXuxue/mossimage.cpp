@@ -198,22 +198,26 @@ void apply_params(Args& a, const json::Value& doc) {
   str("prompt", a.prompt);
   if (!a.prompt.empty()) a.have_prompt = true;
   str("negative_prompt", a.negative);
-  std::int64_t i = 0;
-  integer("height", i);
-  if (i) a.height = static_cast<int>(i);
-  i = 0;
-  integer("width", i);
-  if (i) a.width = static_cast<int>(i);
-  i = 0;
-  integer("steps", i);
-  if (i) a.steps = static_cast<int>(i);
-  if (const json::Value* s = p.find("seed"); s != nullptr && !s->is_null()) {
-    if (!s->is_int()) usage("seed must be an integer");
-    a.seed = s->as_int();
+  // The engine checks the int range; a bare int64 -> int cast would turn an out-of-range value into a valid small one.
+  const auto checked_int = [&](const char* key, int& dst) {
+    std::int64_t i = dst;
+    integer(key, i);
+    if (i < std::numeric_limits<int>::min() || i > std::numeric_limits<int>::max())
+      usage(std::string(key) + " is out of range.");
+    dst = static_cast<int>(i);
+  };
+  checked_int("height", a.height);
+  checked_int("width", a.width);
+  checked_int("steps", a.steps);
+  if (const json::Value* s = p.find("seed"); s != nullptr) {
+    if (s->is_null())
+      a.seed = -1;  // as in pipeline::request_from_parameters: a null seed is a random seed
+    else {
+      if (!s->is_int()) usage("seed must be an integer");
+      a.seed = s->as_int();
+    }
   }
-  i = 0;
-  integer("max_sequence_length", i);
-  if (i) a.max_seq = static_cast<int>(i);
+  checked_int("max_sequence_length", a.max_seq);
   num("cfg", a.cfg);
   num("shift", a.shift);
   num("slg_scale", a.slg_scale);
@@ -449,7 +453,6 @@ Args parse(const std::vector<std::string>& argv) {
   if (a.noise_source != "philox") note("--noise-source");
   if (a.eta != 0) note("--eta");
   if (a.s_noise != 1) note("--s-noise");
-  if (a.scheduler != "moss" || a.flow_multiplier != 1.0) note("--scheduler/--flow-multiplier");
   if (a.slg_scale != 0 || !a.slg.empty()) note("--slg-*");
   if (a.cfg_truncation != 1.0) note("--cfg-truncation");
   if (a.list) return a;
@@ -467,6 +470,20 @@ Args parse(const std::vector<std::string>& argv) {
   }
   if (a.steps < 1) usage("Steps and image count must be positive.");
   if (a.steps > kMaxSteps) usage("Steps must be at most " + std::to_string(kMaxSteps) + ".");
+  // These arrive as doubles but the sampler stores floats: a finite double above FLT_MAX would become inf here and
+  // poison the latents, so reject it as a usage error rather than silently producing NaNs.
+  const auto finite_f32 = [&](double v, const char* what) {
+    if (!std::isfinite(v) || std::fabs(v) > static_cast<double>(std::numeric_limits<float>::max()))
+      usage(std::string(what) + " must be finite and within the float range.");
+  };
+  finite_f32(a.cfg, "CFG");
+  finite_f32(a.shift, "shift");
+  finite_f32(a.slg_scale, "slg-scale");
+  finite_f32(a.slg_start, "slg-start");
+  finite_f32(a.slg_stop, "slg-stop");
+  finite_f32(a.cfg_truncation, "cfg-truncation");
+  finite_f32(a.eta, "eta");
+  finite_f32(a.s_noise, "s-noise");
   if (a.cfg < 0 || a.shift <= 0) usage("CFG must be finite and nonnegative; shift must be finite and positive.");
   if (a.seed < -1 || a.seed >= kMaxSeed) usage("Seed must be -1 (random) or an integer from 0 to 2^53-1 (browser-safe range).");
   if (a.max_seq < 1 || a.max_seq > static_cast<int>(tok::kMossMaxSequenceLength)) {
@@ -580,7 +597,8 @@ int run(const Args& a) {
       const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
       if (std::string_view(stage) == "denoise" && done > 0) {
         // Like the CUDA CLI: redraw one line in place instead of one line per step.
-        std::fprintf(stderr, "\rstep %d/%d  %.2f s/step %s", done, total, now - last, done == total ? "\n" : "");
+        // Fixed-width time so a shorter value cannot leave stale digits from the previous step on the line.
+        std::fprintf(stderr, "\rstep %d/%d  %7.2f s/step    %s", done, total, now - last, done == total ? "\n" : "");
       } else if (done == 0) {
         std::fprintf(stderr, "%s\n", stage);
       }

@@ -164,7 +164,10 @@ int main(int argc, char** argv) {
     } else if (arg == "--time-ops") {
       options.time_ops = true;
     } else if (arg == "--row-major") {
+      // The tiled GEMM is the default and wins regardless of `packed`; to actually compare the legacy operands both
+      // switches have to be off.
       options.packed = false;
+      options.tiled_gemm = false;
     } else if (arg == "--noise-floor" && i + 1 < argc) {
       floor_file = argv[++i];
     } else if (arg == "--prefix" && i + 1 < argc) {
@@ -209,8 +212,8 @@ int main(int argc, char** argv) {
     Device device(device_index);
     TextEncoder encoder(device, weights, options);
     std::printf("device %d: %s (%s), build %s, GEMMs on %s operands; %zu sequences in one call\n", device.info().index,
-                device.info().name.c_str(), device.info().arch.c_str(), build_target(), options.packed ? "packed" : "row-major",
-                seqs.size());
+                device.info().name.c_str(), device.info().arch.c_str(), build_target(),
+                options.tiled_gemm ? "tiled" : (options.packed ? "packed" : "row-major"), seqs.size());
     std::map<int, std::vector<std::uint16_t>> layers;
     const TeLayerHook hook = [&](int layer, const std::uint16_t* hidden, std::uint32_t tokens, hipStream_t stream) {
       if (layer != 0 && layer != 3 && layer != 31 && dump.empty()) return;

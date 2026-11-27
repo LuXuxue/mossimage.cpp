@@ -36,9 +36,6 @@ int main() {
     }
     std::printf("g=%d ref %.3fs fast %.4fs speedup %.1fx  worst=%.3g mean=%.3g bf16diff=%zu/%zu\n", g, slow, fast,
                 slow / fast, worst, sum / got.size(), bad_bf16, got.size());
-    if (g == 4) {
-      for (int i = 0; i < 8; ++i) std::printf("  i=%d q=%d ref=%.6f fast=%.6f\n", i, quant[i], want[i], got[i]);
-    }
   }
   return 0;
 }

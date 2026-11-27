@@ -3,10 +3,10 @@
 //   - forward(): one sampling step for several rows (cond, uncond, ...). The time embedding and the shared modulation run
 //     once; the rows' joint sequences [video_r | text_r] are concatenated, so each linear runs once over all rows and
 //     attention is one varlen call per run of rows. A block that some rows skip runs on the other rows' token ranges only.
-// Each op follows the reference's order and bf16/fp32 rounding, as the engine's CUDA forward (src/models/moss_dit). The
-// 42 blocks run hip_block's packed path: their GEMM weights are packed on the host at load (hip_block::pack_fragments'
-// layout). Blocks past the device budget stay in pinned host memory and are copied into one of two device slots on a
-// copy stream while the block before them runs.
+// Each op follows the reference's order and bf16/fp32 rounding, as the engine's CUDA forward (src/models/moss_dit).
+// bf16 blocks run hip_block's packed path (weights packed on the host at load into pack_fragments' layout); INT8 ConvRot
+// blocks run int8_block's path instead. Blocks past the device budget stay in pinned host memory and are copied into one
+// of two device slots on a copy stream while the block before them runs.
 #pragma once
 
 #include <bitset>

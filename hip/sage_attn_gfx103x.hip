@@ -24,7 +24,7 @@ constexpr int kBlockN = 16;    // keys per tile
 constexpr int kTM = 8;         // output columns per thread group
 constexpr int kQuads = kHeadDim / 4;
 constexpr int kTD = kHeadDim / kTM;
-constexpr int kMinBlkQ = 32, kMinBlkK = 16;
+constexpr int kMinBlkK = 16;
 constexpr float kMaskedScore = -3.0e38f;
 
 __device__ __forceinline__ int sdot4(int a, int b, int c) { return __builtin_amdgcn_sdot4(a, b, c, true); }

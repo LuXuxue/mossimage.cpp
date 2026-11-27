@@ -134,7 +134,6 @@ class Event {
   Event(const Event&) = delete;
   Event& operator=(const Event&) = delete;
 
-  hipEvent_t get() const { return e_; }
   void record(hipStream_t stream);
   // Makes `stream` wait on the device for this event's last record.
   void wait(hipStream_t stream) const;

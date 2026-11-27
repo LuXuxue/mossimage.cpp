@@ -511,6 +511,7 @@ VaeDecodeStats decode_impl(const VaeDecoder::Weights& wt, Products products, boo
 }  // namespace
 
 VaeDecoder::VaeDecoder(Device& device, const std::filesystem::path& path) : device_(device), weights_(std::make_unique<Weights>()) {
+  device_.make_current();
   const st::File file(path);
   const st::TensorInfo* conv_in = file.find("decoder.conv_in.weight");
   if (conv_in == nullptr || conv_in->shape.size() != 4 || conv_in->shape[0] % 4 != 0 || conv_in->shape[1] != 32) {
@@ -522,14 +523,17 @@ VaeDecoder::VaeDecoder(Device& device, const std::filesystem::path& path) : devi
   Weights& w = *weights_;
   // gfx1035 has no bf16 arithmetic: the default TF32 path needs four fp16 dot products per MAC. One fp16-rounded
   // operand needs one, which is much faster and is how ComfyUI's --fp16-vae runs. MI_HIP_VAE_FP16=0 keeps the old path.
+  // Ask this decoder's device, not whichever device happens to be current (the process may hold several).
+  const bool rdna2 = device_.info().arch.compare(0, 6, "gfx103") == 0;
   const char* fp16_env = std::getenv("MI_HIP_VAE_FP16");
-  const bool fp16 = fp16_env != nullptr ? std::strcmp(fp16_env, "0") != 0 : device_is_rdna2();
-  if (fp16 && !device_is_rdna2())
-    throw std::runtime_error("hip vae: MI_HIP_VAE_FP16 needs a gfx103x (RDNA2) device");
-  vae_fp16_flag() = fp16;
+  const bool fp16 = fp16_env != nullptr ? std::strcmp(fp16_env, "0") != 0 : rdna2;
+  if (fp16 && !rdna2) throw std::runtime_error("hip vae: MI_HIP_VAE_FP16 needs a gfx103x (RDNA2) device");
   const char* act_env = std::getenv("MI_HIP_VAE_FP16_ACT");
   const bool act = act_env != nullptr ? std::strcmp(act_env, "0") != 0 : fp16;
   if (act && !fp16) throw std::runtime_error("hip vae: MI_HIP_VAE_FP16_ACT needs the fp16 operand path");
+  fp16_ = fp16;
+  fp16_act_ = act;
+  vae_fp16_flag() = fp16;
   vae_fp16_act_flag() = act;
   conv_products_ = fp16 ? Products::kFp16 : Products::kTf32;
   Packer pk(file, fp16);
@@ -604,6 +608,10 @@ VaeDecodeStats VaeDecoder::decode(const float* latents, std::uint32_t h, std::ui
                                   std::vector<float>* image) {
   const auto t0 = std::chrono::steady_clock::now();
   device_.make_current();
+  // The layout/planner helpers are static and read process-global mode flags. Reassert this decoder's mode so using two
+  // decoders in one process cannot make one decode with the other's activation storage or attention pieces.
+  vae_fp16_flag() = fp16_;
+  vae_fp16_act_flag() = fp16_act_;
   require_fits(h, w);
   VaeDecodeStats st =
       vae_fp16_act() ? decode_impl<std::uint16_t>(*weights_, conv_products_, profile_, base_, latents, h, w, rgb, image)
@@ -1374,8 +1382,10 @@ VaeDecodeStats VaeDecoder::decode_tiled_exact(const float* latents, std::uint32_
                                                std::vector<float>* image) {
   const auto t0 = std::chrono::steady_clock::now();
   const int c = base_;
-  const Layout l = layout(c, h, w);  // validates the latent grid
   device_.make_current();
+  vae_fp16_flag() = fp16_;
+  vae_fp16_act_flag() = fp16_act_;
+  const Layout l = layout(c, h, w);  // validates the latent grid
   require(plan.height == h && plan.width == w && plan.base_channels == c,
           "tile plan was made for another latent grid or decoder width");
   const Planner p(c, h, w);

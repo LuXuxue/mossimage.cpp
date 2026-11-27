@@ -25,6 +25,7 @@ namespace hip_block {
 using detail::add;
 using detail::bf;
 using detail::f;
+using detail::rbf;
 
 constexpr int kWave = 32;
 
@@ -156,7 +157,8 @@ __global__ __launch_bounds__(256) void int8_gemm_valu(const Int8GemmArgs a, int 
       if (ldrow != nullptr) v += f(ldrow[col]);
       const bf16_bits g = bf(v);
       if (a.gate != nullptr) {
-        const float prod = f(g) * f(gt[j]);
+        // bf(res + bf(bf(gemm) * gate)), the same rounding points as the bf16 GatedResidualOp.
+        const float prod = rbf(f(g) * f(gt[j]));
         const float res = a.residual != nullptr ? f(a.residual[static_cast<std::int64_t>(row) * a.ldr + col]) : 0.0f;
         out[j] = bf(add(res, prod));
       } else {
@@ -187,7 +189,7 @@ __global__ void int8_gemm_valu(const Int8GemmArgs, int) { __builtin_trap(); }
 
 // Stage a ROWS x BKB byte tile from global into registers, then write it to LDS. One 16-byte chunk per lane per pass;
 // out-of-range rows and the K tail are zero-filled so the WMMA reads never leave the tile.
-template <int ROWS, int BKB, int THREADS>
+template <int ROWS, int BKB, int THREADS, bool kTail>
 struct TileStager {
   static constexpr int kPerRow = BKB / 16;
   static constexpr int kChunks = ROWS * kPerRow;
@@ -197,17 +199,32 @@ struct TileStager {
 
   uint4 regs[kPerThread];
 
-  __device__ __forceinline__ void load(const std::int8_t* src, int row0, int rows_total, int kbyte0,
-                                       int kbytes) {
+  __device__ __forceinline__ void load(const std::int8_t* src, int row0, int rows_total, std::int64_t ld,
+                                       int kbyte0, int kbytes) {
     const int tid = static_cast<int>(threadIdx.x);
 #pragma unroll
     for (int i = 0; i < kPerThread; ++i) {
       const int c = tid * kPerThread + i;
       const int row = row0 + c / kPerRow;
       const int kbyte = kbyte0 + (c % kPerRow) * 16;
-      regs[i] = (row < rows_total && kbyte < kbytes)
-                    ? *reinterpret_cast<const uint4*>(src + static_cast<std::int64_t>(row) * kbytes + kbyte)
-                    : make_uint4(0, 0, 0, 0);
+      if constexpr (kTail) {
+        regs[i] = make_uint4(0, 0, 0, 0);
+        if (row >= rows_total || kbyte >= kbytes) continue;
+        const std::int8_t* p = src + static_cast<std::int64_t>(row) * ld + kbyte;
+        if (kbyte + 16 <= kbytes) {
+          regs[i] = *reinterpret_cast<const uint4*>(p);
+        } else {
+          // Fewer than 16 bytes left in this row: a vector load would cross into the next row (or past the buffer).
+          unsigned char* d = reinterpret_cast<unsigned char*>(&regs[i]);
+          const unsigned char* s = reinterpret_cast<const unsigned char*>(p);
+#pragma unroll 1
+          for (int b = 0; b < 16; ++b) d[b] = (kbyte + b < kbytes) ? s[b] : 0;
+        }
+      } else {
+        regs[i] = (row < rows_total && kbyte < kbytes)
+                      ? *reinterpret_cast<const uint4*>(src + static_cast<std::int64_t>(row) * ld + kbyte)
+                      : make_uint4(0, 0, 0, 0);
+      }
     }
   }
 
@@ -224,14 +241,14 @@ struct TileStager {
 // C[m, n] = epilogue(A[m, k] @ B[n, k]^T), B in its natural [N, K] row-major form. WARPS_M*WARPS_N waves of 32 threads
 // tile a BM x BN output tile; each wave owns TM*TN 16x16 WMMA tiles. K walks in BKB-byte stages, each holding kSteps
 // 16-byte WMMA K-steps. The next stage's global loads and the next K-step's fragments are issued ahead of the MMAs.
-template <int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN>
+template <int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN, bool kTail>
 __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void int8_gemm_tiled(
     const Int8GemmArgs a, int x_blocks) {
   constexpr int kThreads = WARPS_M * WARPS_N * kWave;
   constexpr int kStride = BKB + 16;
   constexpr int kSteps = BKB / 16;
   static_assert(BM == WARPS_M * TM * 16 && BN == WARPS_N * TN * 16, "warp grid must tile the block");
-  static_assert(TileStager<BM, BKB, kThreads>::kStride == kStride, "staging stride must match read stride");
+  static_assert(TileStager<BM, BKB, kThreads, kTail>::kStride == kStride, "staging stride must match read stride");
 
   __shared__ __align__(16) std::int8_t As[BM * kStride];
   __shared__ __align__(16) std::int8_t Bs[BN * kStride];
@@ -263,9 +280,10 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void int8_gemm_tiled(
     for (int j = 0; j < TN; ++j) i8leaf::clear(acc[i][j]);
   }
 
-  TileStager<BM, BKB, kThreads> sa, sb;
-  sa.load(a.x, m0, a.m, 0, a.k);
-  sb.load(a.w, n0, a.n, 0, a.k);
+  TileStager<BM, BKB, kThreads, kTail> sa, sb;
+  // int8 elements are one byte: the row stride is ldx for A and k for B (the weight is [n, k] contiguous).
+  sa.load(a.x, m0, a.m, a.ldx, 0, a.k);
+  sb.load(a.w, n0, a.n, a.k, 0, a.k);
   sa.store(As);
   sb.store(Bs);
   __syncthreads();
@@ -274,8 +292,8 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void int8_gemm_tiled(
     const int knext = k0 + BKB;
     const bool has_next = knext < a.k;
     if (has_next) {
-      sa.load(a.x, m0, a.m, knext, a.k);
-      sb.load(a.w, n0, a.n, knext, a.k);
+      sa.load(a.x, m0, a.m, a.ldx, knext, a.k);
+      sb.load(a.w, n0, a.n, a.k, knext, a.k);
     }
 
     i8leaf::FragA af[2][TM];
@@ -357,8 +375,8 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void int8_gemm_tiled(
         const bf16_bits g = bf(v);  // the GEMM's own bf16 rounding, before the optional gate+residual epilogue
         const std::size_t at = static_cast<std::size_t>(r) * a.ldy + c;
         if (a.gate != nullptr) {
-          // bf(x + bf(gemm_out)*gate): read the residual before storing to it (it may alias y).
-          const float prod = f(g) * f(gt[j]);
+          // bf(x + bf(bf(gemm_out)*gate)): read the residual before storing to it (it may alias y).
+          const float prod = rbf(f(g) * f(gt[j]));
           const float res = a.residual != nullptr ? f(a.residual[static_cast<std::int64_t>(r) * a.ldr + c]) : 0.0f;
           a.y[at] = bf(add(res, prod));
         } else {
@@ -396,9 +414,17 @@ void int8_gemm(hip_block::bf16_bits* y, std::int64_t ldy, const std::int8_t* x, 
     if (device_is_rdna2()) {
       hip_block::int8_gemm_valu<<<grid, 256, 0, stream>>>(a, xn);
     } else if (deep) {
-      hip_block::int8_gemm_tiled<128, 128, 128, 2, 2, 4, 4><<<grid, 128, 0, stream>>>(a, xn);
+      // K is a multiple of 16 for every model GEMM; keep the original single-predicate staging path there and only
+      // pay for a masked tail when a caller supplies an unusual K.
+      if (k % 16 != 0)
+        hip_block::int8_gemm_tiled<128, 128, 128, 2, 2, 4, 4, true><<<grid, 128, 0, stream>>>(a, xn);
+      else
+        hip_block::int8_gemm_tiled<128, 128, 128, 2, 2, 4, 4, false><<<grid, 128, 0, stream>>>(a, xn);
     } else {
-      hip_block::int8_gemm_tiled<128, 128, 64, 4, 4, 2, 2><<<grid, 512, 0, stream>>>(a, xn);
+      if (k % 16 != 0)
+        hip_block::int8_gemm_tiled<128, 128, 64, 4, 4, 2, 2, true><<<grid, 512, 0, stream>>>(a, xn);
+      else
+        hip_block::int8_gemm_tiled<128, 128, 64, 4, 4, 2, 2, false><<<grid, 512, 0, stream>>>(a, xn);
     }
   }
   const hipError_t e = hipGetLastError();

@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -246,6 +247,16 @@ void close_fd(int fd) {
 #endif
 }
 
+std::optional<double> parse_lora_alpha(const std::string& text) {
+  const Json v = Parser(text).parse_document();
+  if (v.kind != Json::Kind::kObject) return std::nullopt;
+  const Json* a = v.find("lora_alpha");
+  if (a == nullptr || a->kind != Json::Kind::kNumber || !std::isfinite(a->number)) return std::nullopt;
+  if (const Json* p = v.find("alpha_pattern"); p != nullptr && p->kind == Json::Kind::kObject && !p->keys.empty())
+    return std::nullopt;  // per-module alphas are a different rule; do not guess one value for every site
+  return a->number;
+}
+
 }  // namespace
 
 File::File(const std::filesystem::path& file) : path_(utf8(file)) {
@@ -270,7 +281,18 @@ File::File(const std::filesystem::path& file) : path_(utf8(file)) {
     for (std::size_t m = 0; m < root.keys.size(); ++m) {
       const std::string& name = root.keys[m];
       const Json& v = root.values[m];
-      if (name == "__metadata__") continue;
+      if (name == "__metadata__") {
+        if (v.kind == Json::Kind::kObject) {
+          for (std::size_t k = 0; k < v.keys.size(); ++k) {
+            const Json& mv = v.values[k];
+            if (mv.kind == Json::Kind::kString)
+              metadata_[v.keys[k]] = mv.text;
+            else if (mv.kind == Json::Kind::kNumber)
+              metadata_[v.keys[k]] = std::to_string(mv.number);
+          }
+        }
+        continue;
+      }
       const Json* dtype = v.find("dtype");
       const Json* shape = v.find("shape");
       const Json* offsets = v.find("data_offsets");
@@ -303,6 +325,11 @@ File::File(const std::filesystem::path& file) : path_(utf8(file)) {
 }
 
 File::~File() { close_fd(fd_); }
+
+std::optional<double> File::lora_metadata_alpha() const {
+  const auto it = metadata_.find("lora_adapter_metadata");
+  return it == metadata_.end() ? std::nullopt : parse_lora_alpha(it->second);
+}
 
 const TensorInfo* File::find(const std::string& name) const {
   const auto it = by_name_.find(name);

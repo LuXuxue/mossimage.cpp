@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,8 @@ class File {
   const std::vector<TensorInfo>& tensors() const { return tensors_; }
   const TensorInfo* find(const std::string& name) const;  // null if absent
   const TensorInfo& at(const std::string& name) const;    // throws if absent
+  // lora_adapter_metadata's lora_alpha, as PEFT/diffusers LoRA files store it when there is no alpha tensor.
+  std::optional<double> lora_metadata_alpha() const;
 
   // `bytes` bytes of tensor `t` from byte `rel` of it into `dst`.
   void read(const TensorInfo& t, void* dst, std::uint64_t rel, std::uint64_t bytes) const;
@@ -43,6 +46,7 @@ class File {
   int fd_ = -1;
   std::vector<TensorInfo> tensors_;
   std::map<std::string, std::size_t> by_name_;
+  std::map<std::string, std::string> metadata_;
 };
 
 // model.safetensors.index.json's weight_map: tensor name -> shard file name (relative to the index's directory).

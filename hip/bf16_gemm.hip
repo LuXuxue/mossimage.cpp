@@ -41,7 +41,7 @@ __device__ __forceinline__ __half bf16_to_half(bf16 b) {
 // Same template signature as the WMMA kernel below: host launchers cannot see __GFX10__ (a device-only macro), so they
 // must reference a kernel name that exists in every architecture's code object. The RDNA2 body ignores the template's
 // blocking arguments and uses the fixed tile above; the launcher picks the matching grid and thread count at runtime.
-template <int, int, int, int, int, int, int>
+template <int, int, int, int, int, int, int, bool kTail>
 __global__ __launch_bounds__(256) void gemm_tiled(const Bf16GemmArgs a) {
   constexpr int TM = 4, TN = 4, BM = 64, BN = 64, BK = 64, THREADS = 256;
   constexpr int STRIDE = BK + 8;
@@ -67,16 +67,34 @@ __global__ __launch_bounds__(256) void gemm_tiled(const Bf16GemmArgs a) {
       __half* dst = is_a ? &As[buf][0] : &Bs[buf][0];
       for (int i = tid; i < rows * (BK / kVec); i += THREADS) {
         const int r = i / (BK / kVec), c = i % (BK / kVec), gk = k0 + c * kVec;
+        const int row = (is_a ? m0 : n0) + r;
         uint4 val = make_uint4(0, 0, 0, 0);
-        if ((is_a ? m0 + r < a.m : n0 + r < a.n) && gk < a.k)
-          val = *reinterpret_cast<const uint4*>(src + static_cast<std::int64_t>((is_a ? m0 : n0) + r) * ld + gk);
+        if constexpr (kTail) {
+          // A row can be shorter than one 16-byte vector (e.g. a rank-4 LoRA: k = 4). Load only the elements that
+          // exist in that row; the rest of the tile is zero so the dot products ignore them.
+          if ((is_a ? row < a.m : row < a.n) && gk < a.k) {
+            const bf16* p = src + static_cast<std::int64_t>(row) * ld + gk;
+            if (gk + kVec <= a.k) {
+              val = *reinterpret_cast<const uint4*>(p);
+            } else {
+              unsigned char* d = reinterpret_cast<unsigned char*>(&val);
+              const unsigned char* s = reinterpret_cast<const unsigned char*>(p);
+#pragma unroll 1
+              for (int b = 0; b < 2 * kVec; ++b) d[b] = (2 * gk + b < 2 * a.k) ? s[b] : 0;
+            }
+          }
+        } else {
+          if ((is_a ? row < a.m : row < a.n) && gk < a.k)
+            val = *reinterpret_cast<const uint4*>(src + static_cast<std::int64_t>(row) * ld + gk);
+        }
         const std::uint32_t w[4] = {val.x, val.y, val.z, val.w};
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
           const std::uint32_t word = w[q];
           const std::uint16_t lo = static_cast<std::uint16_t>(word), hi = static_cast<std::uint16_t>(word >> 16);
-          dst[r * STRIDE + c * kVec + 2 * q] = gk < a.k ? bf16_to_half(lo) : __float2half_rn(0.0f);
-          dst[r * STRIDE + c * kVec + 2 * q + 1] = gk < a.k ? bf16_to_half(hi) : __float2half_rn(0.0f);
+          dst[r * STRIDE + c * kVec + 2 * q] = (kTail ? gk + 2 * q : gk) < a.k ? bf16_to_half(lo) : __float2half_rn(0.0f);
+          dst[r * STRIDE + c * kVec + 2 * q + 1] =
+              (kTail ? gk + 2 * q + 1 : gk) < a.k ? bf16_to_half(hi) : __float2half_rn(0.0f);
         }
       }
     }
@@ -136,7 +154,7 @@ __global__ __launch_bounds__(256) void gemm_tiled(const Bf16GemmArgs a) {
 
 #else  // !__GFX10__
 
-template <int ROWS, int BKB, int THREADS>
+template <int ROWS, int BKB, int THREADS, bool kTail>
 struct Stager {
   static constexpr int kPerRow = BKB / 16;
   static constexpr int kChunks = ROWS * kPerRow;
@@ -146,17 +164,34 @@ struct Stager {
 
   uint4 regs[kPerThread];
 
-  __device__ __forceinline__ void load(const bf16* src, int row0, int rows_total, int kbyte0, int kbytes) {
+  __device__ __forceinline__ void load(const bf16* src, int row0, int rows_total, std::int64_t ld_bytes, int kbyte0,
+                                       int kbytes) {
     const int tid = static_cast<int>(threadIdx.x);
 #pragma unroll
     for (int i = 0; i < kPerThread; ++i) {
       const int c = tid * kPerThread + i;
       const int row = row0 + c / kPerRow;
       const int kbyte = kbyte0 + (c % kPerRow) * 16;
-      regs[i] = (row < rows_total && kbyte < kbytes)
-                    ? *reinterpret_cast<const uint4*>(reinterpret_cast<const char*>(src) +
-                                                       static_cast<std::size_t>(row) * kbytes + kbyte)
-                    : make_uint4(0, 0, 0, 0);
+      if constexpr (kTail) {
+        regs[i] = make_uint4(0, 0, 0, 0);
+        if (row >= rows_total || kbyte >= kbytes) continue;
+        const char* p = reinterpret_cast<const char*>(src) + static_cast<std::int64_t>(row) * ld_bytes + kbyte;
+        if (kbyte + 16 <= kbytes) {
+          regs[i] = *reinterpret_cast<const uint4*>(p);
+        } else {
+          // Partial tail chunk: a 16-byte load would run into the next row (or past the allocation). Zero-fill the
+          // bytes that are not part of this row, so the WMMA instruction consumes them as zero operands.
+          unsigned char* d = reinterpret_cast<unsigned char*>(&regs[i]);
+          const unsigned char* s = reinterpret_cast<const unsigned char*>(p);
+#pragma unroll 1
+          for (int b = 0; b < 16; ++b) d[b] = (kbyte + b < kbytes) ? s[b] : 0;
+        }
+      } else {
+        regs[i] = (row < rows_total && kbyte < kbytes)
+                      ? *reinterpret_cast<const uint4*>(reinterpret_cast<const char*>(src) +
+                                                         static_cast<std::int64_t>(row) * ld_bytes + kbyte)
+                      : make_uint4(0, 0, 0, 0);
+      }
     }
   }
 
@@ -170,13 +205,13 @@ struct Stager {
   }
 };
 
-template <int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN>
+template <int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN, bool kTail>
 __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_tiled(const Bf16GemmArgs a) {
   constexpr int kThreads = WARPS_M * WARPS_N * kWave;
   constexpr int kStride = BKB + 32;
   constexpr int kSteps = BKB / 32;
   static_assert(BM == WARPS_M * TM * 16 && BN == WARPS_N * TN * 16, "warp grid must tile the block");
-  static_assert(Stager<BM, BKB, kThreads>::kStride == kStride, "staging stride must match read stride");
+  static_assert(Stager<BM, BKB, kThreads, kTail>::kStride == kStride, "staging stride must match read stride");
 
   __shared__ __align__(16) std::int8_t As[BM * kStride];
   __shared__ __align__(16) std::int8_t Bs[BN * kStride];
@@ -205,9 +240,10 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_tiled(const Bf16
     for (int j = 0; j < TN; ++j) acc[i][j] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
   const int kbytes = 2 * a.k;
-  Stager<BM, BKB, kThreads> sa, sb;
-  sa.load(a.a, m0, a.m, 0, kbytes);
-  sb.load(a.b, n0, a.n, 0, kbytes);
+  const std::int64_t lda_bytes = 2 * a.lda, ldb_bytes = 2 * a.ldb;
+  Stager<BM, BKB, kThreads, kTail> sa, sb;
+  sa.load(a.a, m0, a.m, lda_bytes, 0, kbytes);
+  sb.load(a.b, n0, a.n, ldb_bytes, 0, kbytes);
   sa.store(As);
   sb.store(Bs);
   __syncthreads();
@@ -216,8 +252,8 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_tiled(const Bf16
     const int knext = k0 + BKB;
     const bool has_next = knext < kbytes;
     if (has_next) {
-      sa.load(a.a, m0, a.m, knext, kbytes);
-      sb.load(a.b, n0, a.n, knext, kbytes);
+      sa.load(a.a, m0, a.m, lda_bytes, knext, kbytes);
+      sb.load(a.b, n0, a.n, ldb_bytes, knext, kbytes);
     }
     v16bf af[2][TM], bf[2][TN];
 #pragma unroll
@@ -283,7 +319,9 @@ void bf16_gemm_tiled(bf16* c, std::int64_t ldc, const bf16* a, std::int64_t lda,
   // The same template instantiation is launched on both architectures so the mangled kernel name exists in every
   // object of the fat binary. Only the grid and the thread count differ: RDNA2's body uses a 64x64 tile / 256 threads.
   const bool rdna2 = device_is_rdna2();
-  if (rdna2 && k % 8 != 0) throw std::runtime_error("hip bf16 gemm: RDNA2 requires k to be a multiple of 8");
+  // bf16 vector loads are 16 bytes = 8 elements. Only a non-multiple-of-8 K needs the masked tail path; the aligned
+  // case keeps the original single-predicate load (the extra branch there measured ~30% slower on every GEMM).
+  const bool tail = k % 8 != 0;
   const int tile = rdna2 ? 64 : 128;
   const int gx = (m + tile - 1) / tile, gy = (n + tile - 1) / tile;
   for (int x0 = 0; x0 < gx; x0 += kChunk) {
@@ -291,11 +329,20 @@ void bf16_gemm_tiled(bf16* c, std::int64_t ldc, const bf16* a, std::int64_t lda,
     args.m_block0 = x0;
     dim3 grid(gy, xn, 1);
     if (rdna2) {
-      gemm_tiled<128, 128, 128, 2, 2, 4, 4><<<grid, 256, 0, stream>>>(args);
+      if (tail)
+        gemm_tiled<128, 128, 128, 2, 2, 4, 4, true><<<grid, 256, 0, stream>>>(args);
+      else
+        gemm_tiled<128, 128, 128, 2, 2, 4, 4, false><<<grid, 256, 0, stream>>>(args);
     } else if (k >= 2048) {
-      gemm_tiled<128, 128, 128, 2, 2, 4, 4><<<grid, 128, 0, stream>>>(args);
+      if (tail)
+        gemm_tiled<128, 128, 128, 2, 2, 4, 4, true><<<grid, 128, 0, stream>>>(args);
+      else
+        gemm_tiled<128, 128, 128, 2, 2, 4, 4, false><<<grid, 128, 0, stream>>>(args);
     } else {
-      gemm_tiled<128, 128, 64, 4, 4, 2, 2><<<grid, 512, 0, stream>>>(args);
+      if (tail)
+        gemm_tiled<128, 128, 64, 4, 4, 2, 2, true><<<grid, 512, 0, stream>>>(args);
+      else
+        gemm_tiled<128, 128, 64, 4, 4, 2, 2, false><<<grid, 512, 0, stream>>>(args);
     }
   }
   const hipError_t e = hipGetLastError();
