@@ -18,6 +18,8 @@ SageAttention. The gfx1103 (and other matrix-core) paths are unchanged.
 - INT8 SageAttention-style attention: u8 probabilities on matrix-core devices, int8 Q/K with fp16 V on RDNA2
 - Accepts the `moss-infer generate` flag set, UTF-8 prompts, single-file
   `--dit`/`--te`/`--vae` overrides, varlen batches and high-resolution support.
+  DiT files with ComfyUI's `model.diffusion_model.` / `diffusion_model.` tensor
+  prefixes are accepted as well as the official unprefixed names.
   Flags that need CUDA-only machinery are accepted but print a no-effect notice.
 
 ## Build (Windows / TheRock)

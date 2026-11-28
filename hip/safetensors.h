@@ -56,7 +56,8 @@ std::map<std::string, std::string> read_index(const std::filesystem::path& path)
 // with exactly one .safetensors. Unlike Index, this keeps the file paths so a caller can open them itself.
 std::map<std::string, std::filesystem::path> index_files(const std::filesystem::path& path);
 
-// The tensors of one file, or of every shard of a model directory, by name.
+// The tensors of one file, or of every shard of a model directory, by name. DiT tensor names are canonicalized:
+// a `model.diffusion_model.` / `diffusion_model.` prefix is stripped, as the CUDA backend does.
 class Index {
  public:
   // A .safetensors file, or a directory holding one *.safetensors.index.json (its shards) or exactly one .safetensors.
