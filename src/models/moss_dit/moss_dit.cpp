@@ -22,6 +22,7 @@
 #include "models/moss_dit/dit_kernels.h"
 #include "models/moss_dit/nvfp4_support.h"
 #include "runtime/pinned_ring.h"
+#include "weights/quant/quant_codec.h"
 #include "weights/test_seams.h"
 #include "weights/upload.h"
 
@@ -759,10 +760,105 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
       merge_targets_.emplace_back(module, t);
     }
   };
+  // StarNodes-style INT8 ConvRot files quantize every linear, including the globals and the text refiner, which this
+  // engine runs as bf16. Undo the rotation on load for those linears; the DiT blocks stay INT8.
+  struct ExtraBf16 {
+    std::string name;
+    std::string module;
+    std::vector<std::int64_t> shape;
+    std::vector<std::uint16_t> bits;
+    std::size_t offset = 0;
+  };
+  const auto extra_module = [&](const weights::IndexedTensor& t) {
+    if (t.dtype != weights::DType::kI8 || !t.name.ends_with(".weight")) return std::string();
+    const std::string module = t.name.substr(0, t.name.size() - 7);
+    const quant::QuantSpec* spec = quant != nullptr ? quant->find_spec(module) : nullptr;
+    return spec != nullptr && spec->format == quant::QuantFormat::kInt8ConvRot ? module : std::string();
+  };
+  const auto install_extras = [&](const WeightGroup& g, TensorMap& m) {
+    if (g.name != "globals" && g.name != "text_embedder") return;
+    std::vector<ExtraBf16> extras;
+    for (const auto& t : g.tensors) {
+      const std::string module = extra_module(t);
+      if (module.empty()) continue;
+      const weights::IndexedTensor* scale = nullptr;
+      for (const auto& c : g.tensors) {
+        if (c.name == module + ".weight_scale") {
+          scale = &c;
+          break;
+        }
+      }
+      if (scale == nullptr || scale->dtype != weights::DType::kF32 || t.shape.size() != 2 || scale->numel() != t.shape[0])
+        continue;
+      const std::int64_t n = t.shape[0], k = t.shape[1];
+      std::vector<std::int8_t> q(t.nbytes);
+      std::vector<float> s(scale->nbytes / sizeof(float));
+      readers.get(t.file).read_at(t.offset, q.data(), q.size());
+      readers.get(scale->file).read_at(scale->offset, s.data(), s.size() * sizeof(float));
+      std::vector<float> deq(static_cast<std::size_t>(n * k));
+      quant::dequantize_rows(q.data(), s.data(), n, k, quant->find_spec(module)->group, deq.data());
+      ExtraBf16 e;
+      e.name = t.name;
+      e.module = module;
+      e.shape = t.shape;
+      e.bits.resize(deq.size());
+      for (std::size_t i = 0; i < deq.size(); ++i) e.bits[i] = quant::float_to_bf16(deq[i]);
+      extras.push_back(std::move(e));
+    }
+    if (extras.empty()) return;
+    // ffn_up and ffn_gate must stay adjacent and in that order for fuse()'s contiguity check.
+    const auto parent = [](const std::string& name) {
+      const std::size_t dot = name.rfind('.');
+      return dot == std::string::npos ? name : name.substr(0, dot);
+    };
+    const auto rank = [](const std::string& name) {
+      if (name.ends_with(".qkv")) return 0;
+      if (name.ends_with(".proj")) return 1;
+      if (name.ends_with(".ffn_up")) return 2;
+      if (name.ends_with(".ffn_gate")) return 3;
+      if (name.ends_with(".ffn_down")) return 4;
+      return 5;
+    };
+    std::sort(extras.begin(), extras.end(), [&](const ExtraBf16& a, const ExtraBf16& b) {
+      if (parent(a.module) != parent(b.module)) return parent(a.module) < parent(b.module);
+      return rank(a.module) < rank(b.module);
+    });
+    std::size_t bytes = 0;
+    for (auto& e : extras) {
+      e.offset = align_up(bytes);
+      bytes = e.offset + e.bits.size() * sizeof(std::uint16_t);
+    }
+    void* const dev = arena.alloc_persistent(bytes);
+    std::vector<std::byte> host(bytes);
+    for (const auto& e : extras) std::memcpy(host.data() + e.offset, e.bits.data(), e.bits.size() * sizeof(std::uint16_t));
+    MI_CUDA_CHECK(cudaMemcpy(dev, host.data(), bytes, cudaMemcpyHostToDevice));
+    MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    for (const auto& e : extras) {
+      m[e.name] = Tensor::view(static_cast<std::byte*>(dev) + e.offset, DType::kBF16, Device::kCUDA, e.shape.data(),
+                               static_cast<int>(e.shape.size()));
+    }
+    load_stats_.bytes += bytes;
+  };
   const auto upload = [&](const WeightGroup& g) {
     check_cancel();
+    WeightGroup plain = g;
+    if (g.name == "globals" || g.name == "text_embedder") {
+      std::vector<std::string> skip;
+      for (const auto& t : g.tensors) {
+        const std::string module = extra_module(t);
+        if (!module.empty()) {
+          skip.push_back(t.name);
+          skip.push_back(module + ".weight_scale");
+        }
+      }
+      plain.tensors.clear();
+      for (const auto& t : g.tensors) {
+        if (std::find(skip.begin(), skip.end(), t.name) == skip.end()) plain.tensors.push_back(t);
+      }
+    }
     load_stats_.bytes += g.total_bytes;
-    TensorMap m = weights::upload_group(readers, g, arena, ring);
+    TensorMap m = weights::upload_group(readers, plain, arena, ring);
+    install_extras(g, m);
     merge(m);
     return m;
   };
