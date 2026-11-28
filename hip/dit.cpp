@@ -179,53 +179,10 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
   // backend runs as bf16. Their `_quantization_metadata` says which modules to undo; the DiT blocks stay INT8.
   const std::string* qmd = index.metadata("_quantization_metadata");
   const auto convrot = st::convrot_groups(qmd != nullptr ? *qmd : "");
-  std::vector<bf16> host;
-  const auto place = [&](const std::string& name, const std::vector<std::int64_t>& shape, DeviceBuffer& buf,
-                         std::size_t offset) {
-    const st::TensorInfo& t = index.at(name);
-    if (t.shape != shape) fail(name + " has an unexpected shape");
-    if (t.dtype == "BF16") {
-      host.resize(t.bytes / kBf16);
-      index.read_into(name, host.data(), t.bytes);
-      buf.upload(host.data(), t.bytes, offset);
-      return;
-    }
-    if (t.dtype != "I8" || shape.size() != 2 || !name.ends_with(".weight"))
-      fail(name + " is " + t.dtype + ", expected BF16");
-    const std::string module = name.substr(0, name.size() - 7);
-    const auto it = convrot.find(module);
-    if (it == convrot.end() || !quant::valid_convrot_group(it->second) || shape[1] % it->second != 0)
-      fail(name + " is INT8 but has no int8_convrot config in _quantization_metadata");
-    const std::string sname = name + "_scale";
-    const st::TensorInfo& scale = index.at(sname);
-    // Comfy-kitchen writes [N, 1]; the converter's own files use [N]. Both are one scale per output row.
-    const bool scales_ok = scale.dtype == "F32" && (scale.shape == std::vector<std::int64_t>{shape[0]} ||
-                                                    scale.shape == std::vector<std::int64_t>({shape[0], 1}));
-    if (!scales_ok) fail(sname + " is not F32 [N] or [N, 1] as INT8 ConvRot requires");
-    const std::size_t rows = static_cast<std::size_t>(shape[0]), cols = static_cast<std::size_t>(shape[1]);
-    std::vector<std::int8_t> q(rows * cols);
-    std::vector<float> s(rows);
-    index.read_into(name, q.data(), q.size());
-    index.read_into(sname, s.data(), s.size() * sizeof(float));
-    if (it->second == 256 && cols % 256 == 0) {
-      // The same device butterfly the text encoder uses for its INT8 ConvRot weights: no host fp32 image and no
-      // multi-second CPU Hadamard transform for these ~325 M weights.
-      DeviceBuffer q_dev(rows * cols), s_dev(rows * sizeof(float));
-      q_dev.upload(q.data(), q.size());
-      s_dev.upload(s.data(), s.size() * sizeof(float));
-      te_dequant::dequant_i8(q_dev.as<std::int8_t>(), s_dev.as<float>(), at(buf, offset), static_cast<int>(rows),
-                             static_cast<int>(cols), stream_.get());
-      stream_.synchronize();
-    } else {
-      std::vector<float> deq(rows * cols);
-      std::vector<bf16> out(rows * cols);
-      quant::dequantize_rows(q.data(), s.data(), static_cast<std::int64_t>(rows), static_cast<std::int64_t>(cols), it->second,
-                             deq.data());
-      for (std::size_t i = 0; i < deq.size(); ++i) out[i] = quant::float_to_bf16(deq[i]);
-      buf.upload(out.data(), out.size() * kBf16, offset);
-    }
-  };
-  // Tensors into one new device buffer, each at a 256-byte aligned offset; returns their device pointers.
+  // Tensors into one device buffer, each at a 256-byte aligned offset. BF16 tensors are read into one host staging
+  // area and uploaded once per buffer; INT8 ConvRot extras share one q/scale staging + scratch area and are all
+  // expanded on the device into their final bf16 slots in one queued burst. This used to do ~5 device-wide syncs
+  // and two allocations per extra linear (~75 syncs for 15 linears); now it is five syncs and one scratch per load.
   const auto load = [&](const std::vector<std::string>& names, const std::vector<std::vector<std::int64_t>>& shapes) {
     std::vector<std::size_t> offsets;
     std::size_t total = 0;
@@ -235,7 +192,70 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
     }
     owned_.emplace_back(total);
     DeviceBuffer& buf = owned_.back();
-    for (std::size_t i = 0; i < names.size(); ++i) place(names[i], shapes[i], buf, offsets[i]);
+
+    struct Extra {
+      std::string name, sname;
+      std::size_t q_off, s_off, s_bytes, out_off;
+      int group;
+      std::size_t rows, cols;
+    };
+    std::vector<Extra> extras;
+    std::size_t qs_bytes = 0;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      const st::TensorInfo& t = index.at(names[i]);
+      if (t.shape != shapes[i]) fail(names[i] + " has an unexpected shape");
+      if (t.dtype != "I8") continue;
+      if (shapes[i].size() != 2 || !names[i].ends_with(".weight")) fail(names[i] + " is I8 but not a weight matrix");
+      const std::string module = names[i].substr(0, names[i].size() - 7);
+      const auto it = convrot.find(module);
+      if (it == convrot.end() || !quant::valid_convrot_group(it->second) || shapes[i][1] % it->second != 0)
+        fail(names[i] + " is INT8 but has no int8_convrot config in _quantization_metadata");
+      const std::string sname = names[i] + "_scale";
+      const st::TensorInfo& scale = index.at(sname);
+      // Comfy-kitchen writes [N, 1]; the converter's own files use [N]. Both are one scale per output row.
+      const bool scales_ok = scale.dtype == "F32" && (scale.shape == std::vector<std::int64_t>{shapes[i][0]} ||
+                                                      scale.shape == std::vector<std::int64_t>({shapes[i][0], 1}));
+      if (!scales_ok) fail(sname + " is not F32 [N] or [N, 1] as INT8 ConvRot requires");
+      extras.push_back({names[i], sname, qs_bytes, qs_bytes + t.bytes, scale.bytes, offsets[i], it->second,
+                        static_cast<std::size_t>(shapes[i][0]), static_cast<std::size_t>(shapes[i][1])});
+      qs_bytes += t.bytes + scale.bytes;
+    }
+
+    std::vector<std::byte> qs(qs_bytes);
+    for (const Extra& e : extras) {
+      index.read_into(e.name, qs.data() + e.q_off, e.s_off - e.q_off);
+      index.read_into(e.sname, qs.data() + e.s_off, e.s_bytes);
+    }
+    std::vector<std::byte> host(total);
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      const st::TensorInfo& t = index.at(names[i]);
+      if (t.dtype == "BF16") index.read_into(names[i], host.data() + offsets[i], t.bytes);
+    }
+    // The text encoder's g=256 butterfly is accurate to <0.05 % of bf16 weight bits versus quant::dequantize_rows
+    // (one ulp at most), so use that fast kernel here too. Other groups are rare; do them on the host into the same
+    // staging buffer so they cost no extra upload or sync.
+    for (const Extra& e : extras) {
+      if (e.group == 256 && e.cols % 256 == 0) continue;
+      std::vector<float> deq(e.rows * e.cols);
+      quant::dequantize_rows(reinterpret_cast<const std::int8_t*>(qs.data() + e.q_off),
+                             reinterpret_cast<const float*>(qs.data() + e.s_off), static_cast<std::int64_t>(e.rows),
+                             static_cast<std::int64_t>(e.cols), e.group, deq.data());
+      std::uint16_t* dst = reinterpret_cast<std::uint16_t*>(host.data() + e.out_off);
+      for (std::size_t i = 0; i < deq.size(); ++i) dst[i] = quant::float_to_bf16(deq[i]);
+    }
+    buf.upload(host.data(), total, 0);
+    if (!extras.empty()) {
+      DeviceBuffer qdev(qs_bytes);
+      qdev.upload(qs.data(), qs_bytes);
+      for (const Extra& e : extras) {
+        if (e.group != 256 || e.cols % 256 != 0) continue;
+        te_dequant::dequant_i8(reinterpret_cast<const std::int8_t*>(qdev.data()) + e.q_off,
+                               reinterpret_cast<const float*>(qdev.data()) + e.s_off / sizeof(float),
+                               reinterpret_cast<std::uint16_t*>(at(buf, e.out_off)), static_cast<int>(e.rows),
+                               static_cast<int>(e.cols), stream_.get());
+      }
+      stream_.synchronize();
+    }
     weight_bytes_ += total;
     std::vector<const bf16*> out;
     for (const std::size_t o : offsets) out.push_back(at(buf, o));
