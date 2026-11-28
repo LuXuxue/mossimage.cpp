@@ -19,7 +19,10 @@ SageAttention. The gfx1103 (and other matrix-core) paths are unchanged.
 - Accepts the `moss-infer generate` flag set, UTF-8 prompts, single-file
   `--dit`/`--te`/`--vae` overrides, varlen batches and high-resolution support.
   DiT files with ComfyUI's `model.diffusion_model.` / `diffusion_model.` tensor
-  prefixes are accepted as well as the official unprefixed names.
+  prefixes are accepted as well as the official unprefixed names. StarNodes-style
+  INT8 ConvRot files that quantize the globals and text refiner too are accepted:
+  those non-block linears are dequantized to bf16 on load using the file's
+  `_quantization_metadata`, so no offline rewrite is needed.
   Flags that need CUDA-only machinery are accepted but print a no-effect notice.
 
 ## Build (Windows / TheRock)

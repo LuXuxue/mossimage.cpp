@@ -337,6 +337,11 @@ File::File(const std::filesystem::path& file) : path_(utf8(file)) {
 
 File::~File() { close_fd(fd_); }
 
+const std::string* File::metadata(const std::string& key) const {
+  const auto it = metadata_.find(key);
+  return it == metadata_.end() ? nullptr : &it->second;
+}
+
 std::optional<double> File::lora_metadata_alpha() const {
   const auto it = metadata_.find("lora_adapter_metadata");
   return it == metadata_.end() ? std::nullopt : parse_lora_alpha(it->second);
@@ -356,6 +361,32 @@ const TensorInfo& File::at(const std::string& name) const {
 void File::read(const TensorInfo& t, void* dst, std::uint64_t rel, std::uint64_t bytes) const {
   if (rel > t.bytes || bytes > t.bytes - rel) fail("read past the end of tensor " + t.name);
   read_at(fd_, dst, t.offset + rel, bytes, path_);
+}
+
+std::map<std::string, int> convrot_groups(const std::string& json) {
+  std::map<std::string, int> out;
+  if (json.empty()) return out;
+  const Json root = Parser(json).parse_document();
+  if (root.kind != Json::Kind::kObject) fail("_quantization_metadata is not an object");
+  const Json* layers = root.find("layers");
+  if (layers == nullptr) return out;
+  if (layers->kind != Json::Kind::kObject) fail("_quantization_metadata has no layers object");
+  for (std::size_t m = 0; m < layers->keys.size(); ++m) {
+    const Json& cfg = layers->values[m];
+    if (cfg.kind != Json::Kind::kObject) continue;
+    const Json* fmt = cfg.find("format");
+    const Json* rot = cfg.find("convrot");
+    if (fmt == nullptr || fmt->kind != Json::Kind::kString || fmt->text != "int8_tensorwise" || rot == nullptr ||
+        rot->kind != Json::Kind::kBool || rot->integer == 0)
+      continue;
+    int group = 256;  // comfy-kitchen's default when the config omits the field
+    if (const Json* g = cfg.find("convrot_groupsize")) {
+      if (g->kind != Json::Kind::kNumber || g->integer < 4 || g->integer > 1024) continue;
+      group = static_cast<int>(g->integer);
+    }
+    out.emplace(dit_name(layers->keys[m]), group);
+  }
+  return out;
 }
 
 std::map<std::string, std::string> read_index(const std::filesystem::path& file) {
@@ -458,6 +489,13 @@ Index::Index(const std::filesystem::path& path) {
   for (const auto& [name, shard] : weight_map) {
     if (!has(dit_name(name))) throw std::runtime_error("safetensors: " + name + " is in the index but in no shard");
   }
+}
+
+const std::string* Index::metadata(const std::string& key) const {
+  for (const auto& f : files_) {
+    if (const std::string* v = f->metadata(key)) return v;
+  }
+  return nullptr;
 }
 
 const TensorInfo& Index::at(const std::string& name) const {

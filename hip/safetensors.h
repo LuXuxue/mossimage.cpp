@@ -30,6 +30,8 @@ class File {
 
   const std::string& path() const { return path_; }  // UTF-8, for messages
   const std::vector<TensorInfo>& tensors() const { return tensors_; }
+  // File-level `__metadata__` value, or null when the key is absent.
+  const std::string* metadata(const std::string& key) const;
   const TensorInfo* find(const std::string& name) const;  // null if absent
   const TensorInfo& at(const std::string& name) const;    // throws if absent
   // lora_adapter_metadata's lora_alpha, as PEFT/diffusers LoRA files store it when there is no alpha tensor.
@@ -52,6 +54,10 @@ class File {
 // model.safetensors.index.json's weight_map: tensor name -> shard file name (relative to the index's directory).
 std::map<std::string, std::string> read_index(const std::filesystem::path& path);
 
+// `_quantization_metadata`'s layers: canonical module name -> ConvRot group of the modules stored as INT8 ConvRot.
+// Other formats and unrotated modules are left out; the caller validates the group before using it.
+std::map<std::string, int> convrot_groups(const std::string& json);
+
 // The file holding every tensor name, for one .safetensors file, a directory with a weight_map index, or a directory
 // with exactly one .safetensors. Unlike Index, this keeps the file paths so a caller can open them itself.
 std::map<std::string, std::filesystem::path> index_files(const std::filesystem::path& path);
@@ -64,6 +70,8 @@ class Index {
   explicit Index(const std::filesystem::path& path);
 
   bool has(const std::string& name) const { return tensors_.count(name) != 0; }
+  // File-level `__metadata__` value from any of the shards, or null when absent.
+  const std::string* metadata(const std::string& key) const;
   const TensorInfo& at(const std::string& name) const;  // throws if absent
   // Reads a whole tensor into caller memory of exactly its size, or throws.
   void read_into(const std::string& name, void* out, std::uint64_t bytes) const;
