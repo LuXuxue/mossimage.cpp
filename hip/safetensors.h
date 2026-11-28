@@ -48,7 +48,8 @@ class File {
 // model.safetensors.index.json's weight_map: tensor name -> shard file name (relative to the index's directory).
 std::map<std::string, std::string> read_index(const std::filesystem::path& path);
 
-// The tensors of one file, or of every shard of a model directory, by name.
+// The tensors of one file, or of every shard of a model directory, by name. DiT tensor names are canonicalized:
+// a `model.diffusion_model.` / `diffusion_model.` prefix is stripped, as the CUDA backend does.
 class Index {
  public:
   // A .safetensors file, or a directory holding one *.safetensors.index.json (its shards) or exactly one .safetensors.

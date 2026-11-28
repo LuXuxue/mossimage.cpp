@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 
 #ifdef _WIN32
 #include <io.h>
@@ -19,6 +20,16 @@ namespace mi::hip::st {
 namespace {
 
 [[noreturn]] void fail(const std::string& what) { throw std::runtime_error("safetensors: " + what); }
+
+// ComfyUI checkpoints name the DiT tensors `model.diffusion_model.<name>` (or `diffusion_model.<name>`). The engine
+// looks them up by the official unprefixed names, so strip that prefix on the way into Index, as the CUDA backend's
+// quantizer does. Only Index is used for DiT files; File keeps the names as stored for the other components.
+std::string dit_name(std::string_view name) {
+  for (std::string_view p : {"model.diffusion_model.", "diffusion_model."}) {
+    if (name.starts_with(p)) return std::string(name.substr(p.size()));
+  }
+  return std::string(name);
+}
 
 // The JSON subset safetensors headers and index files use: objects, arrays, strings, numbers, true/false/null.
 struct Json {
@@ -364,7 +375,7 @@ Index::Index(const std::filesystem::path& path) {
     files_.push_back(std::make_unique<File>(file));
     const File& f = *files_.back();
     for (const TensorInfo& t : f.tensors()) {
-      if (!tensors_.emplace(t.name, std::make_pair(&f, &t)).second) {
+      if (!tensors_.emplace(dit_name(t.name), std::make_pair(&f, &t)).second) {
         throw std::runtime_error("safetensors: " + t.name + " appears in more than one file under " + utf8(path));
       }
     }
@@ -392,7 +403,7 @@ Index::Index(const std::filesystem::path& path) {
   for (const auto& [name, shard] : weight_map) shards[shard] = true;
   for (const auto& [shard, unused] : shards) add(path / shard);
   for (const auto& [name, shard] : weight_map) {
-    if (!has(name)) throw std::runtime_error("safetensors: " + name + " is in the index but in no shard");
+    if (!has(dit_name(name))) throw std::runtime_error("safetensors: " + name + " is in the index but in no shard");
   }
 }
 
