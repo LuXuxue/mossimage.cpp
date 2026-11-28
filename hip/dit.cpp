@@ -12,6 +12,7 @@
 #include "bf16_gemm.h"
 #include "dit_kernels.h"
 #include "safetensors.h"
+#include "te_dequant.h"
 #include "weights/quant/quant_codec.h"
 
 namespace mi::hip {
@@ -178,13 +179,16 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
   // backend runs as bf16. Their `_quantization_metadata` says which modules to undo; the DiT blocks stay INT8.
   const std::string* qmd = index.metadata("_quantization_metadata");
   const auto convrot = st::convrot_groups(qmd != nullptr ? *qmd : "");
-  const auto read_bf16 = [&](const std::string& name, const std::vector<std::int64_t>& shape) {
+  std::vector<bf16> host;
+  const auto place = [&](const std::string& name, const std::vector<std::int64_t>& shape, DeviceBuffer& buf,
+                         std::size_t offset) {
     const st::TensorInfo& t = index.at(name);
     if (t.shape != shape) fail(name + " has an unexpected shape");
-    std::vector<bf16> out(numel(shape));
     if (t.dtype == "BF16") {
-      index.read_into(name, out.data(), out.size() * kBf16);
-      return out;
+      host.resize(t.bytes / kBf16);
+      index.read_into(name, host.data(), t.bytes);
+      buf.upload(host.data(), t.bytes, offset);
+      return;
     }
     if (t.dtype != "I8" || shape.size() != 2 || !name.ends_with(".weight"))
       fail(name + " is " + t.dtype + ", expected BF16");
@@ -200,16 +204,28 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
     if (!scales_ok) fail(sname + " is not F32 [N] or [N, 1] as INT8 ConvRot requires");
     const std::size_t rows = static_cast<std::size_t>(shape[0]), cols = static_cast<std::size_t>(shape[1]);
     std::vector<std::int8_t> q(rows * cols);
-    std::vector<float> s(rows), deq(rows * cols);
+    std::vector<float> s(rows);
     index.read_into(name, q.data(), q.size());
     index.read_into(sname, s.data(), s.size() * sizeof(float));
-    quant::dequantize_rows(q.data(), s.data(), static_cast<std::int64_t>(rows), static_cast<std::int64_t>(cols), it->second,
-                           deq.data());
-    for (std::size_t i = 0; i < deq.size(); ++i) out[i] = quant::float_to_bf16(deq[i]);
-    return out;
+    if (it->second == 256 && cols % 256 == 0) {
+      // The same device butterfly the text encoder uses for its INT8 ConvRot weights: no host fp32 image and no
+      // multi-second CPU Hadamard transform for these ~325 M weights.
+      DeviceBuffer q_dev(rows * cols), s_dev(rows * sizeof(float));
+      q_dev.upload(q.data(), q.size());
+      s_dev.upload(s.data(), s.size() * sizeof(float));
+      te_dequant::dequant_i8(q_dev.as<std::int8_t>(), s_dev.as<float>(), at(buf, offset), static_cast<int>(rows),
+                             static_cast<int>(cols), stream_.get());
+      stream_.synchronize();
+    } else {
+      std::vector<float> deq(rows * cols);
+      std::vector<bf16> out(rows * cols);
+      quant::dequantize_rows(q.data(), s.data(), static_cast<std::int64_t>(rows), static_cast<std::int64_t>(cols), it->second,
+                             deq.data());
+      for (std::size_t i = 0; i < deq.size(); ++i) out[i] = quant::float_to_bf16(deq[i]);
+      buf.upload(out.data(), out.size() * kBf16, offset);
+    }
   };
   // Tensors into one new device buffer, each at a 256-byte aligned offset; returns their device pointers.
-  std::vector<bf16> host;
   const auto load = [&](const std::vector<std::string>& names, const std::vector<std::vector<std::int64_t>>& shapes) {
     std::vector<std::size_t> offsets;
     std::size_t total = 0;
@@ -219,10 +235,7 @@ Dit::Dit(Device& device, const std::filesystem::path& transformer_dir, const Dit
     }
     owned_.emplace_back(total);
     DeviceBuffer& buf = owned_.back();
-    for (std::size_t i = 0; i < names.size(); ++i) {
-      host = read_bf16(names[i], shapes[i]);
-      buf.upload(host.data(), host.size() * kBf16, offsets[i]);
-    }
+    for (std::size_t i = 0; i < names.size(); ++i) place(names[i], shapes[i], buf, offsets[i]);
     weight_bytes_ += total;
     std::vector<const bf16*> out;
     for (const std::size_t o : offsets) out.push_back(at(buf, o));
