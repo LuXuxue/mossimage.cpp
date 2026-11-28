@@ -21,8 +21,8 @@
 #include "models/lora/lora_merge_device.h"
 #include "models/moss_dit/dit_kernels.h"
 #include "models/moss_dit/nvfp4_support.h"
+#include "kernels/vision/vision.h"
 #include "runtime/pinned_ring.h"
-#include "weights/quant/quant_codec.h"
 #include "weights/test_seams.h"
 #include "weights/upload.h"
 
@@ -761,12 +761,12 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
     }
   };
   // StarNodes-style INT8 ConvRot files quantize every linear, including the globals and the text refiner, which this
-  // engine runs as bf16. Undo the rotation on load for those linears; the DiT blocks stay INT8.
+  // engine runs as bf16. Undo the rotation on the device at load; the DiT blocks stay INT8. The device kernel is the
+  // same one the vision encoder uses to turn INT8 ConvRot weights into bf16 before a bf16 GEMM.
   struct ExtraBf16 {
     std::string name;
     std::string module;
     std::vector<std::int64_t> shape;
-    std::vector<std::uint16_t> bits;
     std::size_t offset = 0;
   };
   const auto extra_module = [&](const weights::IndexedTensor& t) {
@@ -790,20 +790,7 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
       }
       if (scale == nullptr || scale->dtype != weights::DType::kF32 || t.shape.size() != 2 || scale->numel() != t.shape[0])
         continue;
-      const std::int64_t n = t.shape[0], k = t.shape[1];
-      std::vector<std::int8_t> q(t.nbytes);
-      std::vector<float> s(scale->nbytes / sizeof(float));
-      readers.get(t.file).read_at(t.offset, q.data(), q.size());
-      readers.get(scale->file).read_at(scale->offset, s.data(), s.size() * sizeof(float));
-      std::vector<float> deq(static_cast<std::size_t>(n * k));
-      quant::dequantize_rows(q.data(), s.data(), n, k, quant->find_spec(module)->group, deq.data());
-      ExtraBf16 e;
-      e.name = t.name;
-      e.module = module;
-      e.shape = t.shape;
-      e.bits.resize(deq.size());
-      for (std::size_t i = 0; i < deq.size(); ++i) e.bits[i] = quant::float_to_bf16(deq[i]);
-      extras.push_back(std::move(e));
+      extras.push_back({t.name, module, t.shape, 0});
     }
     if (extras.empty()) return;
     // ffn_up and ffn_gate must stay adjacent and in that order for fuse()'s contiguity check.
@@ -826,16 +813,32 @@ MossDit::MossDit(const weights::ModelIndex& index, const quant::QuantIndex* quan
     std::size_t bytes = 0;
     for (auto& e : extras) {
       e.offset = align_up(bytes);
-      bytes = e.offset + e.bits.size() * sizeof(std::uint16_t);
+      bytes = e.offset + static_cast<std::size_t>(e.shape[0] * e.shape[1]) * sizeof(std::uint16_t);
     }
     void* const dev = arena.alloc_persistent(bytes);
-    std::vector<std::byte> host(bytes);
-    for (const auto& e : extras) std::memcpy(host.data() + e.offset, e.bits.data(), e.bits.size() * sizeof(std::uint16_t));
-    MI_CUDA_CHECK(cudaMemcpy(dev, host.data(), bytes, cudaMemcpyHostToDevice));
-    MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
     for (const auto& e : extras) {
-      m[e.name] = Tensor::view(static_cast<std::byte*>(dev) + e.offset, DType::kBF16, Device::kCUDA, e.shape.data(),
-                               static_cast<int>(e.shape.size()));
+      const weights::IndexedTensor* wt = nullptr;
+      const weights::IndexedTensor* sc = nullptr;
+      for (const auto& t : g.tensors) {
+        if (t.name == e.name) wt = &t;
+        else if (t.name == e.module + ".weight_scale") sc = &t;
+      }
+      if (wt == nullptr || sc == nullptr) continue;
+      std::vector<std::int8_t> q(wt->nbytes);
+      std::vector<float> s(sc->nbytes / sizeof(float));
+      readers.get(wt->file).read_at(wt->offset, q.data(), q.size());
+      readers.get(sc->file).read_at(sc->offset, s.data(), s.size() * sizeof(float));
+      runtime::StackScope scope(arena_);
+      void* const q_dev = arena.alloc_stack(q.size());
+      void* const s_dev = arena.alloc_stack(s.size() * sizeof(float));
+      MI_CUDA_CHECK(cudaMemcpy(q_dev, q.data(), q.size(), cudaMemcpyHostToDevice));
+      MI_CUDA_CHECK(cudaMemcpy(s_dev, s.data(), s.size() * sizeof(float), cudaMemcpyHostToDevice));
+      const Tensor qt = Tensor::view(q_dev, DType::kI8, Device::kCUDA, e.shape.data(), 2);
+      const Tensor st = Tensor::view(s_dev, DType::kF32, Device::kCUDA, e.shape.data(), 1);
+      const Tensor ot = Tensor::view(static_cast<std::byte*>(dev) + e.offset, DType::kBF16, Device::kCUDA, e.shape.data(), 2);
+      kernels::vision::dequantize_convrot(qt, st, quant->find_spec(e.module)->group, ot, nullptr);
+      MI_CUDA_CHECK(cudaStreamSynchronize(nullptr));
+      m[e.name] = ot;
     }
     load_stats_.bytes += bytes;
   };
